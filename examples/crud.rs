@@ -41,7 +41,7 @@ impl TitoModelTrait for User {
     }
 
     fn get_event_table_name(&self) -> Option<String> {
-        Some("jobs".to_string())
+        None
     }
 
     fn get_id(&self) -> String {

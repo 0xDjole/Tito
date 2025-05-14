@@ -1,5 +1,7 @@
 # Tito
 
+> ⚠️ **WARNING: This project is in early development and NOT PRODUCTION READY.** Use at your own risk. The API may change without notice, and there may be bugs and performance issues. Not recommended for critical applications.
+
 Tito is a powerful, flexible database layer built on top of TiKV, providing robust indexing strategies, relationship modeling, and transaction management capabilities for Rust applications.
 
 ## Features
