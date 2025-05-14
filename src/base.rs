@@ -1429,7 +1429,6 @@ where
                     return self.to_results(res.into_iter());
                 }
                 Err(e) => {
-                    println!("RETRY {:?}", keys);
                     if retries >= max_retries {
                         return Err(TiKvError::NotFound(format!(
                             "Failed to batch get keys {:?} after {} retries: {}",
