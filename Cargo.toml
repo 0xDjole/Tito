@@ -24,7 +24,7 @@ chrono = { version = "0.4", features = ["serde"] }
 cron = "0.5"
 
 # Database and storage
-tikv-client = { git = "https://github.com/tikv/client-rust.git", branch = "master" }
+tikv-client = "0.3"
 
 
 # Utilities

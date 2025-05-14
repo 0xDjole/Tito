@@ -1818,12 +1818,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "take_mut"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f764005d11ee5f36500a149ace24e00e3da98b0158b3e2d53a7495660d3f4d60"
-
-[[package]]
 name = "tempfile"
 version = "3.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1859,7 +1853,8 @@ dependencies = [
 [[package]]
 name = "tikv-client"
 version = "0.3.0"
-source = "git+https://github.com/tikv/client-rust.git?branch=master#32b0cff3aa8f54cf473f59a506e23dda627af680"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "048968e4e3d04db472346770cc19914c6b5ae206fa44677f6a0874d54cd05940"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -1877,8 +1872,6 @@ dependencies = [
  "semver",
  "serde",
  "serde_derive",
- "serde_json",
- "take_mut",
  "thiserror",
  "tokio",
  "tonic",
