@@ -102,8 +102,6 @@ impl TitoModelTrait for Post {
                 }],
                 custom_generator: None,
             },
-            // Custom index generator for posts by tag
-            // This creates an entry for each tag the post has
             TitoIndexConfig {
                 condition: true,
                 name: "post-by-tag".to_string(),
