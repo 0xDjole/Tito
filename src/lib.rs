@@ -10,3 +10,5 @@ pub use base::BaseTiKv;
 pub use base::TiKvModel;
 
 mod utils;
+
+pub mod queue;
