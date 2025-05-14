@@ -5,13 +5,13 @@ use std::{
 };
 
 use crate::{
-    transaction::{TiKvTransaction, TransactionManager},
+    transaction::{TitoTransaction, TransactionManager},
     types::{
-        DBUuid, ReverseIndex, TiKvChangeLog, TiKvConfigs, TiKvCoreTransaction, TiKvCursor,
-        TiKvDatabase, TiKvEmbeddedRelationshipConfig, TiKvError, TiKvFindByIndexPayload,
-        TiKvFindByIndexRawPayload, TiKvFindByMultipleIndexPayload, TiKvFindChangeLogSincePaylaod,
-        TiKvFindOneByIndexPayload, TiKvFindPayload, TiKvGenerateJobPayload, TiKvIndexBlockType,
-        TiKvIndexConfig, TiKvJob, TiKvModelTrait, TiKvPaginated, TiKvScanPayload,
+        DBUuid, ReverseIndex, TitoChangeLog, TitoConfigs, TitoCursor, TitoDatabase,
+        TitoEmbeddedRelationshipConfig, TitoError, TitoFindByIndexPayload,
+        TitoFindByIndexRawPayload, TitoFindChangeLogSincePaylaod, TitoFindOneByIndexPayload,
+        TitoFindPayload, TitoGenerateJobPayload, TitoIndexBlockType, TitoIndexConfig, TitoJob,
+        TitoModelTrait, TitoPaginated, TitoScanPayload,
     },
     utils::{next_string_lexicographically, previous_string_lexicographically, to_snake_case},
 };
@@ -24,43 +24,43 @@ use tikv_client::{Key, KvPair};
 use tokio::time::{sleep, Duration};
 
 #[async_trait]
-pub trait BaseTiKv<T>
+pub trait BaseTito<T>
 where
-    T: Clone + Serialize + DeserializeOwned + Unpin + std::marker::Send + Sync + TiKvModelTrait,
+    T: Clone + Serialize + DeserializeOwned + Unpin + std::marker::Send + Sync + TitoModelTrait,
 {
-    fn new(db: TiKvDatabase, configs: TiKvConfigs, transaction_manager: TransactionManager)
+    fn new(db: TitoDatabase, configs: TitoConfigs, transaction_manager: TransactionManager)
         -> Self;
-    fn get_db(&self) -> TiKvDatabase;
+    fn get_db(&self) -> TitoDatabase;
     fn get_model(&self) -> &T;
-    fn get_embedded_relationships(&self) -> Vec<TiKvEmbeddedRelationshipConfig>;
-    fn get_indexes(&self) -> Vec<TiKvIndexConfig>;
+    fn get_embedded_relationships(&self) -> Vec<TitoEmbeddedRelationshipConfig>;
+    fn get_indexes(&self) -> Vec<TitoIndexConfig>;
     fn get_id(&self) -> String;
-    fn get_configs(&self) -> &TiKvConfigs;
+    fn get_configs(&self) -> &TitoConfigs;
     fn transaction_manager(&self) -> TransactionManager;
 
     fn get_table(&self) -> String;
     fn get_event_table(&self) -> Option<String>;
 
-    fn decode_cursor(&self, cursor: String) -> Result<TiKvCursor, TiKvError> {
-        let cursor = decode(cursor).map_err(|err| TiKvError::Failed)?;
-        if let Ok(value) = serde_json::from_slice::<TiKvCursor>(&cursor) {
+    fn decode_cursor(&self, cursor: String) -> Result<TitoCursor, TitoError> {
+        let cursor = decode(cursor).map_err(|err| TitoError::Failed)?;
+        if let Ok(value) = serde_json::from_slice::<TitoCursor>(&cursor) {
             return Ok(value);
         }
-        return Err(TiKvError::Failed);
+        return Err(TitoError::Failed);
     }
 
-    fn encode_cursors(&self, ids: Vec<Option<String>>) -> Result<String, TiKvError> {
-        let tikv_cursor = TiKvCursor { ids };
-        let json_bytes = serde_json::to_vec(&tikv_cursor).map_err(|_| TiKvError::Failed)?;
+    fn encode_cursors(&self, ids: Vec<Option<String>>) -> Result<String, TitoError> {
+        let tikv_cursor = TitoCursor { ids };
+        let json_bytes = serde_json::to_vec(&tikv_cursor).map_err(|_| TitoError::Failed)?;
 
         Ok(encode(&json_bytes))
     }
 
     async fn tx<F, Fut, R, E>(&self, f: F) -> Result<R, E>
     where
-        F: FnOnce(TiKvTransaction) -> Fut + Send + 'async_trait,
+        F: FnOnce(TitoTransaction) -> Fut + Send + 'async_trait,
         Fut: Future<Output = Result<R, E>> + Send,
-        E: From<TiKvError> + Send + Sync + std::fmt::Debug, // Added Sync trait bound
+        E: From<TitoError> + Send + Sync + std::fmt::Debug, // Added Sync trait bound
         R: Send,
     {
         self.transaction_manager().transaction(f).await
@@ -69,7 +69,7 @@ where
     fn to_results(
         &self,
         items: impl Iterator<Item = KvPair>,
-    ) -> Result<Vec<(String, Value)>, TiKvError> {
+    ) -> Result<Vec<(String, Value)>, TitoError> {
         let mut results = vec![];
         for kv in items {
             let key_bytes: Vec<u8> = kv.0.into();
@@ -94,8 +94,8 @@ where
         key: &str,
         max_retries: usize,
         initial_delay_ms: u64,
-        tx: &TiKvTransaction,
-    ) -> Result<(String, Value), TiKvError> {
+        tx: &TitoTransaction,
+    ) -> Result<(String, Value), TitoError> {
         let mut retries = 0;
         let mut delay = initial_delay_ms;
         let key = key.to_string();
@@ -105,21 +105,21 @@ where
                 Ok(Some(value)) => match serde_json::from_slice::<Value>(&value) {
                     Ok(value) => return Ok((key, value)),
                     Err(e) => {
-                        return Err(TiKvError::NotFound(format!(
+                        return Err(TitoError::NotFound(format!(
                             "Failed to deserialize value for key '{}': {}",
                             key, e
                         )))
                     }
                 },
                 Ok(None) => {
-                    return Err(TiKvError::NotFound(format!(
+                    return Err(TitoError::NotFound(format!(
                         "Key '{}' not found in database",
                         key
                     )))
                 }
                 Err(e) => {
                     if retries >= max_retries {
-                        return Err(TiKvError::NotFound(format!(
+                        return Err(TitoError::NotFound(format!(
                             "Failed to get key '{}' after {} retries: {}",
                             key, max_retries, e
                         )));
@@ -131,27 +131,27 @@ where
             }
         }
     }
-    async fn get_key(&self, key: &str, tx: &TiKvTransaction) -> Result<Value, TiKvError> {
+    async fn get_key(&self, key: &str, tx: &TitoTransaction) -> Result<Value, TitoError> {
         let result = tx
             .get(key.to_string())
             .await
-            .map_err(|e| TiKvError::NotFound(e.to_string()))?;
+            .map_err(|e| TitoError::NotFound(e.to_string()))?;
 
-        let result = result.ok_or(TiKvError::NotFound("Not found".to_string()))?;
+        let result = result.ok_or(TitoError::NotFound("Not found".to_string()))?;
 
         serde_json::from_slice::<Value>(&result)
-            .map_err(|_| TiKvError::NotFound("Not found".to_string()))
+            .map_err(|_| TitoError::NotFound("Not found".to_string()))
     }
 
     async fn put_change_log(
         &self,
-        change_log: TiKvChangeLog,
-        tx: &TiKvTransaction,
-    ) -> Result<bool, TiKvError> {
+        change_log: TitoChangeLog,
+        tx: &TitoTransaction,
+    ) -> Result<bool, TitoError> {
         let change_log_id = format!("change-log:{}:{}", change_log.created_at, change_log.id);
 
         let change_log_value = serde_json::to_value(&change_log)
-            .map_err(|e| TiKvError::FailedCreate(e.to_string()))?;
+            .map_err(|e| TitoError::FailedCreate(e.to_string()))?;
 
         self.put(change_log_id, change_log_value, tx).await?;
 
@@ -160,13 +160,13 @@ where
 
     async fn find_changelog_since(
         &self,
-        payload: TiKvFindChangeLogSincePaylaod,
-        tx: &TiKvTransaction,
-    ) -> Result<TiKvPaginated<TiKvChangeLog>, TiKvError> {
+        payload: TitoFindChangeLogSincePaylaod,
+        tx: &TitoTransaction,
+    ) -> Result<TitoPaginated<TitoChangeLog>, TitoError> {
         let start = format!("change-log:{}:", payload.timestamp);
         let end_key = format!("change-log:{}:", Utc::now().timestamp());
 
-        let scan_payload = TiKvScanPayload {
+        let scan_payload = TitoScanPayload {
             start,
             end: Some(end_key),
             limit: payload.limit,
@@ -181,7 +181,7 @@ where
 
         for item in changelog_entries.into_iter() {
             last_item = Some(item.0.clone());
-            if let Ok(item) = serde_json::from_value::<TiKvChangeLog>(item.1) {
+            if let Ok(item) = serde_json::from_value::<TitoChangeLog>(item.1) {
                 results.push(item);
             }
         }
@@ -195,12 +195,12 @@ where
             })
             .or(None);
 
-        let results = TiKvPaginated::new(results, cursor);
+        let results = TitoPaginated::new(results, cursor);
 
         Ok(results)
     }
 
-    async fn put<P>(&self, key: String, payload: P, tx: &TiKvTransaction) -> Result<bool, TiKvError>
+    async fn put<P>(&self, key: String, payload: P, tx: &TitoTransaction) -> Result<bool, TitoError>
     where
         P: Serialize + Unpin + std::marker::Send + Sync,
     {
@@ -210,7 +210,7 @@ where
 
         // Serialize the payload to serde_json::Value
         let mut value =
-            serde_json::to_value(&payload).map_err(|e| TiKvError::FailedCreate(e.to_string()))?;
+            serde_json::to_value(&payload).map_err(|e| TitoError::FailedCreate(e.to_string()))?;
 
         // Add the last_modified timestamp only if the value is an object
         if let serde_json::Value::Object(ref mut map) = value {
@@ -221,7 +221,7 @@ where
         loop {
             if self.get_configs().is_read_only.load(Ordering::SeqCst) {
                 if retries >= max_retries {
-                    return Err(TiKvError::ReadOnlyMode);
+                    return Err(TitoError::ReadOnlyMode);
                 }
 
                 sleep(Duration::from_millis(delay)).await;
@@ -230,13 +230,13 @@ where
             }
 
             let bytes =
-                serde_json::to_vec(&value).map_err(|e| TiKvError::FailedCreate(e.to_string()))?;
+                serde_json::to_vec(&value).map_err(|e| TitoError::FailedCreate(e.to_string()))?;
 
             match tx.put(key.clone(), bytes).await {
                 Ok(()) => return Ok(true),
                 Err(e) => {
                     if retries >= max_retries {
-                        return Err(TiKvError::FailedCreate(e.to_string()));
+                        return Err(TitoError::FailedCreate(e.to_string()));
                     }
 
                     sleep(Duration::from_millis(delay)).await;
@@ -246,7 +246,7 @@ where
             }
         }
     }
-    async fn delete(&self, key: String, tx: &TiKvTransaction) -> Result<bool, TiKvError> {
+    async fn delete(&self, key: String, tx: &TitoTransaction) -> Result<bool, TitoError> {
         let mut retries = 0;
         let mut delay = 10;
         let max_retries = 10;
@@ -254,7 +254,7 @@ where
         loop {
             if self.get_configs().is_read_only.load(Ordering::SeqCst) {
                 if retries >= max_retries {
-                    return Err(TiKvError::ReadOnlyMode);
+                    return Err(TitoError::ReadOnlyMode);
                 }
 
                 sleep(Duration::from_millis(delay)).await;
@@ -268,7 +268,7 @@ where
                 }
                 Err(e) => {
                     if retries >= max_retries {
-                        return Err(TiKvError::FailedDelete(e.to_string()));
+                        return Err(TitoError::FailedDelete(e.to_string()));
                     }
 
                     sleep(Duration::from_millis(delay)).await;
@@ -283,7 +283,7 @@ where
         &self,
         items: Vec<(String, Value)>,
         cursor: String,
-    ) -> Result<TiKvPaginated<T>, TiKvError> {
+    ) -> Result<TitoPaginated<T>, TitoError> {
         let mut results = vec![];
 
         for item in items.into_iter() {
@@ -292,7 +292,7 @@ where
             }
         }
 
-        let results = TiKvPaginated::new(results, Some(cursor));
+        let results = TitoPaginated::new(results, Some(cursor));
 
         Ok(results)
     }
@@ -301,7 +301,7 @@ where
         &self,
         items: Vec<(String, Value)>,
         has_more: bool,
-    ) -> Result<TiKvPaginated<T>, TiKvError> {
+    ) -> Result<TitoPaginated<T>, TitoError> {
         let mut results = vec![];
         let mut last_item: Option<String> = None;
 
@@ -321,29 +321,29 @@ where
             None
         };
 
-        let results = TiKvPaginated::new(results, cursor);
+        let results = TitoPaginated::new(results, cursor);
         Ok(results)
     }
 
     async fn get_reverse_index(
         &self,
         key: &str,
-        tx: &TiKvTransaction,
-    ) -> Result<ReverseIndex, TiKvError> {
+        tx: &TitoTransaction,
+    ) -> Result<ReverseIndex, TitoError> {
         let result = tx.get(key.to_string()).await.map_err(|e| {
-            TiKvError::NotFound(format!(
+            TitoError::NotFound(format!(
                 "Failed to get reverse index for key '{}': {}",
                 key, e
             ))
         })?;
 
-        let result = result.ok_or(TiKvError::NotFound(format!(
+        let result = result.ok_or(TitoError::NotFound(format!(
             "Reverse index not found for key '{}'",
             key
         )))?;
 
         serde_json::from_slice::<ReverseIndex>(&result).map_err(|e| {
-            TiKvError::NotFound(format!(
+            TitoError::NotFound(format!(
                 "Failed to deserialize reverse index for key '{}': {}",
                 key, e
             ))
@@ -392,7 +392,7 @@ where
         id: String,
         value: &T,
         json: &Value,
-    ) -> Result<Vec<(String, Value)>, TiKvError>
+    ) -> Result<Vec<(String, Value)>, TitoError>
     where
         T: serde::de::DeserializeOwned,
     {
@@ -430,12 +430,12 @@ where
 
                 for value in field_values {
                     let field_str = match field.r#type {
-                        TiKvIndexBlockType::String => match value.as_str() {
+                        TitoIndexBlockType::String => match value.as_str() {
                             Some("") => Some(format!("{}:__null__", field.name)),
                             Some(s) => Some(format!("{}:{}", field.name, to_snake_case(s))),
                             None => Some(format!("{}:__null__", field.name)),
                         },
-                        TiKvIndexBlockType::Number => match value.as_i64() {
+                        TitoIndexBlockType::Number => match value.as_i64() {
                             Some(n) => Some(format!("{}:{:0>10}", field.name, n)),
                             None => Some(format!("{}:__null__", field.name)),
                         },
@@ -468,7 +468,7 @@ where
         Ok(all_index_keys)
     }
 
-    async fn build(&self, payload: T, tx: &TiKvTransaction) -> Result<T, TiKvError>
+    async fn build(&self, payload: T, tx: &TitoTransaction) -> Result<T, TitoError>
     where
         T: 'async_trait + serde::de::DeserializeOwned,
     {
@@ -480,8 +480,8 @@ where
         &self,
         payload: T,
         event_action: Option<String>,
-        tx: &TiKvTransaction,
-    ) -> Result<T, TiKvError>
+        tx: &TitoTransaction,
+    ) -> Result<T, TitoError>
     where
         T: 'async_trait + serde::de::DeserializeOwned,
     {
@@ -510,7 +510,7 @@ where
 
         self.put(reverse_key.clone(), index_json_key, tx).await?;
 
-        let change_log = TiKvChangeLog {
+        let change_log = TitoChangeLog {
             id: DBUuid::new_v4().to_string(),
             record_id: id.clone(),
             operation: String::from("put"),
@@ -522,7 +522,7 @@ where
         self.put_change_log(change_log, tx).await?;
 
         self.generate_job(
-            TiKvGenerateJobPayload {
+            TitoGenerateJobPayload {
                 id: raw_id.clone(),
                 action: event_action,
                 clear_future: false,
@@ -537,9 +537,9 @@ where
 
     async fn generate_job(
         &self,
-        payload: TiKvGenerateJobPayload,
-        tx: &TiKvTransaction,
-    ) -> Result<bool, TiKvError> {
+        payload: TitoGenerateJobPayload,
+        tx: &TitoTransaction,
+    ) -> Result<bool, TitoError> {
         if let Some(raw_action) = payload.action.clone() {
             if let Some(value) = self.get_event_table() {
                 self.lock_keys(vec![payload.id.clone()], tx).await?;
@@ -567,7 +567,7 @@ where
                         let scan_stream = inner_tx
                             .scan(future_events_start..future_events_end, 1000)
                             .await
-                            .map_err(|e| TiKvError::NotFound(e.to_string()))?;
+                            .map_err(|e| TitoError::NotFound(e.to_string()))?;
 
                         let mut future_events = Vec::new();
 
@@ -582,7 +582,7 @@ where
                                 future_events.push(key_by_entity.clone());
                                 future_events.push(key.clone());
 
-                                let change_log = TiKvChangeLog {
+                                let change_log = TitoChangeLog {
                                     id: DBUuid::new_v4().to_string(),
                                     record_id: key.clone(),
                                     operation: String::from("delete"),
@@ -599,7 +599,7 @@ where
                             self.delete(key.clone(), &inner_tx).await?;
                         }
 
-                        Ok::<_, TiKvError>(())
+                        Ok::<_, TitoError>(())
                     })
                     .await?;
                 }
@@ -610,7 +610,7 @@ where
                     value, id, action, scheduled_for, uuid_str
                 );
 
-                let job = TiKvJob {
+                let job = TitoJob {
                     id: uuid_str,
                     key: key.clone(),
                     entity_id: id.clone(),
@@ -632,7 +632,7 @@ where
 
                 let id = DBUuid::new_v4().to_string();
 
-                let change_log = TiKvChangeLog {
+                let change_log = TitoChangeLog {
                     id,
                     record_id: key.clone(),
                     operation: String::from("put"),
@@ -652,7 +652,7 @@ where
         &self,
         item: &mut Value,
         rel_map: &HashMap<String, Value>,
-        config: &TiKvEmbeddedRelationshipConfig,
+        config: &TitoEmbeddedRelationshipConfig,
     ) {
         let source_parts: Vec<&str> = config.source_field_name.split('.').collect();
         let dest_parts: Vec<&str> = config.destination_field_name.split('.').collect();
@@ -665,7 +665,7 @@ where
         source_path_remaining: &[&str],
         dest_path_remaining: &[&str],
         rel_map: &HashMap<String, Value>,
-        config: &TiKvEmbeddedRelationshipConfig,
+        config: &TitoEmbeddedRelationshipConfig,
     ) {
         if source_path_remaining.len() == 1 && dest_path_remaining.len() == 1 {
             let source_key = source_path_remaining[0];
@@ -736,9 +736,9 @@ where
     fn get_relationship_data(
         &self,
         items: &Vec<(String, Value)>,
-        rels_config: &[TiKvEmbeddedRelationshipConfig],
+        rels_config: &[TitoEmbeddedRelationshipConfig],
         rels: &Vec<String>, // List of destination_field_names to populate
-    ) -> Vec<(TiKvEmbeddedRelationshipConfig, String)> {
+    ) -> Vec<(TitoEmbeddedRelationshipConfig, String)> {
         // (Config for this rel, "model_name:id_found")
         let mut relationship_keys_to_fetch = Vec::new();
 
@@ -784,8 +784,8 @@ where
         &self,
         items: Vec<(String, Value)>,
         rels: Vec<String>,
-        tx: &TiKvTransaction,
-    ) -> Result<Vec<(String, Value)>, TiKvError> {
+        tx: &TitoTransaction,
+    ) -> Result<Vec<(String, Value)>, TitoError> {
         if rels.is_empty() {
             return Ok(items);
         }
@@ -821,8 +821,8 @@ where
         &self,
         id: &str,
         rels: Vec<String>,
-        tx: &TiKvTransaction,
-    ) -> Result<T, TiKvError>
+        tx: &TitoTransaction,
+    ) -> Result<T, TitoError>
     where
         T: 'async_trait + serde::de::DeserializeOwned,
     {
@@ -831,7 +831,7 @@ where
         let value = match self.get(&id, 10, 10, tx).await {
             Ok(value) => value,
             Err(e) => {
-                return Err(TiKvError::NotFound(format!(
+                return Err(TitoError::NotFound(format!(
                     "Failed to get record with id '{}': {}",
                     id, e
                 )));
@@ -844,7 +844,7 @@ where
         {
             Ok(value) => value,
             Err(e) => {
-                return Err(TiKvError::NotFound(format!(
+                return Err(TitoError::NotFound(format!(
                     "Failed to fetch relationships for id '{}' with rels {:?}: {}",
                     id, rels, e
                 )));
@@ -853,19 +853,19 @@ where
 
         if let Some(value) = items.get(0) {
             serde_json::from_value(value.1.clone()).map_err(|err| {
-                TiKvError::NotFound(format!(
+                TitoError::NotFound(format!(
                     "Failed to deserialize record with id '{}': {}",
                     id, err
                 ))
             })
         } else {
-            Err(TiKvError::NotFound(format!(
+            Err(TitoError::NotFound(format!(
                 "No record found with id '{}'",
                 id
             )))
         }
     }
-    async fn find_by_id(&self, id: &str, rels: Vec<String>) -> Result<T, TiKvError>
+    async fn find_by_id(&self, id: &str, rels: Vec<String>) -> Result<T, TitoError>
     where
         T: 'async_trait + serde::de::DeserializeOwned,
     {
@@ -875,8 +875,8 @@ where
 
     async fn find_by_index_reverse(
         &self,
-        payload: TiKvFindByIndexPayload,
-    ) -> Result<TiKvPaginated<T>, TiKvError>
+        payload: TitoFindByIndexPayload,
+    ) -> Result<TitoPaginated<T>, TitoError>
     where
         T: 'async_trait + serde::de::DeserializeOwned,
     {
@@ -886,8 +886,8 @@ where
 
     async fn find_by_index(
         &self,
-        payload: TiKvFindByIndexPayload,
-    ) -> Result<TiKvPaginated<T>, TiKvError>
+        payload: TitoFindByIndexPayload,
+    ) -> Result<TitoPaginated<T>, TitoError>
     where
         T: 'async_trait + serde::de::DeserializeOwned,
     {
@@ -897,9 +897,9 @@ where
 
     async fn find_by_index_reverse_raw(
         &self,
-        payload: TiKvFindByIndexPayload,
-        tx: &TiKvTransaction,
-    ) -> Result<(Vec<(String, Value)>, bool), TiKvError>
+        payload: TitoFindByIndexPayload,
+        tx: &TitoTransaction,
+    ) -> Result<(Vec<(String, Value)>, bool), TitoError>
     where
         T: 'async_trait + serde::de::DeserializeOwned,
     {
@@ -917,8 +917,8 @@ where
             let index_field_type = index_field.r#type;
 
             let value = match index_field_type {
-                TiKvIndexBlockType::String => to_snake_case(value),
-                TiKvIndexBlockType::Number => format!("{:0>10}", value),
+                TitoIndexBlockType::String => to_snake_case(value),
+                TitoIndexBlockType::Number => format!("{:0>10}", value),
             };
 
             let field_name = index_field.name.clone();
@@ -932,7 +932,7 @@ where
 
         let (items, has_more) = self
             .scan_reverse(
-                TiKvScanPayload {
+                TitoScanPayload {
                     start: id,
                     end: payload.end.clone(),
                     limit: payload.limit,
@@ -951,9 +951,9 @@ where
 
     async fn find_by_index_raw(
         &self,
-        payload: TiKvFindByIndexRawPayload,
-        tx: &TiKvTransaction,
-    ) -> Result<(Vec<(String, Value)>, bool), TiKvError>
+        payload: TitoFindByIndexRawPayload,
+        tx: &TitoTransaction,
+    ) -> Result<(Vec<(String, Value)>, bool), TitoError>
     where
         T: 'async_trait + serde::de::DeserializeOwned,
     {
@@ -972,8 +972,8 @@ where
             let index_field_type = index_field.r#type;
 
             let value = match index_field_type {
-                TiKvIndexBlockType::String => to_snake_case(value),
-                TiKvIndexBlockType::Number => format!("{:0>10}", value),
+                TitoIndexBlockType::String => to_snake_case(value),
+                TitoIndexBlockType::Number => format!("{:0>10}", value),
             };
 
             let field_name = index_field.name.clone();
@@ -1001,7 +1001,7 @@ where
 
         let (items, has_more) = self
             .scan(
-                TiKvScanPayload {
+                TitoScanPayload {
                     start: id,
                     end,
                     limit: payload.limit,
@@ -1020,9 +1020,9 @@ where
 
     async fn scan(
         &self,
-        payload: TiKvScanPayload,
-        tx: &TiKvTransaction,
-    ) -> Result<(Vec<(String, Value)>, bool), TiKvError>
+        payload: TitoScanPayload,
+        tx: &TitoTransaction,
+    ) -> Result<(Vec<(String, Value)>, bool), TitoError>
     where
         T: DeserializeOwned,
     {
@@ -1050,7 +1050,7 @@ where
         let scan_stream = tx
             .scan(start_bound..end_bound, limit_plus_one)
             .await
-            .map_err(|e| TiKvError::NotFound(e.to_string()))?;
+            .map_err(|e| TitoError::NotFound(e.to_string()))?;
 
         let mut items = self.to_results(scan_stream)?;
 
@@ -1069,15 +1069,15 @@ where
 
     async fn find_by_index_tx(
         &self,
-        payload: TiKvFindByIndexPayload,
-        tx: &TiKvTransaction,
-    ) -> Result<TiKvPaginated<T>, TiKvError>
+        payload: TitoFindByIndexPayload,
+        tx: &TitoTransaction,
+    ) -> Result<TitoPaginated<T>, TitoError>
     where
         T: 'async_trait + serde::de::DeserializeOwned,
     {
         let (items, has_more) = self
             .find_by_index_raw(
-                TiKvFindByIndexRawPayload {
+                TitoFindByIndexRawPayload {
                     index: payload.index,
                     values: payload.values,
                     rels: payload.rels,
@@ -1097,9 +1097,9 @@ where
 
     async fn find_by_index_reverse_tx(
         &self,
-        payload: TiKvFindByIndexPayload,
-        tx: &TiKvTransaction,
-    ) -> Result<TiKvPaginated<T>, TiKvError>
+        payload: TitoFindByIndexPayload,
+        tx: &TitoTransaction,
+    ) -> Result<TitoPaginated<T>, TitoError>
     where
         T: 'async_trait + serde::de::DeserializeOwned,
     {
@@ -1113,9 +1113,9 @@ where
 
     async fn find_by_index_condition<F>(
         &self,
-        index_payload: TiKvFindByIndexPayload,
+        index_payload: TitoFindByIndexPayload,
         filter_condition: F,
-    ) -> Result<TiKvPaginated<T>, TiKvError>
+    ) -> Result<TitoPaginated<T>, TitoError>
     where
         F: FnMut(&T) -> bool + Clone + Send + 'static,
     {
@@ -1127,7 +1127,7 @@ where
 
         loop {
             let tikv_results = self
-                .find_by_index(TiKvFindByIndexPayload {
+                .find_by_index(TitoFindByIndexPayload {
                     index: index_payload.index.clone(),
                     values: index_payload.values.clone(),
                     rels: index_payload.rels.clone(),
@@ -1153,7 +1153,7 @@ where
         }
 
         items.truncate(target_limit);
-        Ok(TiKvPaginated::new(items, cursor))
+        Ok(TitoPaginated::new(items, cursor))
     }
 
     fn deduplicate_and_track_last_valid(
@@ -1190,15 +1190,15 @@ where
 
     async fn find_one_by_index_tx(
         &self,
-        payload: TiKvFindOneByIndexPayload,
-        tx: &TiKvTransaction,
-    ) -> Result<T, TiKvError>
+        payload: TitoFindOneByIndexPayload,
+        tx: &TitoTransaction,
+    ) -> Result<T, TitoError>
     where
         T: 'async_trait + serde::de::DeserializeOwned,
     {
         let (items, _) = self
             .find_by_index_raw(
-                TiKvFindByIndexRawPayload {
+                TitoFindByIndexRawPayload {
                     index: payload.index.clone(),
                     values: payload.values.clone(),
                     rels: payload.rels.clone(),
@@ -1214,20 +1214,20 @@ where
         if let Some(value) = items.get(0) {
             match serde_json::from_value::<T>(value.1.clone()) {
                 Ok(item) => Ok(item),
-                Err(e) => Err(TiKvError::NotFound(format!(
+                Err(e) => Err(TitoError::NotFound(format!(
                     "Failed to deserialize record for index '{}' with values {:?}: {}",
                     payload.index, payload.values, e
                 ))),
             }
         } else {
-            Err(TiKvError::NotFound(format!(
+            Err(TitoError::NotFound(format!(
                 "No record found for index '{}' with values {:?}",
                 payload.index, payload.values
             )))
         }
     }
 
-    async fn find_one_by_index(&self, payload: TiKvFindOneByIndexPayload) -> Result<T, TiKvError>
+    async fn find_one_by_index(&self, payload: TitoFindOneByIndexPayload) -> Result<T, TitoError>
     where
         T: 'async_trait + serde::de::DeserializeOwned,
     {
@@ -1238,8 +1238,8 @@ where
         &self,
         ids: Vec<String>,
         rels: Vec<String>,
-        tx: &TiKvTransaction,
-    ) -> Result<Vec<T>, TiKvError>
+        tx: &TitoTransaction,
+    ) -> Result<Vec<T>, TitoError>
     where
         T: 'async_trait + DeserializeOwned,
     {
@@ -1260,8 +1260,8 @@ where
         &self,
         ids: Vec<String>,
         rels: Vec<String>,
-        tx: &TiKvTransaction,
-    ) -> Result<Vec<(String, Value)>, TiKvError>
+        tx: &TitoTransaction,
+    ) -> Result<Vec<(String, Value)>, TitoError>
     where
         T: 'async_trait + DeserializeOwned,
     {
@@ -1276,7 +1276,7 @@ where
         Ok(items)
     }
 
-    async fn find_by_ids(&self, ids: Vec<String>, rels: Vec<String>) -> Result<Vec<T>, TiKvError>
+    async fn find_by_ids(&self, ids: Vec<String>, rels: Vec<String>) -> Result<Vec<T>, TitoError>
     where
         T: 'async_trait + DeserializeOwned,
     {
@@ -1295,9 +1295,9 @@ where
 
     async fn scan_reverse(
         &self,
-        payload: TiKvScanPayload,
-        tx: &TiKvTransaction,
-    ) -> Result<(Vec<(String, Value)>, bool), TiKvError>
+        payload: TitoScanPayload,
+        tx: &TitoTransaction,
+    ) -> Result<(Vec<(String, Value)>, bool), TitoError>
     where
         T: DeserializeOwned,
     {
@@ -1326,7 +1326,7 @@ where
         let scan_stream = tx
             .scan_reverse(start_bound..end_bound, limit_plus_one)
             .await
-            .map_err(|e| TiKvError::NotFound(e.to_string()))?;
+            .map_err(|e| TitoError::NotFound(e.to_string()))?;
 
         let mut items = self.to_results(scan_stream)?;
 
@@ -1343,7 +1343,7 @@ where
         Ok((items, has_more))
     }
 
-    async fn update(&self, payload: T, tx: &TiKvTransaction) -> Result<bool, TiKvError>
+    async fn update(&self, payload: T, tx: &TitoTransaction) -> Result<bool, TitoError>
     where
         T: 'async_trait + serde::de::DeserializeOwned,
     {
@@ -1369,8 +1369,8 @@ where
         &self,
         payload: T,
         trigger_event: bool,
-        tx: &TiKvTransaction,
-    ) -> Result<bool, TiKvError>
+        tx: &TitoTransaction,
+    ) -> Result<bool, TitoError>
     where
         T: 'async_trait + serde::de::DeserializeOwned,
     {
@@ -1385,7 +1385,7 @@ where
         Ok(true)
     }
 
-    async fn lock_keys(&self, keys: Vec<String>, tx: &TiKvTransaction) -> Result<bool, TiKvError> {
+    async fn lock_keys(&self, keys: Vec<String>, tx: &TitoTransaction) -> Result<bool, TitoError> {
         let keys: Vec<Key> = keys
             .into_iter()
             .map(|key| Key::from(format!("lock:{}", key).into_bytes()))
@@ -1401,7 +1401,7 @@ where
 
                 Err(_) => {
                     if retries >= max_retries {
-                        return Err(TiKvError::NotFound("Not found relationship".to_string()));
+                        return Err(TitoError::NotFound("Not found relationship".to_string()));
                     }
 
                     sleep(Duration::from_millis(delay)).await;
@@ -1418,8 +1418,8 @@ where
         keys: Vec<String>,
         max_retries: usize,
         initial_delay_ms: u64,
-        tx: &TiKvTransaction,
-    ) -> Result<Vec<(String, Value)>, TiKvError> {
+        tx: &TitoTransaction,
+    ) -> Result<Vec<(String, Value)>, TitoError> {
         let mut retries = 0;
         let mut delay = initial_delay_ms;
 
@@ -1430,7 +1430,7 @@ where
                 }
                 Err(e) => {
                     if retries >= max_retries {
-                        return Err(TiKvError::NotFound(format!(
+                        return Err(TitoError::NotFound(format!(
                             "Failed to batch get keys {:?} after {} retries: {}",
                             keys, max_retries, e
                         )));
@@ -1446,15 +1446,15 @@ where
         &self,
         raw_id: &str,
         trigger_event: bool,
-        tx: &TiKvTransaction,
-    ) -> Result<bool, TiKvError> {
+        tx: &TitoTransaction,
+    ) -> Result<bool, TitoError> {
         let id = format!("{}:{}", self.get_table(), raw_id);
         let reverse_index_key = format!("reverse-index:{}", id);
 
         let reverse_index = self.get_reverse_index(&reverse_index_key, tx).await?;
         let mut keys = reverse_index.value;
 
-        let change_log = TiKvChangeLog {
+        let change_log = TitoChangeLog {
             id: DBUuid::new_v4().to_string(),
             record_id: id.clone(),
             operation: String::from("delete"),
@@ -1474,7 +1474,7 @@ where
         }
 
         self.generate_job(
-            TiKvGenerateJobPayload {
+            TitoGenerateJobPayload {
                 id: raw_id.to_string(),
                 action: trigger_event.then(|| String::from("DELETE")),
                 clear_future: false,
@@ -1487,11 +1487,11 @@ where
         Ok(true)
     }
 
-    async fn delete_by_id(&self, raw_id: &str, tx: &TiKvTransaction) -> Result<bool, TiKvError> {
+    async fn delete_by_id(&self, raw_id: &str, tx: &TitoTransaction) -> Result<bool, TitoError> {
         self.delete_by_id_with_options(raw_id, true, tx).await
     }
 
-    async fn find(&self, payload: TiKvFindPayload) -> Result<TiKvPaginated<T>, TiKvError>
+    async fn find(&self, payload: TitoFindPayload) -> Result<TitoPaginated<T>, TitoError>
     where
         T: DeserializeOwned,
     {
@@ -1500,7 +1500,7 @@ where
         self.tx(|tx| async move {
             let (scan_stream, has_more) = self
                 .scan(
-                    TiKvScanPayload {
+                    TitoScanPayload {
                         start: start_bound,
                         end: None,
                         limit: payload.limit,
@@ -1519,7 +1519,7 @@ where
         .await
     }
 
-    async fn add_field(&self, field_name: &str, field_value: Value) -> Result<(), TiKvError> {
+    async fn add_field(&self, field_name: &str, field_value: Value) -> Result<(), TitoError> {
         let table = self.get_table();
 
         let start_key = format!("{}:", table);
@@ -1531,7 +1531,7 @@ where
             loop {
                 let scan_range = cursor.clone()..end_key.clone();
                 let kvs = tx.scan(scan_range, 100).await.map_err(|_| {
-                    TiKvError::TransactionFailed(String::from("Failed migration, scan"))
+                    TitoError::TransactionFailed(String::from("Failed migration, scan"))
                 })?;
 
                 let mut has_kvs = false;
@@ -1544,7 +1544,7 @@ where
 
                     let model_instance =
                         serde_json::from_value::<T>(value.clone()).map_err(|_| {
-                            TiKvError::TransactionFailed(String::from("Failed migration, model"))
+                            TitoError::TransactionFailed(String::from("Failed migration, model"))
                         })?;
 
                     self.update_with_options(model_instance, false, &tx).await?;
@@ -1557,14 +1557,14 @@ where
                 }
             }
 
-            Ok::<_, TiKvError>(true)
+            Ok::<_, TitoError>(true)
         })
         .await;
 
         Ok(())
     }
 
-    async fn remove_field(&self, field_name: &str) -> Result<(), TiKvError> {
+    async fn remove_field(&self, field_name: &str) -> Result<(), TitoError> {
         let table = self.get_table();
         let start_key = format!("{}:", table);
         let end_key = next_string_lexicographically(start_key.clone());
@@ -1575,7 +1575,7 @@ where
             loop {
                 let scan_range = cursor.clone()..end_key.clone();
                 let kvs = tx.scan(scan_range, 100).await.map_err(|_| {
-                    TiKvError::TransactionFailed(String::from("Failed migration, scan"))
+                    TitoError::TransactionFailed(String::from("Failed migration, scan"))
                 })?;
 
                 let mut has_kvs = false;
@@ -1588,7 +1588,7 @@ where
                     if value.as_object_mut().unwrap().remove(field_name).is_some() {
                         let model_instance =
                             serde_json::from_value::<T>(value.clone()).map_err(|_| {
-                                TiKvError::TransactionFailed(String::from(
+                                TitoError::TransactionFailed(String::from(
                                     "Failed migration, model",
                                 ))
                             })?;
@@ -1604,14 +1604,14 @@ where
                 }
             }
 
-            Ok::<_, TiKvError>(true)
+            Ok::<_, TitoError>(true)
         })
         .await?;
 
         Ok(())
     }
 
-    async fn reindex(&self) -> Result<(), TiKvError> {
+    async fn reindex(&self) -> Result<(), TitoError> {
         let table = self.get_table();
         let start_key = format!("{}:", table);
         let end_key = next_string_lexicographically(start_key.clone());
@@ -1622,7 +1622,7 @@ where
             loop {
                 let scan_range = cursor.clone()..end_key.clone();
                 let kvs = tx.scan(scan_range, 100).await.map_err(|e| {
-                    TiKvError::TransactionFailed(String::from("Failed migration, scan"))
+                    TitoError::TransactionFailed(String::from("Failed migration, scan"))
                 })?;
 
                 let mut has_kvs = false;
@@ -1633,7 +1633,7 @@ where
 
                     let model_instance =
                         serde_json::from_value::<T>(value.clone()).map_err(|_| {
-                            TiKvError::TransactionFailed(String::from("Failed migration, model"))
+                            TitoError::TransactionFailed(String::from("Failed migration, model"))
                         })?;
 
                     self.update_with_options(model_instance, false, &tx).await?;
@@ -1646,7 +1646,7 @@ where
                 }
             }
 
-            Ok::<_, TiKvError>(true)
+            Ok::<_, TitoError>(true)
         })
         .await;
 
@@ -1655,9 +1655,9 @@ where
 
     async fn apply_change_logs(
         &self,
-        change_logs: Vec<TiKvChangeLog>,
-        tx: &TiKvTransaction,
-    ) -> Result<bool, TiKvError> {
+        change_logs: Vec<TitoChangeLog>,
+        tx: &TitoTransaction,
+    ) -> Result<bool, TitoError> {
         for log in change_logs {
             self.put_change_log(log.clone(), tx).await?;
 
@@ -1678,7 +1678,7 @@ where
                         let reverse_key = format!("reverse-index:{}", key);
                         self.put(reverse_key, reverse_index, tx).await?;
                     } else {
-                        return Err(TiKvError::FailedCreate(
+                        return Err(TitoError::FailedCreate(
                             "Missing data for put operation".to_string(),
                         ));
                     }
@@ -1697,7 +1697,7 @@ where
                 }
 
                 _ => {
-                    return Err(TiKvError::FailedDelete(format!(
+                    return Err(TitoError::FailedDelete(format!(
                         "Unsupported operation '{}'",
                         log.operation
                     )));
@@ -1707,7 +1707,7 @@ where
         Ok(true)
     }
 
-    async fn find_all(&self) -> Result<TiKvPaginated<T>, TiKvError> {
+    async fn find_all(&self) -> Result<TitoPaginated<T>, TitoError> {
         let table_name = self.get_table();
         let start_key = format!("{}:", table_name);
         let end_key = next_string_lexicographically(start_key.clone());
@@ -1715,7 +1715,7 @@ where
         self.tx(|tx| async move {
             let (items, has_more) = self
                 .scan(
-                    TiKvScanPayload {
+                    TitoScanPayload {
                         start: start_key,
                         end: Some(end_key),
                         limit: None,
@@ -1729,22 +1729,22 @@ where
                 .iter()
                 .map(|(_, value)| {
                     serde_json::from_value::<T>(value.clone()).map_err(|_| {
-                        TiKvError::DeserializationError("Failed to deserialize".to_string())
+                        TitoError::DeserializationError("Failed to deserialize".to_string())
                     })
                 })
                 .collect::<Result<_, _>>()?;
 
-            Ok(TiKvPaginated::new(results, None))
+            Ok(TitoPaginated::new(results, None))
         })
         .await
     }
 }
 
 #[derive(Clone)]
-pub struct TiKvModel<T> {
-    pub db: TiKvDatabase,
+pub struct TitoModel<T> {
+    pub db: TitoDatabase,
     pub model: T,
-    pub configs: TiKvConfigs,
+    pub configs: TitoConfigs,
     pub transaction_manager: TransactionManager,
 }
 
@@ -1757,12 +1757,12 @@ impl<
             + Unpin
             + std::marker::Send
             + Sync
-            + TiKvModelTrait,
-    > BaseTiKv<T> for TiKvModel<T>
+            + TitoModelTrait,
+    > BaseTito<T> for TitoModel<T>
 {
     fn new(
-        db: TiKvDatabase,
-        configs: TiKvConfigs,
+        db: TitoDatabase,
+        configs: TitoConfigs,
         transaction_manager: TransactionManager,
     ) -> Self {
         Self {
@@ -1781,15 +1781,15 @@ impl<
         &self.model
     }
 
-    fn get_embedded_relationships(&self) -> Vec<TiKvEmbeddedRelationshipConfig> {
+    fn get_embedded_relationships(&self) -> Vec<TitoEmbeddedRelationshipConfig> {
         self.model.get_embedded_relationships()
     }
 
-    fn get_db(&self) -> TiKvDatabase {
+    fn get_db(&self) -> TitoDatabase {
         return self.db.clone();
     }
 
-    fn get_indexes(&self) -> Vec<TiKvIndexConfig> {
+    fn get_indexes(&self) -> Vec<TitoIndexConfig> {
         self.model.get_indexes()
     }
 
@@ -1805,7 +1805,7 @@ impl<
         self.model.get_event_table_name()
     }
 
-    fn get_configs(&self) -> &TiKvConfigs {
+    fn get_configs(&self) -> &TitoConfigs {
         &self.configs
     }
 }

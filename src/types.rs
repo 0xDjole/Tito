@@ -11,65 +11,65 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 #[derive(Clone)]
-pub struct TiKvConfigs {
+pub struct TitoConfigs {
     pub is_read_only: Arc<AtomicBool>,
 }
 
-pub type TiKvDatabase = Arc<TransactionClient>;
+pub type TitoDatabase = Arc<TransactionClient>;
 
-pub type TiKvKey = Key;
+pub type TitoKey = Key;
 
-pub type TiKvCoreTransaction = Transaction;
+pub type TiKvTransaction = Transaction;
 
-pub struct TiKvLockItem {
+pub struct TitoLockItem {
     pub key: String,
     pub value: String,
 }
 
 #[derive(PartialEq, Eq, Error, Debug)]
-pub enum TiKvError {
-    #[error("TiKv: Failed to connect - {0}")]
+pub enum TitoError {
+    #[error("Tito: Failed to connect - {0}")]
     FailedToConnect(String),
-    #[error("TiKv: NotFound - {0}")]
+    #[error("Tito: NotFound - {0}")]
     NotFound(String),
 
-    #[error("TiKv: Failed")]
+    #[error("Tito: Failed")]
     Failed,
-    #[error("TiKv: Incorrect")]
+    #[error("Tito: Incorrect")]
     Incorrect,
 
-    #[error("TiKv: FailedCreate - {0}")]
+    #[error("Tito: FailedCreate - {0}")]
     FailedCreate(String),
 
-    #[error("TiKv: FailedUpdate - {0}")]
+    #[error("Tito: FailedUpdate - {0}")]
     FailedUpdate(String),
 
-    #[error("TiKv: FailedDelete - {0}")]
+    #[error("Tito: FailedDelete - {0}")]
     FailedDelete(String),
 
-    #[error("TiKv: Transaction - {0}")]
+    #[error("Tito: Transaction - {0}")]
     TransactionFailed(String),
 
-    #[error("TiKv: Failed to convert to ObjectId")]
+    #[error("Tito: Failed to convert to ObjectId")]
     FailedToObjectId,
 
-    #[error("TiKv: Deserialization Error: {0}")]
+    #[error("Tito: Deserialization Error: {0}")]
     DeserializationError(String),
 
-    #[error("TiKv: Read-only mode")]
+    #[error("Tito: Read-only mode")]
     ReadOnlyMode,
 }
 
-pub struct TiKvUtilsConnectPayload {
+pub struct TitoUtilsConnectPayload {
     pub uri: String,
 }
 
-pub struct TiKvUtilsConnectInput {
-    pub payload: TiKvUtilsConnectPayload,
+pub struct TitoUtilsConnectInput {
+    pub payload: TitoUtilsConnectPayload,
 }
 
 #[derive(Debug, Clone)]
-pub struct TiKvGenerateJobPayload {
+pub struct TitoGenerateJobPayload {
     pub id: String,
     pub action: Option<String>,
     pub clear_future: bool,
@@ -77,47 +77,47 @@ pub struct TiKvGenerateJobPayload {
 }
 
 #[derive(Debug, Clone)]
-pub struct TiKvEmbeddedRelationshipConfig {
+pub struct TitoEmbeddedRelationshipConfig {
     pub source_field_name: String,
     pub destination_field_name: String,
     pub model: String,
 }
 
 #[derive(Debug, Clone)]
-pub enum TiKvIndexBlockType {
+pub enum TitoIndexBlockType {
     String,
     Number,
 }
 
 #[derive(Debug, Clone)]
-pub struct TiKvIndexField {
+pub struct TitoIndexField {
     pub name: String,
-    pub r#type: TiKvIndexBlockType,
+    pub r#type: TitoIndexBlockType,
 }
 
 #[derive(Debug, Clone)]
-pub struct TiKvTemporalIndex {
+pub struct TitoTemporalIndex {
     pub from_field: String,
     pub to_field: String,
     pub range_field: String,
 }
 
-pub struct TiKvIndexConfig {
+pub struct TitoIndexConfig {
     pub condition: bool,
-    pub fields: Vec<TiKvIndexField>,
+    pub fields: Vec<TitoIndexField>,
     pub name: String,
-    pub custom_generator: Option<Box<dyn Fn() -> Result<Vec<String>, TiKvError> + Send + Sync>>,
+    pub custom_generator: Option<Box<dyn Fn() -> Result<Vec<String>, TitoError> + Send + Sync>>,
 }
 
 #[derive(Debug, Clone)]
-pub struct TiKvRelIndexConfig {
+pub struct TitoRelIndexConfig {
     pub name: String,
     pub field: String,
 }
 
-pub trait TiKvModelTrait {
-    fn get_embedded_relationships(&self) -> Vec<TiKvEmbeddedRelationshipConfig>;
-    fn get_indexes(&self) -> Vec<TiKvIndexConfig>;
+pub trait TitoModelTrait {
+    fn get_embedded_relationships(&self) -> Vec<TitoEmbeddedRelationshipConfig>;
+    fn get_indexes(&self) -> Vec<TitoIndexConfig>;
     fn get_table_name(&self) -> String;
     fn get_event_table_name(&self) -> Option<String>;
     fn get_id(&self) -> String;
@@ -129,7 +129,7 @@ pub struct ReverseIndex {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct TiKvJob {
+pub struct TitoJob {
     pub id: String,
     pub key: String,
     pub entity_id: String,
@@ -145,14 +145,14 @@ pub struct TiKvJob {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct TiKvId {
+pub struct TitoId {
     id: String,
     r#type: String,
 }
 
-impl TiKvId {
-    pub fn new(id: &str, r#type: &str) -> TiKvId {
-        TiKvId {
+impl TitoId {
+    pub fn new(id: &str, r#type: &str) -> TitoId {
+        TitoId {
             id: id.to_string(),
             r#type: r#type.to_string(),
         }
@@ -164,7 +164,7 @@ impl TiKvId {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct TiKvScanPayload {
+pub struct TitoScanPayload {
     pub start: String,
     pub end: Option<String>,
     pub limit: Option<u32>,
@@ -172,7 +172,7 @@ pub struct TiKvScanPayload {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct TiKvFindPayload {
+pub struct TitoFindPayload {
     pub start: String,
     pub end: Option<String>,
     pub limit: Option<u32>,
@@ -181,14 +181,14 @@ pub struct TiKvFindPayload {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct TiKvFindChangeLogSincePaylaod {
+pub struct TitoFindChangeLogSincePaylaod {
     pub timestamp: i64,
     pub limit: Option<u32>,
     pub cursor: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct TiKvFindByIndexPayload {
+pub struct TitoFindByIndexPayload {
     pub index: String,
     pub values: Vec<String>,
     pub rels: Vec<String>,
@@ -198,7 +198,7 @@ pub struct TiKvFindByIndexPayload {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct TiKvFindByIndexRawPayload {
+pub struct TitoFindByIndexRawPayload {
     pub index: String,
     pub values: Vec<String>,
     pub rels: Vec<String>,
@@ -209,14 +209,14 @@ pub struct TiKvFindByIndexRawPayload {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct TiKvFindByMultipleIndexPayload {
-    pub queries: Vec<TiKvFindByMultipleIndexQuery>,
+pub struct TitoFindByMultipleIndexPayload {
+    pub queries: Vec<TitoFindByMultipleIndexQuery>,
     pub limit: Option<u32>,
     pub cursor: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct TiKvFindByMultipleIndexQuery {
+pub struct TitoFindByMultipleIndexQuery {
     pub index: String,
     pub edge_name: Option<String>,
     pub values: Vec<String>,
@@ -225,42 +225,42 @@ pub struct TiKvFindByMultipleIndexQuery {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct TiKvFindOneByIndexPayload {
+pub struct TitoFindOneByIndexPayload {
     pub index: String,
     pub values: Vec<String>,
     pub rels: Vec<String>,
 }
 
 #[derive(Default, Serialize, Debug)]
-pub struct TiKvPaginated<T> {
+pub struct TitoPaginated<T> {
     pub items: Vec<T>,
     pub cursor: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize, Debug)]
-pub struct TiKvCursor {
+pub struct TitoCursor {
     pub ids: Vec<Option<String>>,
 }
 
-impl TiKvCursor {
-    pub fn first_id(&self) -> Result<String, TiKvError> {
+impl TitoCursor {
+    pub fn first_id(&self) -> Result<String, TitoError> {
         // Attempt to get the first element, which is an Option<&Option<String>>
         self.ids
             .get(0)
             .and_then(|id_option| id_option.as_ref())
             .map(|id| id.to_string())
-            .ok_or(TiKvError::Failed)
+            .ok_or(TitoError::Failed)
     }
 }
 
-impl<T> TiKvPaginated<T> {
+impl<T> TitoPaginated<T> {
     pub fn new(items: Vec<T>, cursor: Option<String>) -> Self {
         Self { items, cursor }
     }
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, Debug)]
-pub struct TiKvChangeLog {
+pub struct TitoChangeLog {
     pub id: String,
     pub record_id: String,
     pub operation: String,

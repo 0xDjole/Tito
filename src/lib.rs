@@ -6,8 +6,8 @@ pub mod types;
 mod base;
 pub mod transaction;
 
-pub use base::BaseTiKv;
-pub use base::TiKvModel;
+pub use base::BaseTito;
+pub use base::TitoModel;
 
 mod utils;
 

@@ -8,22 +8,22 @@ use tokio::time::sleep;
 
 use crate::{
     transaction::TransactionManager,
-    types::{TiKvDatabase, TiKvError, TiKvJob},
+    types::{TitoDatabase, TitoError, TitoJob},
 };
 
 #[derive(Clone)]
-pub struct TiKvQueue {
-    pub db: TiKvDatabase,
+pub struct TitoQueue {
+    pub db: TitoDatabase,
     pub tx_manager: TransactionManager,
     pub table: String,
 }
 
-impl TiKvQueue {
+impl TitoQueue {
     pub async fn push(
         &self,
         _message: String,
         _date: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<(), TiKvError> {
+    ) -> Result<(), TitoError> {
         Ok(())
     }
 
@@ -32,8 +32,8 @@ impl TiKvQueue {
         limit: u32,
         _offset: u32,
         _group_id: Option<String>,
-    ) -> Result<Vec<TiKvJob>, TiKvError> {
-        let mut jobs: Vec<TiKvJob> = Vec::new();
+    ) -> Result<Vec<TitoJob>, TitoError> {
+        let mut jobs: Vec<TitoJob> = Vec::new();
 
         let start_bound = format!("{}:PENDING", self.table);
 
@@ -46,7 +46,7 @@ impl TiKvQueue {
                 let scan_stream = tx.scan(start_bound..end_bound, limit).await?;
 
                 for item in scan_stream {
-                    if let Ok(job) = serde_json::from_slice::<TiKvJob>(&item.1) {
+                    if let Ok(job) = serde_json::from_slice::<TitoJob>(&item.1) {
                         jobs.push(job);
                     }
                 }
@@ -82,13 +82,13 @@ impl TiKvQueue {
                     }
                 }
 
-                Ok::<_, TiKvError>(jobs)
+                Ok::<_, TitoError>(jobs)
             })
             .await?;
 
         Ok(jobs.into_iter().map(|job| job.into()).collect())
     }
-    pub async fn success_job(&self, job_id: String) -> Result<(), TiKvError> {
+    pub async fn success_job(&self, job_id: String) -> Result<(), TitoError> {
         let new_key = job_id.replace("PROGRESS", "COMPLETED");
 
         self.tx_manager
@@ -96,17 +96,17 @@ impl TiKvQueue {
                 let job = tx.get(job_id.clone()).await?;
 
                 if let Some(job_bytes) = job {
-                    let mut job: TiKvJob = serde_json::from_slice(&job_bytes)
-                        .map_err(|_| TiKvError::NotFound(String::from("Failed job")))?;
+                    let mut job: TitoJob = serde_json::from_slice(&job_bytes)
+                        .map_err(|_| TitoError::NotFound(String::from("Failed job")))?;
                     job.status = "COMPLETED".to_string();
                     job.key = new_key.clone();
 
                     tx.delete(job_id)
                         .await
-                        .map_err(|_| TiKvError::TransactionFailed(String::from("Failed job")))?;
+                        .map_err(|_| TitoError::TransactionFailed(String::from("Failed job")))?;
                     tx.put(new_key.clone(), serde_json::to_vec(&job).unwrap())
                         .await
-                        .map_err(|_| TiKvError::Failed)?;
+                        .map_err(|_| TitoError::Failed)?;
 
                     let key_by_entity = format!(
                         "{}_by_entity:{}:{}:{}:{}",
@@ -115,23 +115,23 @@ impl TiKvQueue {
 
                     tx.put(key_by_entity, serde_json::to_vec(&new_key).unwrap())
                         .await
-                        .map_err(|_| TiKvError::TransactionFailed(String::from("Failed job")))?;
+                        .map_err(|_| TitoError::TransactionFailed(String::from("Failed job")))?;
                 }
-                Ok::<_, TiKvError>(())
+                Ok::<_, TitoError>(())
             })
             .await;
 
         Ok(())
     }
 
-    pub async fn fail_job(&self, job_id: String) -> Result<(), TiKvError> {
+    pub async fn fail_job(&self, job_id: String) -> Result<(), TitoError> {
         self.tx_manager
             .transaction(|tx| async move {
                 let job = tx.get(job_id.clone()).await?;
 
                 if let Some(job_bytes) = job {
-                    let mut job: TiKvJob = serde_json::from_slice(&job_bytes)
-                        .map_err(|_| TiKvError::TransactionFailed(String::from("Failed job")))?;
+                    let mut job: TitoJob = serde_json::from_slice(&job_bytes)
+                        .map_err(|_| TitoError::TransactionFailed(String::from("Failed job")))?;
 
                     if job.retries < job.max_retries {
                         let additional_seconds = (job.retries * job.retries * 60) as i64;
@@ -151,13 +151,13 @@ impl TiKvQueue {
                             job.status = "PENDING".to_string();
 
                             tx.delete(job_id).await.map_err(|_| {
-                                TiKvError::TransactionFailed(String::from("Failed job"))
+                                TitoError::TransactionFailed(String::from("Failed job"))
                             })?;
 
                             tx.put(new_key, serde_json::to_vec(&job).unwrap())
                                 .await
                                 .map_err(|_| {
-                                    TiKvError::TransactionFailed(String::from("Failed job"))
+                                    TitoError::TransactionFailed(String::from("Failed job"))
                                 })?;
                         }
                     } else {
@@ -166,37 +166,37 @@ impl TiKvQueue {
                         job.status = "FAILED".to_string();
 
                         tx.delete(job_id).await.map_err(|_| {
-                            TiKvError::TransactionFailed(String::from("Failed job"))
+                            TitoError::TransactionFailed(String::from("Failed job"))
                         })?;
 
                         tx.put(new_key, serde_json::to_vec(&job).unwrap())
                             .await
                             .map_err(|_| {
-                                TiKvError::TransactionFailed(String::from("Failed job"))
+                                TitoError::TransactionFailed(String::from("Failed job"))
                             })?;
                     }
                 }
 
-                Ok::<_, TiKvError>(())
+                Ok::<_, TitoError>(())
             })
             .await;
 
         Ok(())
     }
-    pub async fn clear(&self) -> Result<(), TiKvError> {
+    pub async fn clear(&self) -> Result<(), TitoError> {
         Ok(())
     }
 }
 
 pub async fn run_worker<H>(
-    queue: Arc<TiKvQueue>,
+    queue: Arc<TitoQueue>,
     handler: H,
     is_leader: Arc<AtomicBool>,
     concurrency: u32,
     mut shutdown: broadcast::Receiver<()>,
 ) -> tokio::task::JoinHandle<()>
 where
-    H: Fn(TiKvJob) -> futures::future::BoxFuture<'static, Result<(), TiKvError>>
+    H: Fn(TitoJob) -> futures::future::BoxFuture<'static, Result<(), TitoError>>
         + Clone
         + Send
         + Sync
