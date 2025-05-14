@@ -128,14 +128,14 @@ impl TitoTransaction {
 
 #[derive(Clone)]
 pub struct TransactionManager {
-    pub db: Arc<TitoDatabase>,
+    pub db: TitoDatabase,
     pub active_transactions: Arc<Mutex<HashMap<String, TitoTransaction>>>, // HashMap for active transactions
 }
 
 impl TransactionManager {
     pub fn new(db: TitoDatabase) -> Self {
         Self {
-            db: Arc::new(db),
+            db,
             active_transactions: Arc::new(Mutex::new(HashMap::new())), // Initialize empty HashMap
         }
     }
