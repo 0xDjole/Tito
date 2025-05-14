@@ -68,7 +68,7 @@ async fn main() -> Result<(), TitoError> {
     let tx_manager = TransactionManager::new(Arc::new(tikv_client));
 
     // Create model
-    let user_model = TitoModel::<User>::new(tx_manager.db.clone(), configs, tx_manager.clone());
+    let user_model = TitoModel::<User>::new(configs, tx_manager.clone());
 
     // Create a user
     let user_id = DBUuid::new_v4().to_string();

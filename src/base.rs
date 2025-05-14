@@ -28,9 +28,7 @@ pub trait BaseTito<T>
 where
     T: Clone + Serialize + DeserializeOwned + Unpin + std::marker::Send + Sync + TitoModelTrait,
 {
-    fn new(db: TitoDatabase, configs: TitoConfigs, transaction_manager: TransactionManager)
-        -> Self;
-    fn get_db(&self) -> TitoDatabase;
+    fn new(configs: TitoConfigs, transaction_manager: TransactionManager) -> Self;
     fn get_model(&self) -> &T;
     fn get_embedded_relationships(&self) -> Vec<TitoEmbeddedRelationshipConfig>;
     fn get_indexes(&self) -> Vec<TitoIndexConfig>;
@@ -1742,7 +1740,6 @@ where
 
 #[derive(Clone)]
 pub struct TitoModel<T> {
-    pub db: TitoDatabase,
     pub model: T,
     pub configs: TitoConfigs,
     pub transaction_manager: TransactionManager,
@@ -1760,13 +1757,8 @@ impl<
             + TitoModelTrait,
     > BaseTito<T> for TitoModel<T>
 {
-    fn new(
-        db: TitoDatabase,
-        configs: TitoConfigs,
-        transaction_manager: TransactionManager,
-    ) -> Self {
+    fn new(configs: TitoConfigs, transaction_manager: TransactionManager) -> Self {
         Self {
-            db,
             model: T::default(),
             configs,
             transaction_manager,
@@ -1783,10 +1775,6 @@ impl<
 
     fn get_embedded_relationships(&self) -> Vec<TitoEmbeddedRelationshipConfig> {
         self.model.get_embedded_relationships()
-    }
-
-    fn get_db(&self) -> TitoDatabase {
-        return self.db.clone();
     }
 
     fn get_indexes(&self) -> Vec<TitoIndexConfig> {
