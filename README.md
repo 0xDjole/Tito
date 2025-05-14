@@ -182,25 +182,6 @@ let post_with_tags = post_model
     .await?;
 ```
 
-### Custom Index Generators
-
-For complex indexing scenarios, create custom index generators:
-
-```rust
-TitoIndexConfig {
-    condition: true,
-    name: "post-by-tag".to_string(),
-    fields: vec![TitoIndexField {
-        name: "tag_ids".to_string(),
-        r#type: TitoIndexBlockType::String,
-    }],
-    custom_generator: Some(Box::new(|post: &Post| {
-        // Generate an index entry for each tag
-        post.tag_ids.iter().map(|tag_id| tag_id.clone()).collect()
-    })),
-}
-```
-
 ### Query by Index
 
 Efficiently query data using custom indexes:
