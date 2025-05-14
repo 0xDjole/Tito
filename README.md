@@ -9,6 +9,8 @@ Tito is a powerful, flexible database layer built on top of TiKV, providing robu
 - **Powerful Indexing Strategies**: Define custom indexes with conditional logic for efficient querying
 - **Relationship Modeling**: Create and manage embedded relationships between data models
 - **Transaction Management**: Full ACID-compliant transaction support
+- **Job Queue**: Built-in persistent job queue with retries and scheduling capabilities
+- **Async Workers**: Tokio-powered workers for concurrent job processing
 - **Type Safety**: Leverages Rust's type system for safety and performance
 - **Flexible Query API**: Query data using multiple strategies based on your application needs
 
