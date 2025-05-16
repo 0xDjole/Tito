@@ -1,7 +1,7 @@
 use crate::{
     transaction::TitoTransaction,
     types::{TitoError, TitoFindByIndexPayload, TitoModelTrait, TitoPaginated},
-    BaseTito, TitoModel,
+    TitoModel,
 };
 use serde::{de::DeserializeOwned, Serialize};
 

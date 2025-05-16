@@ -10,7 +10,7 @@ use tito::{
         TitoIndexBlockType, TitoIndexConfig, TitoIndexField, TitoModelTrait, TitoUtilsConnectInput,
         TitoUtilsConnectPayload,
     },
-    BaseTito, TitoModel,
+    TitoModel,
 };
 
 // Simple Tag model

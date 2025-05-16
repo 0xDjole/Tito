@@ -9,7 +9,7 @@ use tito::{
         DBUuid, TitoConfigs, TitoError, TitoIndexBlockType, TitoIndexConfig, TitoIndexField,
         TitoModelTrait, TitoUtilsConnectInput, TitoUtilsConnectPayload,
     },
-    BaseTito, TitoModel,
+    TitoModel,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

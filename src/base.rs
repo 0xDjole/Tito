@@ -24,28 +24,67 @@ use serde_json::Value;
 use tikv_client::{Key, KvPair};
 use tokio::time::{sleep, Duration};
 
-#[async_trait]
-pub trait BaseTito<T>
-where
-    T: Clone
-        + Serialize
-        + DeserializeOwned
-        + Unpin
-        + std::marker::Send
-        + Sync
-        + TitoModelTrait
-        + Default,
-{
-    fn new(configs: TitoConfigs, transaction_manager: TransactionManager) -> Self;
-    fn get_model(&self) -> &T;
-    fn get_embedded_relationships(&self) -> Vec<TitoEmbeddedRelationshipConfig>;
-    fn get_indexes(&self) -> Vec<TitoIndexConfig>;
-    fn get_id(&self) -> String;
-    fn get_configs(&self) -> &TitoConfigs;
-    fn transaction_manager(&self) -> TransactionManager;
+#[derive(Clone)]
+pub struct TitoModel<T> {
+    pub model: T,
+    pub configs: TitoConfigs,
+    pub transaction_manager: TransactionManager,
+}
 
-    fn get_table(&self) -> String;
-    fn get_event_table(&self) -> Option<String>;
+impl<
+        T: Default
+            + Clone
+            + Serialize
+            + DeserializeOwned
+            + Unpin
+            + std::marker::Send
+            + Sync
+            + TitoModelTrait,
+    > TitoModel<T>
+{
+    pub fn new(configs: TitoConfigs, transaction_manager: TransactionManager) -> Self {
+        Self {
+            model: T::default(),
+            configs,
+            transaction_manager,
+        }
+    }
+
+    fn get_id(&self) -> String {
+        self.model.get_id()
+    }
+
+    fn get_model(&self) -> &T {
+        &self.model
+    }
+
+    fn get_embedded_relationships(&self) -> Vec<TitoEmbeddedRelationshipConfig> {
+        self.model.get_embedded_relationships()
+    }
+
+    fn get_indexes(&self) -> Vec<TitoIndexConfig> {
+        self.model.get_indexes()
+    }
+
+    fn get_table(&self) -> String {
+        self.model.get_table_name()
+    }
+
+    fn transaction_manager(&self) -> TransactionManager {
+        self.transaction_manager.clone()
+    }
+
+    fn get_event_table(&self) -> Option<String> {
+        self.model.get_event_table_name()
+    }
+
+    fn get_configs(&self) -> &TitoConfigs {
+        &self.configs
+    }
+
+    pub fn query_by_index(&self, index: impl Into<String>) -> IndexQueryBuilder<T> {
+        IndexQueryBuilder::new(self.clone(), index.into())
+    }
 
     fn decode_cursor(&self, cursor: String) -> Result<TitoCursor, TitoError> {
         let cursor = decode(cursor).map_err(|err| TitoError::Failed)?;
@@ -64,7 +103,7 @@ where
 
     async fn tx<F, Fut, R, E>(&self, f: F) -> Result<R, E>
     where
-        F: FnOnce(TitoTransaction) -> Fut + Send + 'async_trait,
+        F: FnOnce(TitoTransaction) -> Fut + Send,
         Fut: Future<Output = Result<R, E>> + Send,
         E: From<TitoError> + Send + Sync + std::fmt::Debug, // Added Sync trait bound
         R: Send,
@@ -137,7 +176,7 @@ where
             }
         }
     }
-    async fn get_key(&self, key: &str, tx: &TitoTransaction) -> Result<Value, TitoError> {
+    pub async fn get_key(&self, key: &str, tx: &TitoTransaction) -> Result<Value, TitoError> {
         let result = tx
             .get(key.to_string())
             .await
@@ -149,7 +188,7 @@ where
             .map_err(|_| TitoError::NotFound("Not found".to_string()))
     }
 
-    async fn put_change_log(
+    pub async fn put_change_log(
         &self,
         change_log: TitoChangeLog,
         tx: &TitoTransaction,
@@ -164,7 +203,7 @@ where
         Ok(true)
     }
 
-    async fn find_changelog_since(
+    pub async fn find_changelog_since(
         &self,
         payload: TitoFindChangeLogSincePaylaod,
         tx: &TitoTransaction,
@@ -252,7 +291,8 @@ where
             }
         }
     }
-    async fn delete(&self, key: String, tx: &TitoTransaction) -> Result<bool, TitoError> {
+
+    pub async fn delete(&self, key: String, tx: &TitoTransaction) -> Result<bool, TitoError> {
         let mut retries = 0;
         let mut delay = 10;
         let max_retries = 10;
@@ -285,7 +325,7 @@ where
         }
     }
 
-    fn to_paginated_items_with_cursor(
+    pub fn to_paginated_items_with_cursor(
         &self,
         items: Vec<(String, Value)>,
         cursor: String,
@@ -474,22 +514,22 @@ where
         Ok(all_index_keys)
     }
 
-    async fn build(&self, payload: T, tx: &TitoTransaction) -> Result<T, TitoError>
+    pub async fn build(&self, payload: T, tx: &TitoTransaction) -> Result<T, TitoError>
     where
-        T: 'async_trait + serde::de::DeserializeOwned,
+        T: serde::de::DeserializeOwned,
     {
         self.build_with_options(payload, Some(String::from("CREATE")), tx)
             .await
     }
 
-    async fn build_with_options(
+    pub async fn build_with_options(
         &self,
         payload: T,
         event_action: Option<String>,
         tx: &TitoTransaction,
     ) -> Result<T, TitoError>
     where
-        T: 'async_trait + serde::de::DeserializeOwned,
+        T: serde::de::DeserializeOwned,
     {
         let value = serde_json::to_value(&payload).unwrap();
 
@@ -654,7 +694,7 @@ where
         Ok(true)
     }
 
-    fn stitch_relationship(
+    pub fn stitch_relationship(
         &self,
         item: &mut Value,
         rel_map: &HashMap<String, Value>,
@@ -739,7 +779,7 @@ where
         }
     }
 
-    fn get_relationship_data(
+    pub fn get_relationship_data(
         &self,
         items: &Vec<(String, Value)>,
         rels_config: &[TitoEmbeddedRelationshipConfig],
@@ -823,14 +863,14 @@ where
         Ok(final_items)
     }
 
-    async fn find_by_id_tx(
+    pub async fn find_by_id_tx(
         &self,
         id: &str,
         rels: Vec<String>,
         tx: &TitoTransaction,
     ) -> Result<T, TitoError>
     where
-        T: 'async_trait + serde::de::DeserializeOwned,
+        T: serde::de::DeserializeOwned,
     {
         let id = format!("{}:{}", self.get_table(), id);
 
@@ -871,43 +911,43 @@ where
             )))
         }
     }
-    async fn find_by_id(&self, id: &str, rels: Vec<String>) -> Result<T, TitoError>
+    pub async fn find_by_id(&self, id: &str, rels: Vec<String>) -> Result<T, TitoError>
     where
-        T: 'async_trait + serde::de::DeserializeOwned,
+        T: serde::de::DeserializeOwned,
     {
         self.tx(|tx| async move { self.find_by_id_tx(id, rels, &tx).await })
             .await
     }
 
-    async fn find_by_index_reverse(
+    pub async fn find_by_index_reverse(
         &self,
         payload: TitoFindByIndexPayload,
     ) -> Result<TitoPaginated<T>, TitoError>
     where
-        T: 'async_trait + serde::de::DeserializeOwned,
+        T: serde::de::DeserializeOwned,
     {
         self.tx(|tx| async move { self.find_by_index_reverse_tx(payload, &tx).await })
             .await
     }
 
-    async fn find_by_index(
+    pub async fn find_by_index(
         &self,
         payload: TitoFindByIndexPayload,
     ) -> Result<TitoPaginated<T>, TitoError>
     where
-        T: 'async_trait + serde::de::DeserializeOwned,
+        T: serde::de::DeserializeOwned,
     {
         self.tx(|tx| async move { self.find_by_index_tx(payload, &tx).await })
             .await
     }
 
-    async fn find_by_index_reverse_raw(
+    pub async fn find_by_index_reverse_raw(
         &self,
         payload: TitoFindByIndexPayload,
         tx: &TitoTransaction,
     ) -> Result<(Vec<(String, Value)>, bool), TitoError>
     where
-        T: 'async_trait + serde::de::DeserializeOwned,
+        T: serde::de::DeserializeOwned,
     {
         let indexes = self.get_indexes();
         let index = indexes
@@ -955,13 +995,13 @@ where
         Ok((items, has_more))
     }
 
-    async fn find_by_index_raw(
+    pub async fn find_by_index_raw(
         &self,
         payload: TitoFindByIndexRawPayload,
         tx: &TitoTransaction,
     ) -> Result<(Vec<(String, Value)>, bool), TitoError>
     where
-        T: 'async_trait + serde::de::DeserializeOwned,
+        T: serde::de::DeserializeOwned,
     {
         let indexes = self.get_indexes();
 
@@ -1024,7 +1064,7 @@ where
         Ok((items, has_more))
     }
 
-    async fn scan(
+    pub async fn scan(
         &self,
         payload: TitoScanPayload,
         tx: &TitoTransaction,
@@ -1073,13 +1113,13 @@ where
         Ok((items, has_more))
     }
 
-    async fn find_by_index_tx(
+    pub async fn find_by_index_tx(
         &self,
         payload: TitoFindByIndexPayload,
         tx: &TitoTransaction,
     ) -> Result<TitoPaginated<T>, TitoError>
     where
-        T: 'async_trait + serde::de::DeserializeOwned,
+        T: serde::de::DeserializeOwned,
     {
         let (items, has_more) = self
             .find_by_index_raw(
@@ -1101,13 +1141,13 @@ where
         Ok(results)
     }
 
-    async fn find_by_index_reverse_tx(
+    pub async fn find_by_index_reverse_tx(
         &self,
         payload: TitoFindByIndexPayload,
         tx: &TitoTransaction,
     ) -> Result<TitoPaginated<T>, TitoError>
     where
-        T: 'async_trait + serde::de::DeserializeOwned,
+        T: serde::de::DeserializeOwned,
     {
         let cursor = payload.cursor.clone();
         let (items, has_more) = self.find_by_index_reverse_raw(payload, tx).await?;
@@ -1117,7 +1157,7 @@ where
         Ok(results)
     }
 
-    async fn find_by_index_condition<F>(
+    pub async fn find_by_index_condition<F>(
         &self,
         index_payload: TitoFindByIndexPayload,
         filter_condition: F,
@@ -1162,7 +1202,7 @@ where
         Ok(TitoPaginated::new(items, cursor))
     }
 
-    fn deduplicate_and_track_last_valid(
+    pub fn deduplicate_and_track_last_valid(
         &self,
         items: &[(String, Value)],
         origins: &[usize],
@@ -1194,13 +1234,13 @@ where
         (result, query_cursors)
     }
 
-    async fn find_one_by_index_tx(
+    pub async fn find_one_by_index_tx(
         &self,
         payload: TitoFindOneByIndexPayload,
         tx: &TitoTransaction,
     ) -> Result<T, TitoError>
     where
-        T: 'async_trait + serde::de::DeserializeOwned,
+        T: serde::de::DeserializeOwned,
     {
         let (items, _) = self
             .find_by_index_raw(
@@ -1233,21 +1273,24 @@ where
         }
     }
 
-    async fn find_one_by_index(&self, payload: TitoFindOneByIndexPayload) -> Result<T, TitoError>
+    pub async fn find_one_by_index(
+        &self,
+        payload: TitoFindOneByIndexPayload,
+    ) -> Result<T, TitoError>
     where
-        T: 'async_trait + serde::de::DeserializeOwned,
+        T: serde::de::DeserializeOwned,
     {
         self.tx(|tx| async move { self.find_one_by_index_tx(payload, &tx).await })
             .await
     }
-    async fn find_by_ids_tx(
+    pub async fn find_by_ids_tx(
         &self,
         ids: Vec<String>,
         rels: Vec<String>,
         tx: &TitoTransaction,
     ) -> Result<Vec<T>, TitoError>
     where
-        T: 'async_trait + DeserializeOwned,
+        T: DeserializeOwned,
     {
         let items = self.find_by_ids_raw(ids, rels, tx).await?;
 
@@ -1262,14 +1305,14 @@ where
         Ok(result)
     }
 
-    async fn find_by_ids_raw(
+    pub async fn find_by_ids_raw(
         &self,
         ids: Vec<String>,
         rels: Vec<String>,
         tx: &TitoTransaction,
     ) -> Result<Vec<(String, Value)>, TitoError>
     where
-        T: 'async_trait + DeserializeOwned,
+        T: DeserializeOwned,
     {
         let ids = ids
             .into_iter()
@@ -1282,9 +1325,13 @@ where
         Ok(items)
     }
 
-    async fn find_by_ids(&self, ids: Vec<String>, rels: Vec<String>) -> Result<Vec<T>, TitoError>
+    pub async fn find_by_ids(
+        &self,
+        ids: Vec<String>,
+        rels: Vec<String>,
+    ) -> Result<Vec<T>, TitoError>
     where
-        T: 'async_trait + DeserializeOwned,
+        T: DeserializeOwned,
     {
         self.tx(|tx| async move {
             let items = self.find_by_ids_raw(ids, rels, &tx).await?;
@@ -1299,7 +1346,7 @@ where
         .await
     }
 
-    async fn scan_reverse(
+    pub async fn scan_reverse(
         &self,
         payload: TitoScanPayload,
         tx: &TitoTransaction,
@@ -1349,19 +1396,19 @@ where
         Ok((items, has_more))
     }
 
-    async fn update(&self, payload: T, tx: &TitoTransaction) -> Result<bool, TitoError>
+    pub async fn update(&self, payload: T, tx: &TitoTransaction) -> Result<bool, TitoError>
     where
-        T: 'async_trait + serde::de::DeserializeOwned,
+        T: serde::de::DeserializeOwned,
     {
         self.update_with_options(payload, true, tx).await
     }
 
-    fn get_last_id(&self, key: String) -> Option<String> {
+    pub fn get_last_id(&self, key: String) -> Option<String> {
         let parts: Vec<&str> = key.split(':').collect();
         parts.last().map(|last| last.to_string())
     }
 
-    fn extract_relationship(&self, input: &str) -> Option<String> {
+    pub fn extract_relationship(&self, input: &str) -> Option<String> {
         if let (Some(start), Some(end)) = (input.find("-").map(|idx| idx + 1), input.rfind("-")) {
             if start < end {
                 return Some(input[start..end].trim().to_string());
@@ -1371,14 +1418,14 @@ where
         None
     }
 
-    async fn update_with_options(
+    pub async fn update_with_options(
         &self,
         payload: T,
         trigger_event: bool,
         tx: &TitoTransaction,
     ) -> Result<bool, TitoError>
     where
-        T: 'async_trait + serde::de::DeserializeOwned,
+        T: serde::de::DeserializeOwned,
     {
         let raw_id = payload.get_id();
 
@@ -1391,7 +1438,11 @@ where
         Ok(true)
     }
 
-    async fn lock_keys(&self, keys: Vec<String>, tx: &TitoTransaction) -> Result<bool, TitoError> {
+    pub async fn lock_keys(
+        &self,
+        keys: Vec<String>,
+        tx: &TitoTransaction,
+    ) -> Result<bool, TitoError> {
         let keys: Vec<Key> = keys
             .into_iter()
             .map(|key| Key::from(format!("lock:{}", key).into_bytes()))
@@ -1419,7 +1470,7 @@ where
         }
     }
 
-    async fn batch_get(
+    pub async fn batch_get(
         &self,
         keys: Vec<String>,
         max_retries: usize,
@@ -1448,7 +1499,8 @@ where
             }
         }
     }
-    async fn delete_by_id_with_options(
+
+    pub async fn delete_by_id_with_options(
         &self,
         raw_id: &str,
         trigger_event: bool,
@@ -1493,11 +1545,15 @@ where
         Ok(true)
     }
 
-    async fn delete_by_id(&self, raw_id: &str, tx: &TitoTransaction) -> Result<bool, TitoError> {
+    pub async fn delete_by_id(
+        &self,
+        raw_id: &str,
+        tx: &TitoTransaction,
+    ) -> Result<bool, TitoError> {
         self.delete_by_id_with_options(raw_id, true, tx).await
     }
 
-    async fn find(&self, payload: TitoFindPayload) -> Result<TitoPaginated<T>, TitoError>
+    pub async fn find(&self, payload: TitoFindPayload) -> Result<TitoPaginated<T>, TitoError>
     where
         T: DeserializeOwned,
     {
@@ -1525,7 +1581,7 @@ where
         .await
     }
 
-    async fn add_field(&self, field_name: &str, field_value: Value) -> Result<(), TitoError> {
+    pub async fn add_field(&self, field_name: &str, field_value: Value) -> Result<(), TitoError> {
         let table = self.get_table();
 
         let start_key = format!("{}:", table);
@@ -1570,7 +1626,7 @@ where
         Ok(())
     }
 
-    async fn remove_field(&self, field_name: &str) -> Result<(), TitoError> {
+    pub async fn remove_field(&self, field_name: &str) -> Result<(), TitoError> {
         let table = self.get_table();
         let start_key = format!("{}:", table);
         let end_key = next_string_lexicographically(start_key.clone());
@@ -1617,7 +1673,7 @@ where
         Ok(())
     }
 
-    async fn reindex(&self) -> Result<(), TitoError> {
+    pub async fn reindex(&self) -> Result<(), TitoError> {
         let table = self.get_table();
         let start_key = format!("{}:", table);
         let end_key = next_string_lexicographically(start_key.clone());
@@ -1659,7 +1715,7 @@ where
         Ok(())
     }
 
-    async fn apply_change_logs(
+    pub async fn apply_change_logs(
         &self,
         change_logs: Vec<TitoChangeLog>,
         tx: &TitoTransaction,
@@ -1713,7 +1769,7 @@ where
         Ok(true)
     }
 
-    async fn find_all(&self) -> Result<TitoPaginated<T>, TitoError> {
+    pub async fn find_all(&self) -> Result<TitoPaginated<T>, TitoError> {
         let table_name = self.get_table();
         let start_key = format!("{}:", table_name);
         let end_key = next_string_lexicographically(start_key.clone());
@@ -1743,81 +1799,5 @@ where
             Ok(TitoPaginated::new(results, None))
         })
         .await
-    }
-}
-
-#[derive(Clone)]
-pub struct TitoModel<T> {
-    pub model: T,
-    pub configs: TitoConfigs,
-    pub transaction_manager: TransactionManager,
-}
-
-#[async_trait]
-impl<
-        T: Default
-            + Clone
-            + Serialize
-            + DeserializeOwned
-            + Unpin
-            + std::marker::Send
-            + Sync
-            + TitoModelTrait,
-    > BaseTito<T> for TitoModel<T>
-{
-    fn new(configs: TitoConfigs, transaction_manager: TransactionManager) -> Self {
-        Self {
-            model: T::default(),
-            configs,
-            transaction_manager,
-        }
-    }
-
-    fn get_id(&self) -> String {
-        self.model.get_id()
-    }
-
-    fn get_model(&self) -> &T {
-        &self.model
-    }
-
-    fn get_embedded_relationships(&self) -> Vec<TitoEmbeddedRelationshipConfig> {
-        self.model.get_embedded_relationships()
-    }
-
-    fn get_indexes(&self) -> Vec<TitoIndexConfig> {
-        self.model.get_indexes()
-    }
-
-    fn get_table(&self) -> String {
-        self.model.get_table_name()
-    }
-
-    fn transaction_manager(&self) -> TransactionManager {
-        self.transaction_manager.clone()
-    }
-
-    fn get_event_table(&self) -> Option<String> {
-        self.model.get_event_table_name()
-    }
-
-    fn get_configs(&self) -> &TitoConfigs {
-        &self.configs
-    }
-}
-
-impl<
-        T: Default
-            + Clone
-            + Serialize
-            + DeserializeOwned
-            + Unpin
-            + std::marker::Send
-            + Sync
-            + TitoModelTrait,
-    > TitoModel<T>
-{
-    pub fn query_by_index(&self, index: impl Into<String>) -> IndexQueryBuilder<T> {
-        IndexQueryBuilder::new(self.clone(), index.into())
     }
 }
