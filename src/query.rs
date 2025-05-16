@@ -60,12 +60,6 @@ where
         self
     }
 
-    // Set relationships to include
-    pub fn relationships(mut self, rels: Vec<String>) -> Self {
-        self.rels = rels;
-        self
-    }
-
     // Add a single relationship
     pub fn relationship(mut self, rel: impl Into<String>) -> Self {
         self.rels.push(rel.into());
@@ -116,5 +110,34 @@ where
         };
 
         self.model.find_by_index_tx(payload, tx).await
+    }
+
+    pub async fn execute_reverse(self) -> Result<TitoPaginated<T>, TitoError> {
+        let payload = TitoFindByIndexPayload {
+            index: self.index,
+            values: self.values,
+            rels: self.rels,
+            end: self.end,
+            limit: self.limit,
+            cursor: self.cursor,
+        };
+
+        self.model.find_by_index_reverse(payload).await
+    }
+
+    pub async fn execute_reverse_tx(
+        self,
+        tx: &TitoTransaction,
+    ) -> Result<TitoPaginated<T>, TitoError> {
+        let payload = TitoFindByIndexPayload {
+            index: self.index,
+            values: self.values,
+            rels: self.rels,
+            end: self.end,
+            limit: self.limit,
+            cursor: self.cursor,
+        };
+
+        self.model.find_by_index_reverse_tx(payload, tx).await
     }
 }
