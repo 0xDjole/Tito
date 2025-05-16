@@ -193,16 +193,6 @@ pub struct TitoFindByIndexPayload {
     pub values: Vec<String>,
     pub rels: Vec<String>,
     pub end: Option<String>,
-    pub limit: Option<u32>,
-    pub cursor: Option<String>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct TitoFindByIndexRawPayload {
-    pub index: String,
-    pub values: Vec<String>,
-    pub rels: Vec<String>,
-    pub end: Option<String>,
     pub exact_match: bool,
     pub limit: Option<u32>,
     pub cursor: Option<String>,

@@ -10,9 +10,9 @@ use crate::{
     types::{
         DBUuid, ReverseIndex, TitoChangeLog, TitoConfigs, TitoCursor, TitoDatabase,
         TitoEmbeddedRelationshipConfig, TitoError, TitoFindByIndexPayload,
-        TitoFindByIndexRawPayload, TitoFindChangeLogSincePaylaod, TitoFindOneByIndexPayload,
-        TitoFindPayload, TitoGenerateJobPayload, TitoIndexBlockType, TitoIndexConfig, TitoJob,
-        TitoModelTrait, TitoPaginated, TitoScanPayload,
+        TitoFindChangeLogSincePaylaod, TitoFindOneByIndexPayload, TitoFindPayload,
+        TitoGenerateJobPayload, TitoIndexBlockType, TitoIndexConfig, TitoJob, TitoModelTrait,
+        TitoPaginated, TitoScanPayload,
     },
     utils::{next_string_lexicographically, previous_string_lexicographically, to_snake_case},
 };
@@ -997,7 +997,7 @@ impl<
 
     pub async fn find_by_index_raw(
         &self,
-        payload: TitoFindByIndexRawPayload,
+        payload: TitoFindByIndexPayload,
         tx: &TitoTransaction,
     ) -> Result<(Vec<(String, Value)>, bool), TitoError>
     where
@@ -1123,12 +1123,12 @@ impl<
     {
         let (items, has_more) = self
             .find_by_index_raw(
-                TitoFindByIndexRawPayload {
+                TitoFindByIndexPayload {
                     index: payload.index,
                     values: payload.values,
                     rels: payload.rels,
                     end: payload.end,
-                    exact_match: false,
+                    exact_match: true,
                     limit: payload.limit,
                     cursor: payload.cursor,
                 },
@@ -1155,51 +1155,6 @@ impl<
         let results = self.to_paginated_items(items, has_more)?;
 
         Ok(results)
-    }
-
-    pub async fn find_by_index_condition<F>(
-        &self,
-        index_payload: TitoFindByIndexPayload,
-        filter_condition: F,
-    ) -> Result<TitoPaginated<T>, TitoError>
-    where
-        F: FnMut(&T) -> bool + Clone + Send + 'static,
-    {
-        let mut items = vec![];
-        let target_limit = index_payload.limit.unwrap_or(u32::MAX) as usize;
-        let mut cursor = index_payload.cursor.clone();
-
-        let filter = filter_condition; // Create local mutable binding
-
-        loop {
-            let tikv_results = self
-                .find_by_index(TitoFindByIndexPayload {
-                    index: index_payload.index.clone(),
-                    values: index_payload.values.clone(),
-                    rels: index_payload.rels.clone(),
-                    end: index_payload.end.clone(),
-                    limit: index_payload.limit,
-                    cursor: cursor.clone(),
-                })
-                .await?;
-
-            let filtered_items: Vec<T> = tikv_results
-                .items
-                .into_iter()
-                .filter(filter.clone()) // Use move closure with local binding
-                .collect();
-
-            cursor = tikv_results.cursor;
-            let new_items_len = filtered_items.len();
-            items.extend(filtered_items);
-
-            if cursor.is_none() || new_items_len == 0 || items.len() >= target_limit {
-                break;
-            }
-        }
-
-        items.truncate(target_limit);
-        Ok(TitoPaginated::new(items, cursor))
     }
 
     pub fn deduplicate_and_track_last_valid(
@@ -1244,7 +1199,7 @@ impl<
     {
         let (items, _) = self
             .find_by_index_raw(
-                TitoFindByIndexRawPayload {
+                TitoFindByIndexPayload {
                     index: payload.index.clone(),
                     values: payload.values.clone(),
                     rels: payload.rels.clone(),

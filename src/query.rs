@@ -21,6 +21,7 @@ where
     values: Vec<String>,
     rels: Vec<String>,
     end: Option<String>,
+    exact_match: bool,
     limit: Option<u32>,
     cursor: Option<String>,
 }
@@ -43,6 +44,7 @@ where
             values: Vec::new(),
             rels: Vec::new(),
             end: None,
+            exact_match: true,
             limit: None,
             cursor: None,
         }
@@ -51,6 +53,11 @@ where
     // Add a vector of values
     pub fn values(mut self, values: Vec<String>) -> Self {
         self.values = values;
+        self
+    }
+
+    pub fn exact_match(mut self, value: bool) -> Self {
+        self.exact_match = value;
         self
     }
 
@@ -91,6 +98,7 @@ where
             values: self.values,
             rels: self.rels,
             end: self.end,
+            exact_match: self.exact_match,
             limit: self.limit,
             cursor: self.cursor,
         };
@@ -105,6 +113,7 @@ where
             values: self.values,
             rels: self.rels,
             end: self.end,
+            exact_match: self.exact_match,
             limit: self.limit,
             cursor: self.cursor,
         };
@@ -118,6 +127,7 @@ where
             values: self.values,
             rels: self.rels,
             end: self.end,
+            exact_match: self.exact_match,
             limit: self.limit,
             cursor: self.cursor,
         };
@@ -134,6 +144,7 @@ where
             values: self.values,
             rels: self.rels,
             end: self.end,
+            exact_match: self.exact_match,
             limit: self.limit,
             cursor: self.cursor,
         };

@@ -217,6 +217,7 @@ impl BlogService {
                 index: "post-by-tag".to_string(),
                 values: vec![tag_id.to_string()],
                 rels: vec!["tags".to_string()], // Include all tags in the results
+                exact_match: true,
                 limit: None,
                 cursor: None,
                 end: None,
@@ -235,6 +236,7 @@ impl BlogService {
                 index: "post-by-author".to_string(),
                 values: vec![author.to_string()],
                 rels: vec!["tags".to_string()], // Include all tags in the results
+                exact_match: true,
                 limit: None,
                 cursor: None,
                 end: None,
