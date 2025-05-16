@@ -5,6 +5,7 @@ use std::{
 };
 
 use crate::{
+    query::IndexQueryBuilder,
     transaction::{TitoTransaction, TransactionManager},
     types::{
         DBUuid, ReverseIndex, TitoChangeLog, TitoConfigs, TitoCursor, TitoDatabase,
@@ -26,7 +27,14 @@ use tokio::time::{sleep, Duration};
 #[async_trait]
 pub trait BaseTito<T>
 where
-    T: Clone + Serialize + DeserializeOwned + Unpin + std::marker::Send + Sync + TitoModelTrait,
+    T: Clone
+        + Serialize
+        + DeserializeOwned
+        + Unpin
+        + std::marker::Send
+        + Sync
+        + TitoModelTrait
+        + Default,
 {
     fn new(configs: TitoConfigs, transaction_manager: TransactionManager) -> Self;
     fn get_model(&self) -> &T;
@@ -1795,5 +1803,21 @@ impl<
 
     fn get_configs(&self) -> &TitoConfigs {
         &self.configs
+    }
+}
+
+impl<
+        T: Default
+            + Clone
+            + Serialize
+            + DeserializeOwned
+            + Unpin
+            + std::marker::Send
+            + Sync
+            + TitoModelTrait,
+    > TitoModel<T>
+{
+    pub fn query_by_index(&self, index: impl Into<String>) -> IndexQueryBuilder<T> {
+        IndexQueryBuilder::new(self.clone(), index.into())
     }
 }

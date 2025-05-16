@@ -12,3 +12,5 @@ pub use base::TitoModel;
 mod utils;
 
 pub mod queue;
+
+pub mod query;
