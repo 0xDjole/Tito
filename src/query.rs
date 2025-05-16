@@ -61,32 +61,32 @@ where
     }
 
     // Set relationships to include
-    pub fn with_relationships(mut self, rels: Vec<String>) -> Self {
+    pub fn relationships(mut self, rels: Vec<String>) -> Self {
         self.rels = rels;
         self
     }
 
     // Add a single relationship
-    pub fn with_relationship(mut self, rel: impl Into<String>) -> Self {
+    pub fn relationship(mut self, rel: impl Into<String>) -> Self {
         self.rels.push(rel.into());
         self
     }
 
     // Set result limit
-    pub fn limit(mut self, limit: u32) -> Self {
-        self.limit = Some(limit);
+    pub fn limit(mut self, limit: Option<u32>) -> Self {
+        self.limit = limit;
         self
     }
 
     // Set pagination cursor
-    pub fn cursor(mut self, cursor: impl Into<String>) -> Self {
-        self.cursor = Some(cursor.into());
+    pub fn cursor(mut self, cursor: Option<impl Into<String>>) -> Self {
+        self.cursor = cursor.map(|cursor| cursor.into());
         self
     }
 
     // Set end key
-    pub fn end(mut self, end: impl Into<String>) -> Self {
-        self.end = Some(end.into());
+    pub fn end(mut self, end: Option<impl Into<String>>) -> Self {
+        self.end = end.map(|end| end.into());
         self
     }
 
