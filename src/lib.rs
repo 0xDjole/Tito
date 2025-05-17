@@ -13,3 +13,5 @@ mod utils;
 pub mod queue;
 
 pub mod query;
+
+mod key_encoder;
