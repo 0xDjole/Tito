@@ -12,7 +12,7 @@ Tito is a powerful, flexible database layer built on top of TiKV, providing robu
 - **Job Queue**: Built-in persistent job queue with retries and scheduling capabilities
 - **Async Workers**: Tokio-powered workers for concurrent job processing
 - **Type Safety**: Leverages Rust's type system for safety and performance
-- **Flexible Query API**: Query data using multiple strategies based on your application needs
+- **Flexible Query API**: Query data using intuitive builder pattern
 
 ## Installation
 
@@ -20,7 +20,7 @@ Add Tito to your project:
 
 ```toml
 [dependencies]
-tito = "0.1.0"
+tito = "0.1.2"
 ```
 
 ## Quick Start
@@ -74,8 +74,8 @@ impl TitoModelTrait for User {
         "users".to_string()
     }
 
-    fn get_event_table_name(&self) -> Option<String> {
-        Some("jobs".to_string())
+    fn has_event(&self) -> bool {
+        false
     }
 
     fn get_id(&self) -> String {
@@ -106,7 +106,7 @@ let saved_user = tx_manager
     })
     .await?;
 
-// Find user
+// Find user by ID
 let found_user = user_model.find_by_id(&user_id, vec![]).await?;
 
 // Update user
@@ -130,6 +130,101 @@ tx_manager
         async move { model.delete_by_id(&user_id, &tx).await }
     })
     .await?;
+```
+
+## Using the Query Builder
+
+Tito v0.1.2 introduces a powerful query builder pattern for easier and more readable querying.
+
+### Basic Query
+
+```rust
+// Find user by email
+let mut query = user_model.query_by_index("by_email");
+let result = query
+    .value("john@example.com")
+    .execute()
+    .await?;
+
+// Check if we found a user
+if let Some(user) = result.items.first() {
+    println!("Found user: {}", user.name);
+}
+```
+
+### Query with Relationships
+
+```rust
+// Post model with tag relationships
+let mut query = post_model.query_by_index("post-by-author");
+let posts = query
+    .value("john")              // Author name
+    .relationship("tags")       // Include tags relationship
+    .limit(Some(10))            // Limit to 10 results
+    .execute()
+    .await?;
+
+for post in posts.items {
+    println!("Post: {} with {} tags", post.title, post.tags.len());
+}
+```
+
+### Advanced Queries
+
+```rust
+// Find active users by role
+let mut query = user_model.query_by_index("by_role_and_status");
+let active_admins = query
+    .value("admin")             // First index field (role)
+    .value("active")            // Second index field (status)
+    .limit(Some(20))            // Limit results
+    .execute()
+    .await?;
+    
+// Use cursor for pagination
+if let Some(cursor) = active_admins.cursor {
+    // Get next page using the same query with a cursor
+    let mut next_page_query = user_model.query_by_index("by_role_and_status");
+    let next_page = next_page_query
+        .value("admin")
+        .value("active")
+        .cursor(Some(cursor))   // Pass the cursor
+        .limit(Some(20))
+        .execute()
+        .await?;
+}
+```
+
+### Reverse Order Query
+
+```rust
+// Get latest posts in reverse chronological order
+let mut query = post_model.query_by_index("post-by-created");
+let latest_posts = query
+    .value("2023")              // Index by year
+    .execute_reverse()          // Execute in reverse order
+    .await?;
+```
+
+### Transaction-Specific Queries
+
+```rust
+tx_manager.transaction(|tx| async move {
+    // Query within transaction context
+    let mut query = user_model.query_by_index("by_email");
+    let user = query
+        .value("john@example.com")
+        .execute_tx(&tx)        // Execute within transaction
+        .await?;
+        
+    // Update user in same transaction
+    if let Some(mut user) = user.items.first().cloned() {
+        user.name = "John Smith".to_string();
+        user_model.update(user, &tx).await?;
+    }
+    
+    Ok::<_, TitoError>(())
+}).await?;
 ```
 
 ## Advanced Features
@@ -180,27 +275,44 @@ impl TitoModelTrait for Post {
     // ... other implementation details
 }
 
-// Fetch a post with all its related tags
-let post_with_tags = post_model
-    .find_by_id(post_id, vec!["tags".to_string()]) // Include tags relationship
+// Fetch a post with related tags using query builder
+let mut query = post_model.query_by_index("post-by-id");
+let post = query
+    .value(post_id)
+    .relationship("tags")
+    .execute()
     .await?;
 ```
 
-### Query by Index
+### Composite Indexes
 
-Efficiently query data using custom indexes:
+Create and query using composite indexes:
 
 ```rust
-// Find posts by tag
-let posts = post_model
-    .find_by_index(TitoFindByIndexPayload {
-        index: "post-by-tag".to_string(),
-        values: vec![tag_id.to_string()],
-        rels: vec!["tags".to_string()], // Include tags in results
-        limit: None,
-        cursor: None,
-        end: None,
-    })
+// Define composite index
+TitoIndexConfig {
+    condition: true,
+    name: "by_category_and_date".to_string(),
+    fields: vec![
+        TitoIndexField {
+            name: "category".to_string(),
+            r#type: TitoIndexBlockType::String,
+        },
+        TitoIndexField {
+            name: "published_at".to_string(),
+            r#type: TitoIndexBlockType::Number,
+        },
+    ],
+    custom_generator: None,
+}
+
+// Query using composite index
+let mut query = article_model.query_by_index("by_category_and_date");
+let articles = query
+    .value("technology")         // category value
+    .value("20230101")           // published_at value as number
+    .limit(Some(5))
+    .execute()
     .await?;
 ```
 
@@ -209,7 +321,7 @@ let posts = post_model
 For more detailed examples, check out the examples directory:
 
 - `crud.rs` - Basic CRUD operations
-- `blog.rs` - More complex example with relationships and various indexing strategies
+- `blog.rs` - More complex example with relationships and query builder
 
 ## Requirements
 

@@ -1,14 +1,12 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tito::{
     connect,
     transaction::TransactionManager,
     types::{
-        DBUuid, TitoConfigs, TitoEmbeddedRelationshipConfig, TitoFindByIndexPayload,
-        TitoIndexBlockType, TitoIndexConfig, TitoIndexField, TitoModelTrait, TitoUtilsConnectInput,
-        TitoUtilsConnectPayload,
+        DBUuid, TitoConfigs, TitoEmbeddedRelationshipConfig, TitoIndexBlockType, TitoIndexConfig,
+        TitoIndexField, TitoModelTrait, TitoUtilsConnectInput, TitoUtilsConnectPayload,
     },
     TitoError, TitoModel,
 };
@@ -208,42 +206,38 @@ impl BlogService {
             .await
     }
 
-    // Find posts by tag
+    // Find posts by tag using QueryBuilder pattern
     async fn find_posts_by_tag(&self, tag_id: &str) -> Result<Vec<Post>, TitoError> {
-        // Use the post-by-tag index to find posts with this tag
-        let posts = self
-            .post_model
-            .find_by_index(TitoFindByIndexPayload {
-                index: "post-by-tag".to_string(),
-                values: vec![tag_id.to_string()],
-                rels: vec!["tags".to_string()], // Include all tags in the results
-                exact_match: true,
-                limit: None,
-                cursor: None,
-                end: None,
-            })
+        // Use the query builder pattern instead of direct find_by_index calls
+        let mut query = self.post_model.query_by_index("post-by-tag");
+
+        // Chain method calls to configure the query
+        let results = query
+            .value(tag_id.to_string()) // Set the tag_id value
+            .relationship("tags") // Include the tags relationship
+            .exact_match(true) // Exact matches only
+            .limit(None) // No limit
+            .execute() // Execute the query
             .await?;
 
-        Ok(posts.items)
+        Ok(results.items)
     }
 
-    // Find posts by author
+    // Find posts by author using QueryBuilder pattern
     async fn find_posts_by_author(&self, author: &str) -> Result<Vec<Post>, TitoError> {
-        // Use the post-by-author index to find posts by this author
-        let posts = self
-            .post_model
-            .find_by_index(TitoFindByIndexPayload {
-                index: "post-by-author".to_string(),
-                values: vec![author.to_string()],
-                rels: vec!["tags".to_string()], // Include all tags in the results
-                exact_match: true,
-                limit: None,
-                cursor: None,
-                end: None,
-            })
+        // Use the query builder pattern
+        let mut query = self.post_model.query_by_index("post-by-author");
+
+        // Configure and execute the query with method chaining
+        let results = query
+            .value(author.to_string()) // Set the author value
+            .relationship("tags") // Include the tags relationship
+            .exact_match(true) // Exact matches only
+            .limit(None) // No limit
+            .execute() // Execute the query
             .await?;
 
-        Ok(posts.items)
+        Ok(results.items)
     }
 
     // Add a tag to a post
@@ -290,6 +284,23 @@ impl BlogService {
                 }
             })
             .await
+    }
+
+    // Search for posts with title containing a keyword using QueryBuilder
+    async fn search_posts_by_title(&self, title_keyword: &str) -> Result<Vec<Post>, TitoError> {
+        let mut query = self.post_model.query_by_index("post-by-title");
+
+        // Note: Using exact_match(false) to allow partial matches
+        // In a real implementation, you might want to use a specific search index
+        let results = query
+            .value(title_keyword.to_string())
+            .relationship("tags")
+            .exact_match(false) // Allow partial matches
+            .limit(Some(10)) // Limit to 10 results
+            .execute()
+            .await?;
+
+        Ok(results.items)
     }
 }
 
@@ -400,7 +411,7 @@ async fn main() -> Result<(), TitoError> {
         println!("- {}", tag.name);
     }
 
-    // Find posts by tag
+    // Find posts by tag using the query builder
     let tech_posts = blog_service.find_posts_by_tag(&tech_tag.id).await?;
     println!("\nTechnology posts:");
     for post in &tech_posts {
@@ -415,21 +426,7 @@ async fn main() -> Result<(), TitoError> {
         );
     }
 
-    let travel_posts = blog_service.find_posts_by_tag(&travel_tag.id).await?;
-    println!("\nTravel posts:");
-    for post in &travel_posts {
-        println!("- {} (by {})", post.title, post.author);
-        println!(
-            "  Tags: {}",
-            post.tags
-                .iter()
-                .map(|t| t.name.clone())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-
-    // Find posts by author
+    // Find posts by author using the query builder
     let alice_posts = blog_service.find_posts_by_author("Alice").await?;
     println!("\nAlice's posts:");
     for post in &alice_posts {
@@ -444,29 +441,10 @@ async fn main() -> Result<(), TitoError> {
         );
     }
 
-    // Remove a tag from a post
-    let post3_without_tech = blog_service
-        .remove_tag_from_post(&post3.id, &tech_tag.id)
-        .await?;
-
-    println!("\nRemoved 'Technology' tag from post3");
-
-    // Verify the tag has been removed
-    let updated_post3 = blog_service.get_post_with_tags(&post3.id).await?;
-    println!(
-        "Updated post3 tags: {}",
-        updated_post3
-            .tags
-            .iter()
-            .map(|t| t.name.clone())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-
-    // Show which posts have the 'Rust' tag after all our changes
-    let rust_posts = blog_service.find_posts_by_tag(&rust_tag.id).await?;
-    println!("\nRust posts after all changes:");
-    for post in &rust_posts {
+    // Search for posts with "Rust" in the title using the query builder
+    println!("\nSearching for posts with 'Rust' in the title:");
+    let rust_title_posts = blog_service.search_posts_by_title("Rust").await?;
+    for post in &rust_title_posts {
         println!("- {} (by {})", post.title, post.author);
         println!(
             "  Tags: {}",
@@ -476,6 +454,19 @@ async fn main() -> Result<(), TitoError> {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+    }
+
+    // Using query builder directly in main function
+    println!("\nDirect query for posts about travel:");
+    let mut travel_query = post_model.query_by_index("post-by-tag");
+    let travel_results = travel_query
+        .value(travel_tag.id.clone())
+        .relationship("tags")
+        .execute()
+        .await?;
+
+    for post in &travel_results.items {
+        println!("- {} (by {})", post.title, post.author);
     }
 
     Ok(())
