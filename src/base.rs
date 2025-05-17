@@ -1626,33 +1626,34 @@ impl<
         for log in change_logs {
             self.put_change_log(log.clone(), tx).await?;
 
+            let record_id = &log.record_id;
+
+            let is_regular_record = record_id.starts_with(&format!("{}:", self.get_table()));
+
             match log.operation.as_str() {
                 "put" => {
                     if let Some(data) = &log.data {
-                        let key = log.record_id.clone();
-
-                        self.put(key.clone(), data.clone(), tx).await?;
-                    } else {
-                        return Err(TitoError::FailedCreate(
-                            "Missing data for put operation".to_string(),
-                        ));
+                        if is_regular_record {
+                            if let Ok(model) = serde_json::from_value::<T>(data.clone()) {
+                                self.update_with_options(model, false, tx).await?;
+                            }
+                        } else {
+                            self.put(record_id.clone(), data.clone(), tx).await?;
+                        }
                     }
                 }
                 "delete" => {
-                    let key = log.record_id.clone();
-
-                    self.delete(key.clone(), tx).await?;
-
-                    let reverse_key = format!("reverse-index:{}", key);
-                    self.delete(reverse_key, tx).await?;
+                    if is_regular_record {
+                        if let Some(raw_id) =
+                            record_id.strip_prefix(&format!("{}:", self.get_table()))
+                        {
+                            self.delete_by_id_with_options(raw_id, false, tx).await?;
+                        }
+                    } else {
+                        self.delete(record_id.clone(), tx).await?;
+                    }
                 }
-
-                _ => {
-                    return Err(TitoError::FailedDelete(format!(
-                        "Unsupported operation '{}'",
-                        log.operation
-                    )));
-                }
+                _ => {}
             }
         }
         Ok(true)
