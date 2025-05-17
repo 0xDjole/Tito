@@ -246,17 +246,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
-name = "cron"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e1f7abe87c3ec592fade387a40451b0c9f5dbbe2857af3338af7d5fb6b83a3a"
-dependencies = [
- "chrono",
- "error-chain",
- "nom",
-]
-
-[[package]]
 name = "derive-new"
 version = "0.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -307,15 +296,6 @@ checksum = "976dd42dc7e85965fe702eb8164f21f450704bdde31faefd6471dba214cb594e"
 dependencies = [
  "libc",
  "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "error-chain"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9435d864e017c3c6afeac1654189b06cdb491cf2ff73dbf0d73b0f292f42ff8"
-dependencies = [
- "backtrace",
 ]
 
 [[package]]
@@ -1011,12 +991,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nom"
-version = "2.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5d4598834859fedb9a0a69d5b862a970e77982a92f544d547257a4d49469067"
-
-[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1641,17 +1615,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde-aux"
-version = "3.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0a77223b653fa95f3f9864f3eb25b93e4ed170687eb42d85b6b98af21d5e1de"
-dependencies = [
- "chrono",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "serde_derive"
 version = "1.0.219"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1671,16 +1634,6 @@ dependencies = [
  "itoa",
  "memchr",
  "ryu",
- "serde",
-]
-
-[[package]]
-name = "serde_path_to_error"
-version = "0.1.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59fab13f937fa393d08645bf3a84bdfe86e296747b506ada67bb15f10f218b2a"
-dependencies = [
- "itoa",
  "serde",
 ]
 
@@ -1889,22 +1842,17 @@ dependencies = [
 
 [[package]]
 name = "tito"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
- "async-trait",
  "base64 0.22.1",
  "chrono",
- "cron",
  "futures",
  "futures-util",
  "log",
  "rand 0.8.5",
  "regex",
  "serde",
- "serde-aux",
  "serde_json",
- "serde_path_to_error",
- "serde_urlencoded",
  "thiserror",
  "tikv-client",
  "tokio",

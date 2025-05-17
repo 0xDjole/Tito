@@ -1,29 +1,22 @@
 [package]
 name = "tito"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "A flexible database layer built on top of TiKV with powerful indexing strategies and relationship modeling"
 license = "Apache-2.0"
 
 [dependencies]
-#Axum
-
 # Async and futures
 tokio = { version = "1.6", features = ["full"] }
 futures = "0.3"
 futures-util = "0.3"
-async-trait = "0.1"
 
 # Serialization
 serde = { version = "1.0", features = ["rc", "derive"] }
 serde_json = "1.0"
-serde-aux = "3.0"
-serde_urlencoded = "0.7.1"
-serde_path_to_error = "0.1"
 
 # Time and dates
 chrono = { version = "0.4", features = ["serde"] }
-cron = "0.5"
 
 # Database and storage
 tikv-client = "0.3"

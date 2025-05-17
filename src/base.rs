@@ -17,7 +17,6 @@ use crate::{
     },
     utils::{next_string_lexicographically, previous_string_lexicographically},
 };
-use async_trait::async_trait;
 use base64::{decode, encode};
 use chrono::{DateTime, Utc};
 use serde::{de::DeserializeOwned, Serialize};
