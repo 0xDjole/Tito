@@ -15,3 +15,9 @@ pub mod queue;
 pub mod query;
 
 mod key_encoder;
+
+mod error;
+
+pub use error::TitoError;
+pub use types::TitoDatabase;
+pub use types::TitoJob;

@@ -6,10 +6,10 @@ use tito::{
     connect,
     transaction::TransactionManager,
     types::{
-        DBUuid, TitoConfigs, TitoError, TitoIndexBlockType, TitoIndexConfig, TitoIndexField,
-        TitoModelTrait, TitoUtilsConnectInput, TitoUtilsConnectPayload,
+        DBUuid, TitoConfigs, TitoIndexBlockType, TitoIndexConfig, TitoIndexField, TitoModelTrait,
+        TitoUtilsConnectInput, TitoUtilsConnectPayload,
     },
-    TitoModel,
+    TitoError, TitoModel,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -1,13 +1,12 @@
+use crate::TitoError;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use thiserror::Error;
 use tikv_client::Key;
 use tikv_client::Transaction;
 use tikv_client::TransactionClient;
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -24,40 +23,6 @@ pub type TiKvTransaction = Transaction;
 pub struct TitoLockItem {
     pub key: String,
     pub value: String,
-}
-
-#[derive(PartialEq, Eq, Error, Debug)]
-pub enum TitoError {
-    #[error("Tito: Failed to connect - {0}")]
-    FailedToConnect(String),
-    #[error("Tito: NotFound - {0}")]
-    NotFound(String),
-
-    #[error("Tito: Failed")]
-    Failed,
-    #[error("Tito: Incorrect")]
-    Incorrect,
-
-    #[error("Tito: FailedCreate - {0}")]
-    FailedCreate(String),
-
-    #[error("Tito: FailedUpdate - {0}")]
-    FailedUpdate(String),
-
-    #[error("Tito: FailedDelete - {0}")]
-    FailedDelete(String),
-
-    #[error("Tito: Transaction - {0}")]
-    TransactionFailed(String),
-
-    #[error("Tito: Failed to convert to ObjectId")]
-    FailedToObjectId,
-
-    #[error("Tito: Deserialization Error: {0}")]
-    DeserializationError(String),
-
-    #[error("Tito: Read-only mode")]
-    ReadOnlyMode,
 }
 
 pub struct TitoUtilsConnectPayload {
@@ -233,12 +198,13 @@ pub struct TitoCursor {
 
 impl TitoCursor {
     pub fn first_id(&self) -> Result<String, TitoError> {
-        // Attempt to get the first element, which is an Option<&Option<String>>
         self.ids
             .get(0)
             .and_then(|id_option| id_option.as_ref())
             .map(|id| id.to_string())
-            .ok_or(TitoError::Failed)
+            .ok_or(TitoError::InvalidInput(
+                "Cursor has no valid ID in first position".to_string(),
+            ))
     }
 }
 

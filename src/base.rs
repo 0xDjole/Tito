@@ -5,15 +5,15 @@ use std::{
 };
 
 use crate::{
+    error::TitoError,
     key_encoder::safe_encode,
     query::IndexQueryBuilder,
     transaction::{TitoTransaction, TransactionManager},
     types::{
         DBUuid, ReverseIndex, TitoChangeLog, TitoConfigs, TitoCursor, TitoDatabase,
-        TitoEmbeddedRelationshipConfig, TitoError, TitoFindByIndexPayload,
-        TitoFindChangeLogSincePaylaod, TitoFindOneByIndexPayload, TitoFindPayload,
-        TitoGenerateJobPayload, TitoIndexBlockType, TitoIndexConfig, TitoJob, TitoModelTrait,
-        TitoPaginated, TitoScanPayload,
+        TitoEmbeddedRelationshipConfig, TitoFindByIndexPayload, TitoFindChangeLogSincePaylaod,
+        TitoFindOneByIndexPayload, TitoFindPayload, TitoGenerateJobPayload, TitoIndexBlockType,
+        TitoIndexConfig, TitoJob, TitoModelTrait, TitoPaginated, TitoScanPayload,
     },
     utils::{next_string_lexicographically, previous_string_lexicographically},
 };
@@ -92,17 +92,22 @@ impl<
     }
 
     fn decode_cursor(&self, cursor: String) -> Result<TitoCursor, TitoError> {
-        let cursor = decode(cursor).map_err(|err| TitoError::Failed)?;
+        let cursor = decode(cursor).map_err(|err| {
+            TitoError::DeserializationFailed("Failed to decode cursor".to_string())
+        })?;
         if let Ok(value) = serde_json::from_slice::<TitoCursor>(&cursor) {
             return Ok(value);
         }
-        return Err(TitoError::Failed);
+        return Err(TitoError::DeserializationFailed(
+            "Failed to deserialize cursor".to_string(),
+        ));
     }
 
     fn encode_cursors(&self, ids: Vec<Option<String>>) -> Result<String, TitoError> {
         let tikv_cursor = TitoCursor { ids };
-        let json_bytes = serde_json::to_vec(&tikv_cursor).map_err(|_| TitoError::Failed)?;
-
+        let json_bytes = serde_json::to_vec(&tikv_cursor).map_err(|_| {
+            TitoError::SerializationFailed("Failed to serialize cursor".to_string())
+        })?;
         Ok(encode(&json_bytes))
     }
 
@@ -201,7 +206,7 @@ impl<
         let change_log_id = format!("change-log:{}:{}", change_log.created_at, change_log.id);
 
         let change_log_value = serde_json::to_value(&change_log)
-            .map_err(|e| TitoError::FailedCreate(e.to_string()))?;
+            .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
 
         self.put(change_log_id, change_log_value, tx).await?;
 
@@ -259,8 +264,8 @@ impl<
         let max_retries = 10;
 
         // Serialize the payload to serde_json::Value
-        let mut value =
-            serde_json::to_value(&payload).map_err(|e| TitoError::FailedCreate(e.to_string()))?;
+        let mut value = serde_json::to_value(&payload)
+            .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
 
         // Add the last_modified timestamp only if the value is an object
         if let serde_json::Value::Object(ref mut map) = value {
@@ -279,14 +284,14 @@ impl<
                 delay *= 2;
             }
 
-            let bytes =
-                serde_json::to_vec(&value).map_err(|e| TitoError::FailedCreate(e.to_string()))?;
+            let bytes = serde_json::to_vec(&value)
+                .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
 
             match tx.put(key.clone(), bytes).await {
                 Ok(()) => return Ok(true),
                 Err(e) => {
                     if retries >= max_retries {
-                        return Err(TitoError::FailedCreate(e.to_string()));
+                        return Err(TitoError::CreateFailed(e.to_string()));
                     }
 
                     sleep(Duration::from_millis(delay)).await;
@@ -319,7 +324,7 @@ impl<
                 }
                 Err(e) => {
                     if retries >= max_retries {
-                        return Err(TitoError::FailedDelete(e.to_string()));
+                        return Err(TitoError::DeleteFailed(e.to_string()));
                     }
 
                     sleep(Duration::from_millis(delay)).await;
@@ -1681,7 +1686,7 @@ impl<
                 .iter()
                 .map(|(_, value)| {
                     serde_json::from_value::<T>(value.clone()).map_err(|_| {
-                        TitoError::DeserializationError("Failed to deserialize".to_string())
+                        TitoError::DeserializationFailed("Failed to deserialize".to_string())
                     })
                 })
                 .collect::<Result<_, _>>()?;

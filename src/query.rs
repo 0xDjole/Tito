@@ -1,6 +1,7 @@
 use crate::{
+    error::TitoError,
     transaction::TitoTransaction,
-    types::{TitoError, TitoFindByIndexPayload, TitoModelTrait, TitoPaginated},
+    types::{TitoFindByIndexPayload, TitoModelTrait, TitoPaginated},
     TitoModel,
 };
 use serde::{de::DeserializeOwned, Serialize};

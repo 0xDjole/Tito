@@ -6,11 +6,11 @@ use tito::{
     connect,
     transaction::TransactionManager,
     types::{
-        DBUuid, TitoConfigs, TitoEmbeddedRelationshipConfig, TitoError, TitoFindByIndexPayload,
+        DBUuid, TitoConfigs, TitoEmbeddedRelationshipConfig, TitoFindByIndexPayload,
         TitoIndexBlockType, TitoIndexConfig, TitoIndexField, TitoModelTrait, TitoUtilsConnectInput,
         TitoUtilsConnectPayload,
     },
-    TitoModel,
+    TitoError, TitoModel,
 };
 
 // Simple Tag model
