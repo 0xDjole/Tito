@@ -1,83 +1,42 @@
-pub struct KeyEncoder {
-    separator: char,
-    escape_char: char,
+pub fn to_snake_case(s: &str) -> String {
+    let mut snake_case = String::new();
+    let chars: Vec<char> = s.chars().collect();
+
+    for (i, &ch) in chars.iter().enumerate() {
+        // Insert an underscore before uppercase letters that are not at the start
+        // and only if the previous character is a lowercase letter
+        if ch.is_uppercase() && i != 0 && chars[i - 1].is_lowercase() {
+            snake_case.push('_');
+        }
+
+        // Convert alphabetic characters to lowercase, preserve all other characters including underscores
+        if ch.is_alphabetic() {
+            snake_case.push(ch.to_lowercase().next().unwrap());
+        } else {
+            // Keep original character (including underscores, numbers, etc)
+            snake_case.push(ch);
+        }
+    }
+
+    // Only trim non-underscore whitespace characters from ends
+    snake_case = snake_case
+        .trim_matches(|c: char| c.is_whitespace() && c != '_')
+        .to_string();
+
+    snake_case
 }
 
-impl KeyEncoder {
-    pub fn new() -> Self {
-        Self {
-            separator: ':',
-            escape_char: '\\',
+pub fn safe_encode(key: &str) -> String {
+    let key = to_snake_case(key);
+
+    let mut result = String::with_capacity(key.len() * 2);
+
+    for ch in key.chars() {
+        if ch == ':' || ch == '\\' {
+            result.push('\\');
         }
+        result.push(ch);
     }
 
-    /// Encode a single component, escaping any special characters
-    pub fn encode_component(&self, component: &str) -> String {
-        let mut result = String::with_capacity(component.len() * 2);
-
-        for ch in component.chars() {
-            if ch == self.separator || ch == self.escape_char {
-                result.push(self.escape_char);
-            }
-            result.push(ch);
-        }
-
-        result
-    }
-
-    /// Decode a component by interpreting escape sequences
-    pub fn decode_component(&self, component: &str) -> String {
-        let mut result = String::with_capacity(component.len());
-        let mut escaped = false;
-
-        for ch in component.chars() {
-            if escaped {
-                result.push(ch);
-                escaped = false;
-            } else if ch == self.escape_char {
-                escaped = true;
-            } else {
-                result.push(ch);
-            }
-        }
-
-        result
-    }
-
-    /// Build a key from multiple components
-    pub fn build_key(&self, components: &[&str]) -> String {
-        components
-            .iter()
-            .map(|comp| self.encode_component(comp))
-            .collect::<Vec<_>>()
-            .join(&self.separator.to_string())
-    }
-
-    /// Parse a key into its component parts
-    pub fn parse_key(&self, key: &str) -> Vec<String> {
-        let mut components = Vec::new();
-        let mut current_component = String::new();
-        let mut escaped = false;
-
-        for ch in key.chars() {
-            if escaped {
-                current_component.push(ch);
-                escaped = false;
-            } else if ch == self.escape_char {
-                escaped = true;
-            } else if ch == self.separator {
-                components.push(current_component);
-                current_component = String::new();
-            } else {
-                current_component.push(ch);
-            }
-        }
-
-        // Don't forget the last component
-        if !current_component.is_empty() {
-            components.push(current_component);
-        }
-
-        components
-    }
+    result
 }

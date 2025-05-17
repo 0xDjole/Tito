@@ -5,6 +5,7 @@ use std::{
 };
 
 use crate::{
+    key_encoder::safe_encode,
     query::IndexQueryBuilder,
     transaction::{TitoTransaction, TransactionManager},
     types::{
@@ -14,7 +15,7 @@ use crate::{
         TitoGenerateJobPayload, TitoIndexBlockType, TitoIndexConfig, TitoJob, TitoModelTrait,
         TitoPaginated, TitoScanPayload,
     },
-    utils::{next_string_lexicographically, previous_string_lexicographically, to_snake_case},
+    utils::{next_string_lexicographically, previous_string_lexicographically},
 };
 use async_trait::async_trait;
 use base64::{decode, encode};
@@ -478,7 +479,7 @@ impl<
                     let field_str = match field.r#type {
                         TitoIndexBlockType::String => match value.as_str() {
                             Some("") => Some(format!("{}:__null__", field.name)),
-                            Some(s) => Some(format!("{}:{}", field.name, to_snake_case(s))),
+                            Some(s) => Some(format!("{}:{}", field.name, safe_encode(&s))),
                             None => Some(format!("{}:__null__", field.name)),
                         },
                         TitoIndexBlockType::Number => match value.as_i64() {
@@ -963,7 +964,7 @@ impl<
             let index_field_type = index_field.r#type;
 
             let value = match index_field_type {
-                TitoIndexBlockType::String => to_snake_case(value),
+                TitoIndexBlockType::String => safe_encode(value),
                 TitoIndexBlockType::Number => format!("{:0>10}", value),
             };
 
@@ -1018,7 +1019,7 @@ impl<
             let index_field_type = index_field.r#type;
 
             let value = match index_field_type {
-                TitoIndexBlockType::String => to_snake_case(value),
+                TitoIndexBlockType::String => safe_encode(value),
                 TitoIndexBlockType::Number => format!("{:0>10}", value),
             };
 
