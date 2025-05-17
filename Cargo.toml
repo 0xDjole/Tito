@@ -4,6 +4,15 @@ version = "0.1.2"
 edition = "2021"
 description = "A flexible database layer built on top of TiKV with powerful indexing strategies and relationship modeling"
 license = "Apache-2.0"
+authors = ["0xDjole 0xdjole@gmail.com"]
+
+# GitHub metadata
+repository = "https://github.com/0xDjole/Tito"
+homepage = "https://github.com/0xDjole/Tito"
+documentation = "https://github.com/0xDjole/Tito"
+
+keywords = ["database", "tikv", "nosql", "indexing"]
+categories = ["database", "database-implementations"]
 
 [dependencies]
 # Async and futures
