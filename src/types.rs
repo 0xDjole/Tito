@@ -255,7 +255,6 @@ pub struct TitoChangeLog {
     pub operation: String,
     pub created_at: i64,
     pub data: Option<Value>,
-    pub indexes: Vec<String>,
 }
 
 pub type DBUuid = Uuid;

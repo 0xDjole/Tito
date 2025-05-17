@@ -563,7 +563,6 @@ impl<
             operation: String::from("put"),
             created_at: Utc::now().timestamp(),
             data: Some(value),
-            indexes: all_index_keys,
         };
 
         self.put_change_log(change_log, tx).await?;
@@ -604,10 +603,6 @@ impl<
                 let uuid_str = DBUuid::new_v4().to_string();
 
                 let key = format!("{}:{}:{}:{}:{}", value, status, scheduled_for, id, uuid_str);
-                let key_by_entity = format!(
-                    "{}_by_owner:{}:{}:{}:{}",
-                    value, id, action, scheduled_for, uuid_str
-                );
 
                 let job = TitoJob {
                     id: uuid_str,
@@ -625,7 +620,6 @@ impl<
                 };
 
                 self.put(key.clone(), &job, tx).await?;
-                self.put(key_by_entity.clone(), &key, tx).await?;
 
                 let value = serde_json::to_value(&job).ok();
 
@@ -637,7 +631,6 @@ impl<
                     operation: String::from("put"),
                     created_at: created_at,
                     data: value,
-                    indexes: vec![key_by_entity],
                 };
 
                 self.put_change_log(change_log, tx).await?;
@@ -1426,7 +1419,6 @@ impl<
             operation: String::from("delete"),
             created_at: Utc::now().timestamp(),
             data: None,
-            indexes: keys.clone(),
         };
 
         self.put_change_log(change_log, tx).await?;
@@ -1636,16 +1628,6 @@ impl<
                         let key = log.record_id.clone();
 
                         self.put(key.clone(), data.clone(), tx).await?;
-
-                        for index_key in &log.indexes {
-                            self.put(index_key.clone(), data.clone(), tx).await?;
-                        }
-
-                        let reverse_index = ReverseIndex {
-                            value: log.indexes.clone(),
-                        };
-                        let reverse_key = format!("reverse-index:{}", key);
-                        self.put(reverse_key, reverse_index, tx).await?;
                     } else {
                         return Err(TitoError::FailedCreate(
                             "Missing data for put operation".to_string(),
@@ -1656,10 +1638,6 @@ impl<
                     let key = log.record_id.clone();
 
                     self.delete(key.clone(), tx).await?;
-
-                    for index_key in &log.indexes {
-                        self.delete(index_key.clone(), tx).await?;
-                    }
 
                     let reverse_key = format!("reverse-index:{}", key);
                     self.delete(reverse_key, tx).await?;
