@@ -50,91 +50,91 @@ where
         }
     }
 
-    // Add a vector of values
-    pub fn values(mut self, values: Vec<String>) -> Self {
-        self.values = values;
-        self
-    }
-
-    pub fn exact_match(mut self, value: bool) -> Self {
-        self.exact_match = value;
-        self
-    }
-
-    // Add a single value
-    pub fn value(mut self, value: impl Into<String>) -> Self {
+    // Modified to use &mut self
+    pub fn value(&mut self, value: impl Into<String>) -> &mut Self {
         self.values.push(value.into());
         self
     }
 
-    // Add a single relationship
-    pub fn relationship(mut self, rel: impl Into<String>) -> Self {
+    // Modified to use &mut self
+    pub fn exact_match(&mut self, value: bool) -> &mut Self {
+        self.exact_match = value;
+        self
+    }
+
+    // Modified to use &mut self
+    pub fn relationship(&mut self, rel: impl Into<String>) -> &mut Self {
         self.rels.push(rel.into());
         self
     }
 
-    // Set result limit
-    pub fn limit(mut self, limit: Option<u32>) -> Self {
+    // Modified to use &mut self
+    pub fn limit(&mut self, limit: Option<u32>) -> &mut Self {
         self.limit = limit;
         self
     }
 
-    // Set pagination cursor
-    pub fn cursor(mut self, cursor: Option<impl Into<String>>) -> Self {
+    // Modified to use &mut self
+    pub fn cursor(&mut self, cursor: Option<impl Into<String>>) -> &mut Self {
         self.cursor = cursor.map(|cursor| cursor.into());
         self
     }
 
-    // Set end key
-    pub fn end(mut self, end: Option<impl Into<String>>) -> Self {
+    // Modified to use &mut self
+    pub fn end(&mut self, end: Option<impl Into<String>>) -> &mut Self {
         self.end = end.map(|end| end.into());
         self
     }
 
-    // Execute with internal transaction
-    pub async fn execute(self) -> Result<TitoPaginated<T>, TitoError> {
+    // Terminal methods still consume self
+    pub async fn execute(&mut self) -> Result<TitoPaginated<T>, TitoError> {
         let payload = TitoFindByIndexPayload {
-            index: self.index,
-            values: self.values,
-            rels: self.rels,
-            end: self.end,
+            index: self.index.clone(),
+            values: self.values.clone(),
+            rels: self.rels.clone(),
+            end: self.end.clone(),
             exact_match: self.exact_match,
             limit: self.limit,
-            cursor: self.cursor,
+            cursor: self.cursor.clone(),
         };
 
         self.model.find_by_index(payload).await
     }
 
-    // Execute with provided transaction
-    pub async fn execute_tx(self, tx: &TitoTransaction) -> Result<TitoPaginated<T>, TitoError> {
+    // Terminal method - still consumes self
+    pub async fn execute_tx(
+        &mut self,
+        tx: &TitoTransaction,
+    ) -> Result<TitoPaginated<T>, TitoError> {
         let payload = TitoFindByIndexPayload {
-            index: self.index,
-            values: self.values,
-            rels: self.rels,
-            end: self.end,
+            index: self.index.clone(),
+            values: self.values.clone(),
+            rels: self.rels.clone(),
+            end: self.end.clone(),
             exact_match: self.exact_match,
             limit: self.limit,
-            cursor: self.cursor,
+            cursor: self.cursor.clone(),
         };
 
         self.model.find_by_index_tx(payload, tx).await
     }
 
-    pub async fn execute_reverse(self) -> Result<TitoPaginated<T>, TitoError> {
+    // Terminal method - still consumes self
+    pub async fn execute_reverse(&mut self) -> Result<TitoPaginated<T>, TitoError> {
         let payload = TitoFindByIndexPayload {
-            index: self.index,
-            values: self.values,
-            rels: self.rels,
-            end: self.end,
+            index: self.index.clone(),
+            values: self.values.clone(),
+            rels: self.rels.clone(),
+            end: self.end.clone(),
             exact_match: self.exact_match,
             limit: self.limit,
-            cursor: self.cursor,
+            cursor: self.cursor.clone(),
         };
 
         self.model.find_by_index_reverse(payload).await
     }
 
+    // Terminal method - still consumes self
     pub async fn execute_reverse_tx(
         self,
         tx: &TitoTransaction,
