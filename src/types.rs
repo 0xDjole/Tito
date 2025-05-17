@@ -72,7 +72,6 @@ pub struct TitoUtilsConnectInput {
 pub struct TitoGenerateJobPayload {
     pub id: String,
     pub action: Option<String>,
-    pub clear_future: bool,
     pub scheduled_for: Option<i64>,
 }
 

@@ -572,7 +572,6 @@ impl<
             TitoGenerateJobPayload {
                 id: raw_id.clone(),
                 action: event_action,
-                clear_future: false,
                 scheduled_for: None,
             },
             tx,
@@ -603,53 +602,6 @@ impl<
                 let status = String::from("PENDING");
                 let id = payload.id.clone();
                 let uuid_str = DBUuid::new_v4().to_string();
-
-                if payload.clear_future {
-                    let future_events_start =
-                        format!("{}_by_owner:{}:{}:{}", value, id, action, created_at);
-                    let future_events_end =
-                        format!("{}_by_owner:{}:{}:{}", value, id, action, u32::MAX);
-
-                    self.tx(|inner_tx| async move {
-                        let scan_stream = inner_tx
-                            .scan(future_events_start..future_events_end, 1000)
-                            .await
-                            .map_err(|e| TitoError::NotFound(e.to_string()))?;
-
-                        let mut future_events = Vec::new();
-
-                        for item in scan_stream {
-                            if let Ok(key_by_entity) = serde_json::from_slice::<String>(&item.1) {
-                                let key_bytes: Vec<u8> = item.0.into();
-                                let key = match String::from_utf8(key_bytes) {
-                                    Ok(k) => k,
-                                    Err(_) => continue,
-                                };
-
-                                future_events.push(key_by_entity.clone());
-                                future_events.push(key.clone());
-
-                                let change_log = TitoChangeLog {
-                                    id: DBUuid::new_v4().to_string(),
-                                    record_id: key.clone(),
-                                    operation: String::from("delete"),
-                                    created_at: Utc::now().timestamp(),
-                                    data: None,
-                                    indexes: vec![key_by_entity],
-                                };
-
-                                self.put_change_log(change_log, &inner_tx).await?;
-                            }
-                        }
-
-                        for key in future_events.iter() {
-                            self.delete(key.clone(), &inner_tx).await?;
-                        }
-
-                        Ok::<_, TitoError>(())
-                    })
-                    .await?;
-                }
 
                 let key = format!("{}:{}:{}:{}:{}", value, status, scheduled_for, id, uuid_str);
                 let key_by_entity = format!(
@@ -1491,7 +1443,6 @@ impl<
             TitoGenerateJobPayload {
                 id: raw_id.to_string(),
                 action: trigger_event.then(|| String::from("DELETE")),
-                clear_future: false,
                 scheduled_for: None,
             },
             tx,
