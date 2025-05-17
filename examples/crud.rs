@@ -40,8 +40,8 @@ impl TitoModelTrait for User {
         "users".to_string()
     }
 
-    fn get_event_table_name(&self) -> Option<String> {
-        None
+    fn has_event(&self) -> bool {
+        false
     }
 
     fn get_id(&self) -> String {

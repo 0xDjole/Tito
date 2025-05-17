@@ -35,10 +35,10 @@ impl TitoQueue {
     ) -> Result<Vec<TitoJob>, TitoError> {
         let mut jobs: Vec<TitoJob> = Vec::new();
 
-        let start_bound = format!("{}:PENDING", self.table);
+        let start_bound = format!("event:{}:PENDING", self.table);
 
         let current_time = Utc::now().timestamp();
-        let end_bound = format!("{}:PENDING:{}", self.table, current_time);
+        let end_bound = format!("event:{}:PENDING:{}", self.table, current_time);
 
         let jobs = self
             .tx_manager

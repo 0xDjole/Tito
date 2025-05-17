@@ -60,8 +60,8 @@ impl TitoModelTrait for Tag {
         "tag".to_string()
     }
 
-    fn get_event_table_name(&self) -> Option<String> {
-        None
+    fn has_event(&self) -> bool {
+        false
     }
 
     fn get_id(&self) -> String {
@@ -118,8 +118,8 @@ impl TitoModelTrait for Post {
         "post".to_string()
     }
 
-    fn get_event_table_name(&self) -> Option<String> {
-        None
+    fn has_event(&self) -> bool {
+        false
     }
 
     fn get_id(&self) -> String {

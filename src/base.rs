@@ -76,7 +76,11 @@ impl<
     }
 
     fn get_event_table(&self) -> Option<String> {
-        self.model.get_event_table_name()
+        if self.model.has_event() {
+            Some(format!("event:{}", self.model.get_table_name()))
+        } else {
+            None
+        }
     }
 
     fn get_configs(&self) -> &TitoConfigs {
@@ -665,7 +669,7 @@ impl<
             if let Some(obj_to_modify) = current_json_node.as_object_mut() {
                 if let Some(id_val_at_source_key) = obj_to_modify.get(source_key) {
                     if let Some(id_str) = id_val_at_source_key.as_str() {
-                        let rel_lookup_key = format!("{}:{}", config.model, id_str);
+                        let rel_lookup_key = format!("table:{}:{}", config.model, id_str);
                         if let Some(related_data) = rel_map.get(&rel_lookup_key) {
                             obj_to_modify.insert(dest_key.to_string(), related_data.clone());
                         }
@@ -674,7 +678,8 @@ impl<
                         let mut stitched_related_items_array = Vec::new();
                         for id_elem_in_array in ids_array {
                             if let Some(id_str_elem) = id_elem_in_array.as_str() {
-                                let rel_lookup_key = format!("{}:{}", config.model, id_str_elem);
+                                let rel_lookup_key =
+                                    format!("table:{}:{}", config.model, id_str_elem);
                                 if let Some(related_data) = rel_map.get(&rel_lookup_key) {
                                     stitched_related_items_array.push(related_data.clone());
                                 }
@@ -749,7 +754,7 @@ impl<
                                     // Assuming __null__ is a skip marker
                                     relationship_keys_to_fetch.push((
                                         config.clone(),
-                                        format!("{}:{}", config.model, id_str),
+                                        format!("table:{}:{}", config.model, id_str),
                                     ));
                                 }
                             } else if let Some(id_array) = value_or_array_of_values.as_array() {
@@ -758,7 +763,7 @@ impl<
                                         if id_str != "__null__" {
                                             relationship_keys_to_fetch.push((
                                                 config.clone(),
-                                                format!("{}:{}", config.model, id_str),
+                                                format!("table:{}:{}", config.model, id_str),
                                             ));
                                         }
                                     }

@@ -118,7 +118,7 @@ pub trait TitoModelTrait {
     fn get_embedded_relationships(&self) -> Vec<TitoEmbeddedRelationshipConfig>;
     fn get_indexes(&self) -> Vec<TitoIndexConfig>;
     fn get_table_name(&self) -> String;
-    fn get_event_table_name(&self) -> Option<String>;
+    fn has_event(&self) -> bool;
     fn get_id(&self) -> String;
 }
 
