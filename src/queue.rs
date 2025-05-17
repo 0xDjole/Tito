@@ -51,16 +51,8 @@ impl TitoQueue {
                     }
                 }
 
-                let keys: Vec<_> = jobs.iter().map(|job| job.group_id.clone()).collect();
-
                 for job in jobs.iter_mut() {
-                    let key_by_entity = format!(
-                        "{}_by_entity:{}:{}:{}:{}",
-                        self.table, job.entity_id, job.action, job.scheduled_for, job.id
-                    );
-
                     tx.delete(job.key.clone()).await;
-                    tx.delete(key_by_entity).await;
 
                     job.status = String::from("PROGRESS");
                     let new_key = job.key.replace("PENDING", "PROGRESS");
@@ -68,16 +60,8 @@ impl TitoQueue {
 
                     let json_job = serde_json::to_value(job.clone());
 
-                    let key_by_entity = format!(
-                        "{}_by_entity:{}:{}:{}:{}",
-                        self.table, job.entity_id, job.action, job.scheduled_for, job.id
-                    );
-
                     if let Ok(value) = json_job {
                         tx.put(new_key.clone(), serde_json::to_vec(&value).unwrap())
-                            .await;
-
-                        tx.put(key_by_entity.clone(), serde_json::to_vec(&new_key).unwrap())
                             .await;
                     }
                 }
@@ -107,15 +91,6 @@ impl TitoQueue {
                     tx.put(new_key.clone(), serde_json::to_vec(&job).unwrap())
                         .await
                         .map_err(|_| TitoError::Failed)?;
-
-                    let key_by_entity = format!(
-                        "{}_by_entity:{}:{}:{}:{}",
-                        self.table, job.entity_id, job.action, job.scheduled_for, job.id
-                    );
-
-                    tx.put(key_by_entity, serde_json::to_vec(&new_key).unwrap())
-                        .await
-                        .map_err(|_| TitoError::TransactionFailed(String::from("Failed job")))?;
                 }
                 Ok::<_, TitoError>(())
             })
