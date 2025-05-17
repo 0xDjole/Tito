@@ -68,7 +68,7 @@ impl<
     }
 
     fn get_table(&self) -> String {
-        self.model.get_table_name()
+        format!("table:{}", self.model.get_table_name())
     }
 
     fn transaction_manager(&self) -> TransactionManager {
@@ -585,10 +585,9 @@ impl<
         payload: TitoGenerateJobPayload,
         tx: &TitoTransaction,
     ) -> Result<bool, TitoError> {
-        if let Some(raw_action) = payload.action.clone() {
+        if let Some(action) = payload.action.clone() {
             if let Some(value) = self.get_event_table() {
                 self.lock_keys(vec![payload.id.clone()], tx).await?;
-                let action = format!("{}_{}", raw_action, self.get_table().to_string());
                 let created_at = Utc::now().timestamp();
 
                 let scheduled_for = if let Some(scheduled_for) = payload.scheduled_for {
