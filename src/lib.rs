@@ -18,6 +18,10 @@ mod key_encoder;
 
 mod error;
 
+pub mod index;
+
+pub mod relationship;
+
 pub use error::TitoError;
 pub use types::TitoDatabase;
 pub use types::TitoJob;

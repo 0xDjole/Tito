@@ -14,33 +14,6 @@ pub fn next_string_lexicographically(payload: String) -> String {
     String::from_utf8_lossy(&prefix_end).to_string()
 }
 
-pub fn next_uuid(current: &str) -> String {
-    // Parse the current UUID
-    if let Ok(uuid) = Uuid::parse_str(current) {
-        // Convert to bytes (big-endian)
-        let bytes = uuid.as_bytes();
-        let mut next_bytes = bytes.to_vec();
-
-        // Increment the bytes as a big-endian number
-        for byte in next_bytes.iter_mut().rev() {
-            if *byte == 0xff {
-                *byte = 0;
-                continue;
-            }
-            *byte += 1;
-            break;
-        }
-
-        // Create new UUID from the incremented bytes
-        if let Ok(next_uuid) = Uuid::from_slice(&next_bytes) {
-            return next_uuid.to_string();
-        }
-    }
-
-    // Fallback: return a maximum UUID if parsing fails
-    "ffffffff-ffff-ffff-ffff-ffffffffffff".to_string()
-}
-
 pub fn previous_string_lexicographically(payload: String) -> String {
     let mut prefix_end = payload.as_bytes().to_vec();
 

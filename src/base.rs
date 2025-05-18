@@ -50,28 +50,12 @@ impl<
         }
     }
 
-    fn get_id(&self) -> String {
-        self.model.get_id()
-    }
-
-    fn get_model(&self) -> &T {
-        &self.model
-    }
-
-    fn get_embedded_relationships(&self) -> Vec<TitoEmbeddedRelationshipConfig> {
+    pub fn get_embedded_relationships(&self) -> Vec<TitoEmbeddedRelationshipConfig> {
         self.model.get_embedded_relationships()
     }
 
-    fn get_indexes(&self) -> Vec<TitoIndexConfig> {
-        self.model.get_indexes()
-    }
-
-    fn get_table(&self) -> String {
+    pub fn get_table(&self) -> String {
         format!("table:{}", self.model.get_table_name())
-    }
-
-    fn transaction_manager(&self) -> TransactionManager {
-        self.transaction_manager.clone()
     }
 
     fn get_event_table(&self) -> Option<String> {
@@ -80,10 +64,6 @@ impl<
         } else {
             None
         }
-    }
-
-    fn get_configs(&self) -> &TitoConfigs {
-        &self.configs
     }
 
     pub fn query_by_index(&self, index: impl Into<String>) -> IndexQueryBuilder<T> {
@@ -110,14 +90,14 @@ impl<
         Ok(encode(&json_bytes))
     }
 
-    async fn tx<F, Fut, R, E>(&self, f: F) -> Result<R, E>
+    pub async fn tx<F, Fut, R, E>(&self, f: F) -> Result<R, E>
     where
         F: FnOnce(TitoTransaction) -> Fut + Send,
         Fut: Future<Output = Result<R, E>> + Send,
         E: From<TitoError> + Send + Sync + std::fmt::Debug, // Added Sync trait bound
         R: Send,
     {
-        self.transaction_manager().transaction(f).await
+        self.transaction_manager.transaction(f).await
     }
 
     fn to_results(
@@ -273,7 +253,7 @@ impl<
         }
 
         loop {
-            if self.get_configs().is_read_only.load(Ordering::SeqCst) {
+            if self.configs.is_read_only.load(Ordering::SeqCst) {
                 if retries >= max_retries {
                     return Err(TitoError::ReadOnlyMode);
                 }
@@ -307,7 +287,7 @@ impl<
         let max_retries = 10;
 
         loop {
-            if self.get_configs().is_read_only.load(Ordering::SeqCst) {
+            if self.configs.is_read_only.load(Ordering::SeqCst) {
                 if retries >= max_retries {
                     return Err(TitoError::ReadOnlyMode);
                 }
@@ -352,7 +332,7 @@ impl<
         Ok(results)
     }
 
-    fn to_paginated_items(
+    pub fn to_paginated_items(
         &self,
         items: Vec<(String, Value)>,
         has_more: bool,
@@ -404,7 +384,7 @@ impl<
             ))
         })
     }
-    fn get_nested_values(&self, json: &Value, field_path: &str) -> Option<Vec<Value>> {
+    pub fn get_nested_values(&self, json: &Value, field_path: &str) -> Option<Vec<Value>> {
         let mut results = Vec::new();
         let mut to_process = vec![(json.clone(), 0)];
         let parts: Vec<&str> = field_path.split('.').collect();
@@ -440,87 +420,6 @@ impl<
         } else {
             Some(results)
         }
-    }
-
-    fn get_index_keys(
-        &self,
-        id: String,
-        value: &T,
-        json: &Value,
-    ) -> Result<Vec<(String, Value)>, TitoError>
-    where
-        T: serde::de::DeserializeOwned,
-    {
-        let mut all_index_keys = vec![];
-
-        for index_config in value.get_indexes().iter() {
-            if !index_config.condition {
-                continue;
-            }
-
-            let base_key = format!("index:{}:", index_config.name);
-
-            let mut combinations: Vec<String> = vec![String::new()];
-
-            if let Some(generator) = &index_config.custom_generator {
-                let custom_keys = generator()?;
-                for key in custom_keys {
-                    let key = format!("{}{}:{}", base_key, key, id);
-                    if !key.is_empty() {
-                        all_index_keys.push((key, json.clone()));
-                    }
-                }
-            }
-
-            for field in index_config.fields.iter() {
-                let field_values = match self.get_nested_values(json, &field.name) {
-                    Some(values) if !values.is_empty() => values,
-                    _ => {
-                        // Handle null/empty case
-                        vec![Value::String("__null__".to_string())]
-                    }
-                };
-
-                let mut new_combinations = vec![];
-
-                for value in field_values {
-                    let field_str = match field.r#type {
-                        TitoIndexBlockType::String => match value.as_str() {
-                            Some("") => Some(format!("{}:__null__", field.name)),
-                            Some(s) => Some(format!("{}:{}", field.name, safe_encode(&s))),
-                            None => Some(format!("{}:__null__", field.name)),
-                        },
-                        TitoIndexBlockType::Number => match value.as_i64() {
-                            Some(n) => Some(format!("{}:{:0>10}", field.name, n)),
-                            None => Some(format!("{}:__null__", field.name)),
-                        },
-                    };
-
-                    if let Some(field_str) = field_str {
-                        for existing_combo in &combinations {
-                            new_combinations.push(format!(
-                                "{}{}{}",
-                                existing_combo,
-                                if existing_combo.is_empty() { "" } else { ":" },
-                                field_str
-                            ));
-                        }
-                    }
-                }
-
-                if !new_combinations.is_empty() {
-                    combinations = new_combinations;
-                }
-            }
-
-            for combo in combinations {
-                if !combo.is_empty() {
-                    all_index_keys.push((format!("{}{}:{}", base_key, combo, id), json.clone()));
-                }
-            }
-        }
-
-        Ok(all_index_keys)
     }
 
     pub async fn build(&self, payload: T, tx: &TitoTransaction) -> Result<T, TitoError>
@@ -647,176 +546,6 @@ impl<
         Ok(true)
     }
 
-    pub fn stitch_relationship(
-        &self,
-        item: &mut Value,
-        rel_map: &HashMap<String, Value>,
-        config: &TitoEmbeddedRelationshipConfig,
-    ) {
-        let source_parts: Vec<&str> = config.source_field_name.split('.').collect();
-        let dest_parts: Vec<&str> = config.destination_field_name.split('.').collect();
-
-        Self::_stitch_recursive_helper(item, &source_parts, &dest_parts, rel_map, config);
-    }
-
-    fn _stitch_recursive_helper(
-        current_json_node: &mut Value,
-        source_path_remaining: &[&str],
-        dest_path_remaining: &[&str],
-        rel_map: &HashMap<String, Value>,
-        config: &TitoEmbeddedRelationshipConfig,
-    ) {
-        if source_path_remaining.len() == 1 && dest_path_remaining.len() == 1 {
-            let source_key = source_path_remaining[0];
-            let dest_key = dest_path_remaining[0];
-
-            if let Some(obj_to_modify) = current_json_node.as_object_mut() {
-                if let Some(id_val_at_source_key) = obj_to_modify.get(source_key) {
-                    if let Some(id_str) = id_val_at_source_key.as_str() {
-                        let rel_lookup_key = format!("table:{}:{}", config.model, id_str);
-                        if let Some(related_data) = rel_map.get(&rel_lookup_key) {
-                            obj_to_modify.insert(dest_key.to_string(), related_data.clone());
-                        }
-                    } else if let Some(ids_array) = id_val_at_source_key.as_array() {
-                        // Source is an array of ID strings
-                        let mut stitched_related_items_array = Vec::new();
-                        for id_elem_in_array in ids_array {
-                            if let Some(id_str_elem) = id_elem_in_array.as_str() {
-                                let rel_lookup_key =
-                                    format!("table:{}:{}", config.model, id_str_elem);
-                                if let Some(related_data) = rel_map.get(&rel_lookup_key) {
-                                    stitched_related_items_array.push(related_data.clone());
-                                }
-                            }
-                        }
-
-                        obj_to_modify.insert(
-                            dest_key.to_string(),
-                            Value::Array(stitched_related_items_array),
-                        );
-                    }
-                }
-            }
-            return;
-        }
-
-        if !source_path_remaining.is_empty()
-            && !dest_path_remaining.is_empty()
-            && source_path_remaining[0] == dest_path_remaining[0]
-        {
-            let common_key = source_path_remaining[0];
-            if let Some(next_json_node_candidate) = current_json_node.get_mut(common_key) {
-                match next_json_node_candidate {
-                    Value::Object(obj) => {
-                        Self::_stitch_recursive_helper(
-                            next_json_node_candidate, // obj is implicitly &mut Value here
-                            &source_path_remaining[1..],
-                            &dest_path_remaining[1..],
-                            rel_map,
-                            config,
-                        );
-                    }
-                    Value::Array(arr) => {
-                        for element_in_array in arr.iter_mut() {
-                            Self::_stitch_recursive_helper(
-                                element_in_array,
-                                &source_path_remaining[1..],
-                                &dest_path_remaining[1..],
-                                rel_map,
-                                config,
-                            );
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    pub fn get_relationship_data(
-        &self,
-        items: &Vec<(String, Value)>,
-        rels_config: &[TitoEmbeddedRelationshipConfig],
-        rels: &Vec<String>, // List of destination_field_names to populate
-    ) -> Vec<(TitoEmbeddedRelationshipConfig, String)> {
-        // (Config for this rel, "model_name:id_found")
-        let mut relationship_keys_to_fetch = Vec::new();
-
-        for (_, item_value) in items {
-            for config in rels_config {
-                // Check if this relationship is requested
-                if rels.contains(&config.destination_field_name) {
-                    // Use get_nested_values to find all ID values at the source path
-                    if let Some(found_values_at_source_path) =
-                        self.get_nested_values(item_value, &config.source_field_name)
-                    {
-                        for value_or_array_of_values in found_values_at_source_path {
-                            // The value_or_array_of_values could be a single ID (Value::String)
-                            // or an array of IDs (Value::Array of Value::String)
-                            if let Some(id_str) = value_or_array_of_values.as_str() {
-                                if id_str != "__null__" {
-                                    // Assuming __null__ is a skip marker
-                                    relationship_keys_to_fetch.push((
-                                        config.clone(),
-                                        format!("table:{}:{}", config.model, id_str),
-                                    ));
-                                }
-                            } else if let Some(id_array) = value_or_array_of_values.as_array() {
-                                for id_element in id_array {
-                                    if let Some(id_str) = id_element.as_str() {
-                                        if id_str != "__null__" {
-                                            relationship_keys_to_fetch.push((
-                                                config.clone(),
-                                                format!("table:{}:{}", config.model, id_str),
-                                            ));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        relationship_keys_to_fetch
-    }
-    async fn fetch_and_stitch_relationships(
-        &self,
-        items: Vec<(String, Value)>,
-        rels: Vec<String>,
-        tx: &TitoTransaction,
-    ) -> Result<Vec<(String, Value)>, TitoError> {
-        if rels.is_empty() {
-            return Ok(items);
-        }
-
-        let rels_config = self.get_embedded_relationships();
-        let relationship_data = self.get_relationship_data(&items, &rels_config, &rels);
-
-        let rel_keys: Vec<String> = relationship_data.into_iter().map(|item| item.1).collect();
-
-        let rel_items = self.batch_get(rel_keys.clone(), 10, 2, tx).await?;
-
-        let mut rel_map: HashMap<String, Value> = HashMap::new();
-        for kv in rel_items {
-            rel_map.insert(kv.0, kv.1);
-        }
-
-        let final_items = items
-            .into_iter()
-            .map(|mut item| {
-                for config in &rels_config {
-                    if rels.contains(&config.destination_field_name) {
-                        self.stitch_relationship(&mut item.1, &rel_map, config);
-                    }
-                }
-                item
-            })
-            .collect();
-
-        Ok(final_items)
-    }
-
     pub async fn find_by_id_tx(
         &self,
         id: &str,
@@ -873,151 +602,6 @@ impl<
             .await
     }
 
-    pub async fn find_by_index_reverse(
-        &self,
-        payload: TitoFindByIndexPayload,
-    ) -> Result<TitoPaginated<T>, TitoError>
-    where
-        T: serde::de::DeserializeOwned,
-    {
-        self.tx(|tx| async move { self.find_by_index_reverse_tx(payload, &tx).await })
-            .await
-    }
-
-    pub async fn find_by_index(
-        &self,
-        payload: TitoFindByIndexPayload,
-    ) -> Result<TitoPaginated<T>, TitoError>
-    where
-        T: serde::de::DeserializeOwned,
-    {
-        self.tx(|tx| async move { self.find_by_index_tx(payload, &tx).await })
-            .await
-    }
-
-    pub async fn find_by_index_reverse_raw(
-        &self,
-        payload: TitoFindByIndexPayload,
-        tx: &TitoTransaction,
-    ) -> Result<(Vec<(String, Value)>, bool), TitoError>
-    where
-        T: serde::de::DeserializeOwned,
-    {
-        let indexes = self.get_indexes();
-        let index = indexes
-            .iter()
-            .find(|index_config| index_config.name == payload.index)
-            .unwrap();
-
-        let index_fields = index.fields.clone();
-
-        let mut key_from_values = vec![];
-        for (i, value) in payload.values.iter().enumerate() {
-            let index_field = index_fields[i].clone();
-            let index_field_type = index_field.r#type;
-
-            let value = match index_field_type {
-                TitoIndexBlockType::String => safe_encode(value),
-                TitoIndexBlockType::Number => format!("{:0>10}", value),
-            };
-
-            let field_name = index_field.name.clone();
-            let key_part = format!("{}:{}", field_name, value);
-            key_from_values.push(key_part);
-        }
-
-        let key_from_value = key_from_values.join(":");
-
-        let id = format!("index:{}:{}", payload.index, key_from_value);
-
-        let (items, has_more) = self
-            .scan_reverse(
-                TitoScanPayload {
-                    start: id,
-                    end: payload.end.clone(),
-                    limit: payload.limit,
-                    cursor: payload.cursor.clone(),
-                },
-                tx,
-            )
-            .await?;
-
-        let items = self
-            .fetch_and_stitch_relationships(items, payload.rels, tx)
-            .await?;
-
-        Ok((items, has_more))
-    }
-
-    pub async fn find_by_index_raw(
-        &self,
-        payload: TitoFindByIndexPayload,
-        tx: &TitoTransaction,
-    ) -> Result<(Vec<(String, Value)>, bool), TitoError>
-    where
-        T: serde::de::DeserializeOwned,
-    {
-        let indexes = self.get_indexes();
-
-        let index = indexes
-            .iter()
-            .find(|index_config| index_config.name == payload.index)
-            .unwrap();
-
-        let index_fields = index.fields.clone();
-
-        let mut key_from_values = vec![];
-        for (i, value) in payload.values.iter().enumerate() {
-            let index_field = index_fields[i].clone();
-            let index_field_type = index_field.r#type;
-
-            let value = match index_field_type {
-                TitoIndexBlockType::String => safe_encode(value),
-                TitoIndexBlockType::Number => format!("{:0>10}", value),
-            };
-
-            let field_name = index_field.name.clone();
-            let key_part = format!("{}:{}", field_name, value);
-            key_from_values.push(key_part);
-        }
-
-        let key_from_value = key_from_values.join(":");
-
-        let mut id = format!("index:{}:{}", payload.index, key_from_value);
-
-        if payload.exact_match {
-            id.push_str(":");
-        }
-
-        let end = if let Some(end) = payload.end {
-            if let Some(last_colon_index) = id.rfind(':') {
-                Some(format!("{}:{}", &id[..last_colon_index], end))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let (items, has_more) = self
-            .scan(
-                TitoScanPayload {
-                    start: id,
-                    end,
-                    limit: payload.limit,
-                    cursor: payload.cursor.clone(),
-                },
-                tx,
-            )
-            .await?;
-
-        let items = self
-            .fetch_and_stitch_relationships(items, payload.rels, tx)
-            .await?;
-
-        Ok((items, has_more))
-    }
-
     pub async fn scan(
         &self,
         payload: TitoScanPayload,
@@ -1067,131 +651,6 @@ impl<
         Ok((items, has_more))
     }
 
-    pub async fn find_by_index_tx(
-        &self,
-        payload: TitoFindByIndexPayload,
-        tx: &TitoTransaction,
-    ) -> Result<TitoPaginated<T>, TitoError>
-    where
-        T: serde::de::DeserializeOwned,
-    {
-        let (items, has_more) = self
-            .find_by_index_raw(
-                TitoFindByIndexPayload {
-                    index: payload.index,
-                    values: payload.values,
-                    rels: payload.rels,
-                    end: payload.end,
-                    exact_match: true,
-                    limit: payload.limit,
-                    cursor: payload.cursor,
-                },
-                tx,
-            )
-            .await?;
-
-        let results = self.to_paginated_items(items, has_more)?;
-
-        Ok(results)
-    }
-
-    pub async fn find_by_index_reverse_tx(
-        &self,
-        payload: TitoFindByIndexPayload,
-        tx: &TitoTransaction,
-    ) -> Result<TitoPaginated<T>, TitoError>
-    where
-        T: serde::de::DeserializeOwned,
-    {
-        let cursor = payload.cursor.clone();
-        let (items, has_more) = self.find_by_index_reverse_raw(payload, tx).await?;
-
-        let results = self.to_paginated_items(items, has_more)?;
-
-        Ok(results)
-    }
-
-    pub fn deduplicate_and_track_last_valid(
-        &self,
-        items: &[(String, Value)],
-        origins: &[usize],
-        limit: Option<u32>,
-    ) -> (Vec<(String, Value)>, HashMap<usize, String>) {
-        let mut seen = HashSet::new();
-        let mut result = Vec::new();
-        let mut query_cursors = HashMap::new();
-        let limit = limit.map(|l| l as usize); // Convert Option<u32> to Option<usize> for easier comparison
-
-        for (i, item) in items.iter().enumerate() {
-            let origin = origins[i];
-            let id = item.1.get("id");
-
-            if let Some(id) = id {
-                if let Some(id) = id.as_str() {
-                    if seen.insert(id) {
-                        if limit.map_or(true, |lim| result.len() < lim) {
-                            result.push(item.clone());
-                            query_cursors.insert(origin, item.0.clone());
-                        } else {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        (result, query_cursors)
-    }
-
-    pub async fn find_one_by_index_tx(
-        &self,
-        payload: TitoFindOneByIndexPayload,
-        tx: &TitoTransaction,
-    ) -> Result<T, TitoError>
-    where
-        T: serde::de::DeserializeOwned,
-    {
-        let (items, _) = self
-            .find_by_index_raw(
-                TitoFindByIndexPayload {
-                    index: payload.index.clone(),
-                    values: payload.values.clone(),
-                    rels: payload.rels.clone(),
-                    end: None,
-                    exact_match: true,
-                    limit: Some(1),
-                    cursor: None,
-                },
-                tx,
-            )
-            .await?;
-
-        if let Some(value) = items.get(0) {
-            match serde_json::from_value::<T>(value.1.clone()) {
-                Ok(item) => Ok(item),
-                Err(e) => Err(TitoError::NotFound(format!(
-                    "Failed to deserialize record for index '{}' with values {:?}: {}",
-                    payload.index, payload.values, e
-                ))),
-            }
-        } else {
-            Err(TitoError::NotFound(format!(
-                "No record found for index '{}' with values {:?}",
-                payload.index, payload.values
-            )))
-        }
-    }
-
-    pub async fn find_one_by_index(
-        &self,
-        payload: TitoFindOneByIndexPayload,
-    ) -> Result<T, TitoError>
-    where
-        T: serde::de::DeserializeOwned,
-    {
-        self.tx(|tx| async move { self.find_one_by_index_tx(payload, &tx).await })
-            .await
-    }
     pub async fn find_by_ids_tx(
         &self,
         ids: Vec<String>,
@@ -1315,16 +774,6 @@ impl<
     pub fn get_last_id(&self, key: String) -> Option<String> {
         let parts: Vec<&str> = key.split(':').collect();
         parts.last().map(|last| last.to_string())
-    }
-
-    pub fn extract_relationship(&self, input: &str) -> Option<String> {
-        if let (Some(start), Some(end)) = (input.find("-").map(|idx| idx + 1), input.rfind("-")) {
-            if start < end {
-                return Some(input[start..end].trim().to_string());
-            }
-        }
-
-        None
     }
 
     pub async fn update_with_options(
@@ -1576,48 +1025,6 @@ impl<
             Ok::<_, TitoError>(true)
         })
         .await?;
-
-        Ok(())
-    }
-
-    pub async fn reindex(&self) -> Result<(), TitoError> {
-        let table = self.get_table();
-        let start_key = format!("{}:", table);
-        let end_key = next_string_lexicographically(start_key.clone());
-
-        let mut cursor = start_key.clone();
-
-        self.tx(|tx| async move {
-            loop {
-                let scan_range = cursor.clone()..end_key.clone();
-                let kvs = tx.scan(scan_range, 100).await.map_err(|e| {
-                    TitoError::TransactionFailed(String::from("Failed migration, scan"))
-                })?;
-
-                let mut has_kvs = false;
-                for kv in kvs {
-                    has_kvs = true;
-                    let key = String::from_utf8(kv.0.into()).unwrap();
-                    let value: Value = serde_json::from_slice(&kv.1).unwrap();
-
-                    let model_instance =
-                        serde_json::from_value::<T>(value.clone()).map_err(|_| {
-                            TitoError::TransactionFailed(String::from("Failed migration, model"))
-                        })?;
-
-                    self.update_with_options(model_instance, false, &tx).await?;
-
-                    cursor = next_string_lexicographically(key);
-                }
-
-                if !has_kvs {
-                    break;
-                }
-            }
-
-            Ok::<_, TitoError>(true)
-        })
-        .await;
 
         Ok(())
     }
