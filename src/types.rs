@@ -35,7 +35,7 @@ pub struct TitoUtilsConnectInput {
 
 #[derive(Debug, Clone)]
 pub struct TitoGenerateJobPayload {
-    pub id: String,
+    pub key: String,
     pub action: Option<String>,
     pub scheduled_for: Option<i64>,
 }
@@ -96,7 +96,7 @@ pub struct ReverseIndex {
 pub struct TitoJob {
     pub id: String,
     pub key: String,
-    pub entity_id: String,
+    pub entity: String,
     pub r#action: String,
     pub message: String,
     pub status: String,
@@ -105,6 +105,16 @@ pub struct TitoJob {
     pub scheduled_for: i64,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+impl TitoJob {
+    pub fn entity_id(&self) -> String {
+        let parts: Vec<&str> = self.entity.split(':').collect();
+        parts
+            .last()
+            .map(|last| last.to_string())
+            .unwrap_or_else(|| self.entity.clone())
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

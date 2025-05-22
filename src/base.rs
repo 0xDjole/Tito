@@ -58,6 +58,14 @@ impl<
         format!("table:{}", self.model.get_table_name())
     }
 
+    pub fn get_id_from_table(&self, key: String) -> String {
+        let parts: Vec<&str> = key.split(':').collect();
+        parts
+            .last()
+            .map(|last| last.to_string())
+            .unwrap_or_else(|| key)
+    }
+
     pub fn query_by_index(&self, index: impl Into<String>) -> IndexQueryBuilder<T> {
         IndexQueryBuilder::new(self.clone(), index.into())
     }
@@ -401,7 +409,7 @@ impl<
 
         self.generate_job(
             TitoGenerateJobPayload {
-                id: raw_id.clone(),
+                key: id.clone(),
                 action: event_action,
                 scheduled_for: None,
             },
@@ -419,7 +427,7 @@ impl<
     ) -> Result<bool, TitoError> {
         if let Some(action) = payload.action.clone() {
             for value in self.model.get_events().iter() {
-                self.lock_keys(vec![payload.id.clone()], tx).await?;
+                self.lock_keys(vec![payload.key.clone()], tx).await?;
                 let created_at = Utc::now().timestamp();
 
                 let scheduled_for = if let Some(scheduled_for) = payload.scheduled_for {
@@ -430,18 +438,15 @@ impl<
 
                 let message = value.to_string();
                 let status = String::from("PENDING");
-                let id = payload.id.clone();
+
                 let uuid_str = DBUuid::new_v4().to_string();
 
-                let key = format!(
-                    "event:{}:{}:{}:{}:{}",
-                    value, status, scheduled_for, id, uuid_str
-                );
+                let key = format!("event:{}:{}:{}:{}", value, status, scheduled_for, uuid_str);
 
                 let job = TitoJob {
                     id: uuid_str,
                     key: key.clone(),
-                    entity_id: id.clone(),
+                    entity: payload.key.clone(),
                     action: action.clone(),
                     status,
                     message,
@@ -793,7 +798,7 @@ impl<
 
         self.generate_job(
             TitoGenerateJobPayload {
-                id: raw_id.to_string(),
+                key: id.to_string(),
                 action: trigger_event.then(|| String::from("DELETE")),
                 scheduled_for: None,
             },
