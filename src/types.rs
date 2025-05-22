@@ -83,7 +83,7 @@ pub trait TitoModelTrait {
     fn get_embedded_relationships(&self) -> Vec<TitoEmbeddedRelationshipConfig>;
     fn get_indexes(&self) -> Vec<TitoIndexConfig>;
     fn get_table_name(&self) -> String;
-    fn has_event(&self) -> bool;
+    fn get_events(&self) -> Vec<String>;
     fn get_id(&self) -> String;
 }
 
@@ -97,7 +97,6 @@ pub struct TitoJob {
     pub id: String,
     pub key: String,
     pub entity_id: String,
-    pub group_id: String,
     pub r#action: String,
     pub message: String,
     pub status: String,

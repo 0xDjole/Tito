@@ -58,14 +58,6 @@ impl<
         format!("table:{}", self.model.get_table_name())
     }
 
-    fn get_event_table(&self) -> Option<String> {
-        if self.model.has_event() {
-            Some(format!("event:{}", self.model.get_table_name()))
-        } else {
-            None
-        }
-    }
-
     pub fn query_by_index(&self, index: impl Into<String>) -> IndexQueryBuilder<T> {
         IndexQueryBuilder::new(self.clone(), index.into())
     }
@@ -426,7 +418,7 @@ impl<
         tx: &TitoTransaction,
     ) -> Result<bool, TitoError> {
         if let Some(action) = payload.action.clone() {
-            if let Some(value) = self.get_event_table() {
+            for value in self.model.get_events().iter() {
                 self.lock_keys(vec![payload.id.clone()], tx).await?;
                 let created_at = Utc::now().timestamp();
 
@@ -441,13 +433,15 @@ impl<
                 let id = payload.id.clone();
                 let uuid_str = DBUuid::new_v4().to_string();
 
-                let key = format!("{}:{}:{}:{}:{}", value, status, scheduled_for, id, uuid_str);
+                let key = format!(
+                    "event:{}:{}:{}:{}:{}",
+                    value, status, scheduled_for, id, uuid_str
+                );
 
                 let job = TitoJob {
                     id: uuid_str,
                     key: key.clone(),
                     entity_id: id.clone(),
-                    group_id: id.clone(),
                     action: action.clone(),
                     status,
                     message,

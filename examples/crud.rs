@@ -40,8 +40,8 @@ impl TitoModelTrait for User {
         "users".to_string()
     }
 
-    fn has_event(&self) -> bool {
-        false
+    fn get_events(&self) -> Vec<String> {
+        vec![]
     }
 
     fn get_id(&self) -> String {

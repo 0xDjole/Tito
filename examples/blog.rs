@@ -58,8 +58,8 @@ impl TitoModelTrait for Tag {
         "tag".to_string()
     }
 
-    fn has_event(&self) -> bool {
-        false
+    fn get_events(&self) -> Vec<String> {
+        vec![]
     }
 
     fn get_id(&self) -> String {
@@ -116,8 +116,8 @@ impl TitoModelTrait for Post {
         "post".to_string()
     }
 
-    fn has_event(&self) -> bool {
-        false
+    fn get_events(&self) -> Vec<String> {
+        vec![]
     }
 
     fn get_id(&self) -> String {

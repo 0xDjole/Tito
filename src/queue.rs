@@ -28,12 +28,7 @@ impl TitoQueue {
         Ok(())
     }
 
-    pub async fn pull(
-        &self,
-        limit: u32,
-        _offset: u32,
-        _group_id: Option<String>,
-    ) -> Result<Vec<TitoJob>, TitoError> {
+    pub async fn pull(&self, limit: u32, _offset: u32) -> Result<Vec<TitoJob>, TitoError> {
         let mut jobs: Vec<TitoJob> = Vec::new();
 
         let start_bound = format!("event:{}:PENDING", self.table);
@@ -188,7 +183,7 @@ where
                     let is_leader_val = is_leader.load(Ordering::SeqCst);
                     if is_leader_val {
                         // Attempt to pull jobs from the queue
-                        match queue.pull(20, 0, None).await {
+                        match queue.pull(20, 0).await {
                             Ok(jobs) => {
                                 stream::iter(jobs.into_iter().map(|job| {
                                     let queue = Arc::clone(&queue);
