@@ -10,10 +10,10 @@ use crate::{
     query::IndexQueryBuilder,
     transaction::{TitoTransaction, TransactionManager},
     types::{
-        DBUuid, ReverseIndex, TitoChangeLog, TitoConfigs, TitoCursor, TitoDatabase,
-        TitoEmbeddedRelationshipConfig, TitoFindByIndexPayload, TitoFindChangeLogSincePaylaod,
-        TitoFindOneByIndexPayload, TitoFindPayload, TitoGenerateJobPayload, TitoIndexBlockType,
-        TitoIndexConfig, TitoJob, TitoModelTrait, TitoPaginated, TitoScanPayload,
+        DBUuid, ReverseIndex, TitoConfigs, TitoCursor, TitoDatabase,
+        TitoEmbeddedRelationshipConfig, TitoFindByIndexPayload, TitoFindOneByIndexPayload,
+        TitoFindPayload, TitoGenerateJobPayload, TitoIndexBlockType, TitoIndexConfig, TitoJob,
+        TitoModelTrait, TitoPaginated, TitoScanPayload,
     },
     utils::{next_string_lexicographically, previous_string_lexicographically},
 };
@@ -175,63 +175,6 @@ impl<
 
         serde_json::from_slice::<Value>(&result)
             .map_err(|_| TitoError::NotFound("Not found".to_string()))
-    }
-
-    pub async fn put_change_log(
-        &self,
-        change_log: TitoChangeLog,
-        tx: &TitoTransaction,
-    ) -> Result<bool, TitoError> {
-        let change_log_id = format!("change-log:{}:{}", change_log.created_at, change_log.id);
-
-        let change_log_value = serde_json::to_value(&change_log)
-            .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
-
-        self.put(change_log_id, change_log_value, tx).await?;
-
-        Ok(true)
-    }
-
-    pub async fn find_changelog_since(
-        &self,
-        payload: TitoFindChangeLogSincePaylaod,
-        tx: &TitoTransaction,
-    ) -> Result<TitoPaginated<TitoChangeLog>, TitoError> {
-        let start = format!("change-log:{}:", payload.timestamp);
-        let end_key = format!("change-log:{}:", Utc::now().timestamp());
-
-        let scan_payload = TitoScanPayload {
-            start,
-            end: Some(end_key),
-            limit: payload.limit,
-            cursor: payload.cursor,
-        };
-
-        let (changelog_entries, has_more) = self.scan(scan_payload, tx).await?;
-
-        let mut results = vec![];
-
-        let mut last_item: Option<String> = None;
-
-        for item in changelog_entries.into_iter() {
-            last_item = Some(item.0.clone());
-            if let Ok(item) = serde_json::from_value::<TitoChangeLog>(item.1) {
-                results.push(item);
-            }
-        }
-
-        let cursor: Option<String> = last_item
-            .and_then(|item| {
-                Some(
-                    self.encode_cursors(vec![Some(item)])
-                        .expect("Failed to encode cursor"),
-                )
-            })
-            .or(None);
-
-        let results = TitoPaginated::new(results, cursor);
-
-        Ok(results)
     }
 
     async fn put<P>(&self, key: String, payload: P, tx: &TitoTransaction) -> Result<bool, TitoError>
@@ -464,16 +407,6 @@ impl<
 
         self.put(reverse_key.clone(), index_json_key, tx).await?;
 
-        let change_log = TitoChangeLog {
-            id: DBUuid::new_v4().to_string(),
-            record_id: id.clone(),
-            operation: String::from("put"),
-            created_at: Utc::now().timestamp(),
-            data: Some(value),
-        };
-
-        self.put_change_log(change_log, tx).await?;
-
         self.generate_job(
             TitoGenerateJobPayload {
                 id: raw_id.clone(),
@@ -526,20 +459,6 @@ impl<
                 };
 
                 self.put(key.clone(), &job, tx).await?;
-
-                let value = serde_json::to_value(&job).ok();
-
-                let id = DBUuid::new_v4().to_string();
-
-                let change_log = TitoChangeLog {
-                    id,
-                    record_id: key.clone(),
-                    operation: String::from("put"),
-                    created_at: created_at,
-                    data: value,
-                };
-
-                self.put_change_log(change_log, tx).await?;
             }
         }
 
@@ -870,16 +789,6 @@ impl<
         let reverse_index = self.get_reverse_index(&reverse_index_key, tx).await?;
         let mut keys = reverse_index.value;
 
-        let change_log = TitoChangeLog {
-            id: DBUuid::new_v4().to_string(),
-            record_id: id.clone(),
-            operation: String::from("delete"),
-            created_at: Utc::now().timestamp(),
-            data: None,
-        };
-
-        self.put_change_log(change_log, tx).await?;
-
         keys.push(id.clone());
 
         keys.push(reverse_index_key);
@@ -1027,47 +936,6 @@ impl<
         .await?;
 
         Ok(())
-    }
-
-    pub async fn apply_change_logs(
-        &self,
-        change_logs: Vec<TitoChangeLog>,
-        tx: &TitoTransaction,
-    ) -> Result<bool, TitoError> {
-        for log in change_logs {
-            self.put_change_log(log.clone(), tx).await?;
-
-            let record_id = &log.record_id;
-
-            let is_regular_record = record_id.starts_with(&format!("{}:", self.get_table()));
-
-            match log.operation.as_str() {
-                "put" => {
-                    if let Some(data) = &log.data {
-                        if is_regular_record {
-                            if let Ok(model) = serde_json::from_value::<T>(data.clone()) {
-                                self.update_with_options(model, false, tx).await?;
-                            }
-                        } else {
-                            self.put(record_id.clone(), data.clone(), tx).await?;
-                        }
-                    }
-                }
-                "delete" => {
-                    if is_regular_record {
-                        if let Some(raw_id) =
-                            record_id.strip_prefix(&format!("{}:", self.get_table()))
-                        {
-                            self.delete_by_id_with_options(raw_id, false, tx).await?;
-                        }
-                    } else {
-                        self.delete(record_id.clone(), tx).await?;
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(true)
     }
 
     pub async fn find_all(&self) -> Result<TitoPaginated<T>, TitoError> {

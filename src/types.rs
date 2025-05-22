@@ -144,13 +144,6 @@ pub struct TitoFindPayload {
     pub rels: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct TitoFindChangeLogSincePaylaod {
-    pub timestamp: i64,
-    pub limit: Option<u32>,
-    pub cursor: Option<String>,
-}
-
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TitoFindByIndexPayload {
     pub index: String,
@@ -212,15 +205,6 @@ impl<T> TitoPaginated<T> {
     pub fn new(items: Vec<T>, cursor: Option<String>) -> Self {
         Self { items, cursor }
     }
-}
-
-#[derive(Clone, Default, Serialize, Deserialize, Debug)]
-pub struct TitoChangeLog {
-    pub id: String,
-    pub record_id: String,
-    pub operation: String,
-    pub created_at: i64,
-    pub data: Option<Value>,
 }
 
 pub type DBUuid = Uuid;
