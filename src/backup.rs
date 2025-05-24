@@ -18,7 +18,12 @@ impl TitoBackupService {
         Self
     }
 
-    pub async fn backup(&self, file_path: &str, tx: &TitoTransaction) -> Result<usize, TitoError> {
+    pub async fn backup(
+        &self,
+        file_path: &str,
+        prefixes: Vec<&str>,
+        tx: &TitoTransaction,
+    ) -> Result<usize, TitoError> {
         if let Some(parent) = Path::new(file_path).parent() {
             fs::create_dir_all(parent)
                 .await
@@ -39,6 +44,14 @@ impl TitoBackupService {
         record_count += self
             .write_prefix_to_file("table:", &mut file, &mut first_record, tx)
             .await?;
+
+        for prefix in prefixes.iter() {
+            let prefix = format!("{}:", prefix);
+
+            record_count += self
+                .write_prefix_to_file(&prefix, &mut file, &mut first_record, tx)
+                .await?;
+        }
 
         file.write_all(b"\n]")
             .await
