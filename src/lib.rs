@@ -24,6 +24,6 @@ pub mod relationship;
 
 pub use error::TitoError;
 pub use types::TitoDatabase;
-pub use types::TitoJob;
+pub use types::TitoEvent;
 
 pub mod backup;

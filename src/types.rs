@@ -34,7 +34,7 @@ pub struct TitoUtilsConnectInput {
 }
 
 #[derive(Debug, Clone)]
-pub struct TitoGenerateJobPayload {
+pub struct TitoGenerateEventPayload {
     pub key: String,
     pub action: Option<String>,
     pub scheduled_for: Option<i64>,
@@ -83,7 +83,7 @@ pub trait TitoModelTrait {
     fn get_embedded_relationships(&self) -> Vec<TitoEmbeddedRelationshipConfig>;
     fn get_indexes(&self) -> Vec<TitoIndexConfig>;
     fn get_table_name(&self) -> String;
-    fn get_events(&self) -> Vec<String>;
+    fn get_events(&self) -> Vec<TitoEventConfig>;
     fn get_id(&self) -> String;
 }
 
@@ -93,7 +93,7 @@ pub struct ReverseIndex {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct TitoJob {
+pub struct TitoEvent {
     pub id: String,
     pub key: String,
     pub entity: String,
@@ -107,7 +107,7 @@ pub struct TitoJob {
     pub updated_at: i64,
 }
 
-impl TitoJob {
+impl TitoEvent {
     pub fn entity_id(&self) -> String {
         let parts: Vec<&str> = self.entity.split(':').collect();
         parts
@@ -217,3 +217,15 @@ impl<T> TitoPaginated<T> {
 }
 
 pub type DBUuid = Uuid;
+
+#[derive(Debug, Clone)]
+pub struct TitoEventConfig {
+    pub name: String,
+    pub event_type: TitoEventType,
+}
+
+#[derive(Debug, Clone)]
+pub enum TitoEventType {
+    Queue,
+    Audit,
+}

@@ -11,9 +11,9 @@ use crate::{
     transaction::{TitoTransaction, TransactionManager},
     types::{
         DBUuid, ReverseIndex, TitoConfigs, TitoCursor, TitoDatabase,
-        TitoEmbeddedRelationshipConfig, TitoFindByIndexPayload, TitoFindOneByIndexPayload,
-        TitoFindPayload, TitoGenerateJobPayload, TitoIndexBlockType, TitoIndexConfig, TitoJob,
-        TitoModelTrait, TitoPaginated, TitoScanPayload,
+        TitoEmbeddedRelationshipConfig, TitoEvent, TitoEventType, TitoFindByIndexPayload,
+        TitoFindOneByIndexPayload, TitoFindPayload, TitoGenerateEventPayload, TitoIndexBlockType,
+        TitoIndexConfig, TitoModelTrait, TitoPaginated, TitoScanPayload,
     },
     utils::{next_string_lexicographically, previous_string_lexicographically},
 };
@@ -407,8 +407,8 @@ impl<
 
         self.put(reverse_key.clone(), index_json_key, tx).await?;
 
-        self.generate_job(
-            TitoGenerateJobPayload {
+        self.generate_event(
+            TitoGenerateEventPayload {
                 key: id.clone(),
                 action: event_action,
                 scheduled_for: None,
@@ -420,13 +420,13 @@ impl<
         Ok(payload)
     }
 
-    async fn generate_job(
+    async fn generate_event(
         &self,
-        payload: TitoGenerateJobPayload,
+        payload: TitoGenerateEventPayload,
         tx: &TitoTransaction,
     ) -> Result<bool, TitoError> {
         if let Some(action) = payload.action.clone() {
-            for value in self.model.get_events().iter() {
+            for event_config in self.model.get_events().iter() {
                 self.lock_keys(vec![payload.key.clone()], tx).await?;
                 let created_at = Utc::now().timestamp();
 
@@ -436,14 +436,28 @@ impl<
                     created_at
                 };
 
-                let message = value.to_string();
-                let status = String::from("PENDING");
+                let message = event_config.name.to_string();
 
                 let uuid_str = DBUuid::new_v4().to_string();
 
-                let key = format!("event:{}:{}:{}:{}", value, status, scheduled_for, uuid_str);
+                let (status, key) = match event_config.event_type {
+                    TitoEventType::Queue => {
+                        let status = String::from("PENDING");
+                        let key = format!(
+                            "event:{}:{}:{}:{}",
+                            event_config.name, status, scheduled_for, uuid_str
+                        );
+                        (status, key)
+                    }
+                    TitoEventType::Audit => {
+                        let status = String::from("ARCHIVED");
+                        let key =
+                            format!("audit:{}:{}:{}", created_at, event_config.name, uuid_str);
+                        (status, key)
+                    }
+                };
 
-                let job = TitoJob {
+                let event = TitoEvent {
                     id: uuid_str,
                     key: key.clone(),
                     entity: payload.key.clone(),
@@ -457,7 +471,7 @@ impl<
                     updated_at: created_at,
                 };
 
-                self.put(key.clone(), &job, tx).await?;
+                self.put(key.clone(), &event, tx).await?;
             }
         }
 
@@ -796,8 +810,8 @@ impl<
             self.delete(key, tx).await?;
         }
 
-        self.generate_job(
-            TitoGenerateJobPayload {
+        self.generate_event(
+            TitoGenerateEventPayload {
                 key: id.to_string(),
                 action: trigger_event.then(|| String::from("DELETE")),
                 scheduled_for: None,

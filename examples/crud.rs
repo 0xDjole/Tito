@@ -6,8 +6,8 @@ use tito::{
     connect,
     transaction::TransactionManager,
     types::{
-        DBUuid, TitoConfigs, TitoIndexBlockType, TitoIndexConfig, TitoIndexField, TitoModelTrait,
-        TitoUtilsConnectInput, TitoUtilsConnectPayload,
+        DBUuid, TitoConfigs, TitoEventConfig, TitoIndexBlockType, TitoIndexConfig, TitoIndexField,
+        TitoModelTrait, TitoUtilsConnectInput, TitoUtilsConnectPayload,
     },
     TitoError, TitoModel,
 };
@@ -40,7 +40,7 @@ impl TitoModelTrait for User {
         "users".to_string()
     }
 
-    fn get_events(&self) -> Vec<String> {
+    fn get_events(&self) -> Vec<TitoEventConfig> {
         vec![]
     }
 

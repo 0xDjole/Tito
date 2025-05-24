@@ -9,7 +9,7 @@ use tokio::time::sleep;
 use crate::TitoError;
 use crate::{
     transaction::TransactionManager,
-    types::{TitoDatabase, TitoJob},
+    types::{TitoDatabase, TitoEvent},
 };
 
 #[derive(Clone)]
@@ -28,8 +28,8 @@ impl TitoQueue {
         Ok(())
     }
 
-    pub async fn pull(&self, limit: u32, _offset: u32) -> Result<Vec<TitoJob>, TitoError> {
-        let mut jobs: Vec<TitoJob> = Vec::new();
+    pub async fn pull(&self, limit: u32, _offset: u32) -> Result<Vec<TitoEvent>, TitoError> {
+        let mut jobs: Vec<TitoEvent> = Vec::new();
 
         let start_bound = format!("event:{}:PENDING", self.table);
 
@@ -42,7 +42,7 @@ impl TitoQueue {
                 let scan_stream = tx.scan(start_bound..end_bound, limit).await?;
 
                 for item in scan_stream {
-                    if let Ok(job) = serde_json::from_slice::<TitoJob>(&item.1) {
+                    if let Ok(job) = serde_json::from_slice::<TitoEvent>(&item.1) {
                         jobs.push(job);
                     }
                 }
@@ -77,7 +77,7 @@ impl TitoQueue {
                 let job = tx.get(job_id.clone()).await?;
 
                 if let Some(job_bytes) = job {
-                    let mut job: TitoJob = serde_json::from_slice(&job_bytes).map_err(|_| {
+                    let mut job: TitoEvent = serde_json::from_slice(&job_bytes).map_err(|_| {
                         TitoError::DeserializationFailed(String::from("Failed job"))
                     })?;
                     job.status = "COMPLETED".to_string();
@@ -103,7 +103,7 @@ impl TitoQueue {
                 let job = tx.get(job_id.clone()).await?;
 
                 if let Some(job_bytes) = job {
-                    let mut job: TitoJob = serde_json::from_slice(&job_bytes).map_err(|_| {
+                    let mut job: TitoEvent = serde_json::from_slice(&job_bytes).map_err(|_| {
                         TitoError::DeserializationFailed(String::from("Failed job"))
                     })?;
 
@@ -167,7 +167,7 @@ pub async fn run_worker<H>(
     mut shutdown: broadcast::Receiver<()>,
 ) -> tokio::task::JoinHandle<()>
 where
-    H: Fn(TitoJob) -> futures::future::BoxFuture<'static, Result<(), TitoError>>
+    H: Fn(TitoEvent) -> futures::future::BoxFuture<'static, Result<(), TitoError>>
         + Clone
         + Send
         + Sync
