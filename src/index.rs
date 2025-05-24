@@ -358,7 +358,6 @@ impl<
                     has_kvs = true;
                     let key = String::from_utf8(kv.0.into()).unwrap();
 
-                    println!("EOO REE INDEX {:?}", key);
                     let value: Value = serde_json::from_slice(&kv.1).unwrap();
 
                     let model_instance =
