@@ -1,4 +1,5 @@
 use crate::TitoError;
+use async_trait::async_trait;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -19,6 +20,195 @@ pub type TitoDatabase = Arc<TransactionClient>;
 pub type TitoKey = Key;
 
 pub type TiKvTransaction = Transaction;
+
+pub type TitoValue = Vec<u8>;
+
+#[async_trait]
+pub trait StorageBackend: Send + Sync + Clone {
+    type Transaction: StorageTransaction;
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    async fn begin_transaction(&self) -> Result<Self::Transaction, Self::Error>;
+}
+
+#[async_trait]
+pub trait StorageTransaction: Send + Sync {
+    type Key: Clone + Send + Sync;
+    type Value: Clone + Send + Sync;
+    type KvPair: Clone + Send + Sync;
+    type Range: Send + Sync;
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    async fn get(&mut self, key: Self::Key) -> Result<Option<Self::Value>, Self::Error>;
+    async fn get_for_update(&mut self, key: Self::Key) -> Result<Option<Self::Value>, Self::Error>;
+    async fn put(&mut self, key: Self::Key, value: Self::Value) -> Result<(), Self::Error>;
+    async fn delete(&mut self, key: Self::Key) -> Result<(), Self::Error>;
+    async fn scan(
+        &mut self,
+        range: Self::Range,
+        limit: u32,
+    ) -> Result<Vec<Self::KvPair>, Self::Error>;
+    async fn scan_reverse(
+        &mut self,
+        range: Self::Range,
+        limit: u32,
+    ) -> Result<Vec<Self::KvPair>, Self::Error>;
+    async fn batch_get(&mut self, keys: Vec<Self::Key>) -> Result<Vec<Self::KvPair>, Self::Error>;
+    async fn batch_get_for_update(
+        &mut self,
+        keys: Vec<Self::Key>,
+    ) -> Result<Vec<Self::KvPair>, Self::Error>;
+    async fn commit(self) -> Result<(), Self::Error>;
+    async fn rollback(self) -> Result<(), Self::Error>;
+}
+
+#[derive(Clone)]
+pub struct TiKvStorageBackend {
+    pub client: Arc<TransactionClient>,
+}
+
+#[async_trait]
+impl StorageBackend for TiKvStorageBackend {
+    type Transaction = TiKvStorageTransaction;
+    type Error = TitoError;
+
+    async fn begin_transaction(&self) -> Result<Self::Transaction, Self::Error> {
+        let tx = self.client.begin_pessimistic().await.map_err(|e| {
+            TitoError::TransactionFailed(format!("Failed to begin transaction: {}", e))
+        })?;
+        Ok(TiKvStorageTransaction {
+            inner: Arc::new(tokio::sync::Mutex::new(tx)),
+        })
+    }
+}
+
+pub struct TiKvStorageTransaction {
+    inner: Arc<tokio::sync::Mutex<Transaction>>,
+}
+
+#[async_trait]
+impl StorageTransaction for TiKvStorageTransaction {
+    type Key = tikv_client::Key;
+    type Value = tikv_client::Value;
+    type KvPair = tikv_client::KvPair;
+    type Range = tikv_client::BoundRange;
+    type Error = TitoError;
+
+    async fn get(&mut self, key: Self::Key) -> Result<Option<Self::Value>, Self::Error> {
+        self.inner.lock().await.get(key.clone()).await.map_err(|e| {
+            TitoError::QueryFailed(format!("Get operation failed for key {:?}: {}", key, e))
+        })
+    }
+
+    async fn get_for_update(&mut self, key: Self::Key) -> Result<Option<Self::Value>, Self::Error> {
+        self.inner
+            .lock()
+            .await
+            .get_for_update(key.clone())
+            .await
+            .map_err(|e| {
+                TitoError::QueryFailed(format!("Get for update failed for key {:?}: {}", key, e))
+            })
+    }
+
+    async fn put(&mut self, key: Self::Key, value: Self::Value) -> Result<(), Self::Error> {
+        self.inner
+            .lock()
+            .await
+            .put(key.clone(), value)
+            .await
+            .map_err(|e| {
+                TitoError::UpdateFailed(format!("Put operation failed for key {:?}: {}", key, e))
+            })
+    }
+
+    async fn delete(&mut self, key: Self::Key) -> Result<(), Self::Error> {
+        self.inner
+            .lock()
+            .await
+            .delete(key.clone())
+            .await
+            .map_err(|e| {
+                TitoError::DeleteFailed(format!("Delete operation failed for key {:?}: {}", key, e))
+            })
+    }
+
+    async fn scan(
+        &mut self,
+        range: Self::Range,
+        limit: u32,
+    ) -> Result<Vec<Self::KvPair>, Self::Error> {
+        self.inner
+            .lock()
+            .await
+            .scan(range, limit)
+            .await
+            .map(|iter| iter.collect())
+            .map_err(|e| TitoError::QueryFailed(format!("Scan operation failed: {}", e)))
+    }
+
+    async fn scan_reverse(
+        &mut self,
+        range: Self::Range,
+        limit: u32,
+    ) -> Result<Vec<Self::KvPair>, Self::Error> {
+        self.inner
+            .lock()
+            .await
+            .scan_reverse(range, limit)
+            .await
+            .map(|iter| iter.collect())
+            .map_err(|e| TitoError::QueryFailed(format!("Reverse scan operation failed: {}", e)))
+    }
+
+    async fn batch_get(&mut self, keys: Vec<Self::Key>) -> Result<Vec<Self::KvPair>, Self::Error> {
+        self.inner
+            .lock()
+            .await
+            .batch_get(keys)
+            .await
+            .map(|iter| iter.collect())
+            .map_err(|e| TitoError::QueryFailed(format!("Batch get operation failed: {}", e)))
+    }
+
+    async fn batch_get_for_update(
+        &mut self,
+        keys: Vec<Self::Key>,
+    ) -> Result<Vec<Self::KvPair>, Self::Error> {
+        self.inner
+            .lock()
+            .await
+            .batch_get_for_update(keys)
+            .await
+            .map(|iter| iter.into_iter().collect())
+            .map_err(|e| TitoError::QueryFailed(format!("Batch get for update failed: {}", e)))
+    }
+
+    async fn commit(self) -> Result<(), Self::Error> {
+        Arc::try_unwrap(self.inner)
+            .map_err(|_| {
+                TitoError::TransactionFailed("Transaction still has references".to_string())
+            })?
+            .into_inner()
+            .commit()
+            .await
+            .map(|_| ())
+            .map_err(|e| TitoError::TransactionFailed(format!("Transaction commit failed: {}", e)))
+    }
+
+    async fn rollback(self) -> Result<(), Self::Error> {
+        Arc::try_unwrap(self.inner)
+            .map_err(|_| {
+                TitoError::TransactionFailed("Transaction still has references".to_string())
+            })?
+            .into_inner()
+            .rollback()
+            .await
+            .map_err(|e| {
+                TitoError::TransactionFailed(format!("Transaction rollback failed: {}", e))
+            })
+    }
+}
 
 pub struct TitoLockItem {
     pub key: String,
