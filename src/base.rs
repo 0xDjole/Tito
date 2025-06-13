@@ -195,7 +195,7 @@ impl<
         }
 
         loop {
-            if self.configs.is_read_only.load(Ordering::SeqCst) {
+            if self.engine.configs().is_read_only.load(Ordering::SeqCst) {
                 if retries >= max_retries {
                     return Err(TitoError::ReadOnlyMode);
                 }
@@ -229,7 +229,7 @@ impl<
         let max_retries = 10;
 
         loop {
-            if self.configs.is_read_only.load(Ordering::SeqCst) {
+            if self.engine.configs().is_read_only.load(Ordering::SeqCst) {
                 if retries >= max_retries {
                     return Err(TitoError::ReadOnlyMode);
                 }

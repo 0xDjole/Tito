@@ -31,6 +31,8 @@ pub trait StorageEngine: Send + Sync + Clone {
     type Error: std::error::Error + Send + Sync + 'static;
 
     async fn begin_transaction(&self) -> Result<Self::Transaction, Self::Error>;
+
+    fn configs(&self) -> TitoConfigs;
 }
 
 #[async_trait]
@@ -83,6 +85,10 @@ impl StorageEngine for TiKvStorageBackend {
         Ok(TiKvStorageTransaction {
             inner: Arc::new(tokio::sync::Mutex::new(tx)),
         })
+    }
+
+    fn configs(&self) -> TitoConfigs {
+        self.configs.clone()
     }
 }
 
