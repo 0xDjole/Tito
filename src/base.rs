@@ -10,7 +10,7 @@ use crate::{
     query::IndexQueryBuilder,
     transaction::{TitoTransaction, TransactionManager},
     types::{
-        DBUuid, ReverseIndex, TitoConfigs, TitoCursor, TitoDatabase,
+        DBUuid, ReverseIndex, StorageEngine, TitoConfigs, TitoCursor, TitoDatabase,
         TitoEmbeddedRelationshipConfig, TitoEvent, TitoEventType, TitoFindByIndexPayload,
         TitoFindOneByIndexPayload, TitoFindPayload, TitoGenerateEventPayload, TitoIndexBlockType,
         TitoIndexConfig, TitoModelTrait, TitoPaginated, TitoScanPayload,
@@ -25,13 +25,13 @@ use tikv_client::{Key, KvPair};
 use tokio::time::{sleep, Duration};
 
 #[derive(Clone)]
-pub struct TitoModel<T> {
+pub struct TitoModel<E: StorageEngine, T> {
     pub model: T,
-    pub configs: TitoConfigs,
-    pub transaction_manager: TransactionManager,
+    pub engine: E,
 }
 
 impl<
+        E: StorageEngine,
         T: Default
             + Clone
             + Serialize
@@ -40,13 +40,12 @@ impl<
             + std::marker::Send
             + Sync
             + TitoModelTrait,
-    > TitoModel<T>
+    > TitoModel<E, T>
 {
-    pub fn new(configs: TitoConfigs, transaction_manager: TransactionManager) -> Self {
+    pub fn new(engine: E) -> Self {
         Self {
             model: T::default(),
-            configs,
-            transaction_manager,
+            engine,
         }
     }
 

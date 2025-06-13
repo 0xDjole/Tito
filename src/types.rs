@@ -1,8 +1,10 @@
 use crate::TitoError;
 use async_trait::async_trait;
+use futures::lock::Mutex;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tikv_client::Key;
@@ -24,7 +26,7 @@ pub type TiKvTransaction = Transaction;
 pub type TitoValue = Vec<u8>;
 
 #[async_trait]
-pub trait StorageBackend: Send + Sync + Clone {
+pub trait StorageEngine: Send + Sync + Clone {
     type Transaction: StorageTransaction;
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -65,10 +67,12 @@ pub trait StorageTransaction: Send + Sync {
 #[derive(Clone)]
 pub struct TiKvStorageBackend {
     pub client: Arc<TransactionClient>,
+    pub configs: TitoConfigs,
+    pub active_transactions: Arc<Mutex<HashMap<String, TiKvTransaction>>>,
 }
 
 #[async_trait]
-impl StorageBackend for TiKvStorageBackend {
+impl StorageEngine for TiKvStorageBackend {
     type Transaction = TiKvStorageTransaction;
     type Error = TitoError;
 
