@@ -65,7 +65,7 @@ impl<
             .unwrap_or_else(|| key)
     }
 
-    pub fn query_by_index(&self, index: impl Into<String>) -> IndexQueryBuilder<T> {
+    pub fn query_by_index(&self, index: impl Into<String>) -> IndexQueryBuilder<E, T> {
         IndexQueryBuilder::new(self.clone(), index.into())
     }
 
@@ -96,7 +96,7 @@ impl<
         E: From<TitoError> + Send + Sync + std::fmt::Debug, // Added Sync trait bound
         R: Send,
     {
-        self.transaction_manager.transaction(f).await
+        self.engine.transaction(f).await
     }
 
     fn to_results(

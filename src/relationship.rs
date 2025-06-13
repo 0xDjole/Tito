@@ -1,7 +1,7 @@
 use crate::{
     error::TitoError,
     transaction::TitoTransaction,
-    types::{TitoEmbeddedRelationshipConfig, TitoModelTrait},
+    types::{StorageEngine, TitoEmbeddedRelationshipConfig, TitoModelTrait},
     TitoModel,
 };
 use serde::{de::DeserializeOwned, Serialize};
@@ -9,6 +9,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 impl<
+        E: StorageEngine,
         T: Default
             + Clone
             + Serialize
@@ -17,7 +18,7 @@ impl<
             + std::marker::Send
             + Sync
             + TitoModelTrait,
-    > TitoModel<T>
+    > TitoModel<E, T>
 {
     pub fn stitch_relationship(
         &self,

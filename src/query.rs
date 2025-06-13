@@ -1,13 +1,14 @@
 use crate::{
     error::TitoError,
     transaction::TitoTransaction,
-    types::{TitoFindByIndexPayload, TitoModelTrait, TitoPaginated},
+    types::{StorageEngine, TitoFindByIndexPayload, TitoModelTrait, TitoPaginated},
     TitoModel,
 };
 use serde::{de::DeserializeOwned, Serialize};
 
-pub struct IndexQueryBuilder<T>
+pub struct IndexQueryBuilder<E, T>
 where
+    E: StorageEngine,
     T: Default
         + Clone
         + Serialize
@@ -17,7 +18,7 @@ where
         + Sync
         + TitoModelTrait,
 {
-    model: TitoModel<T>,
+    model: TitoModel<E, T>,
     index: String,
     values: Vec<String>,
     rels: Vec<String>,
@@ -27,8 +28,9 @@ where
     cursor: Option<String>,
 }
 
-impl<T> IndexQueryBuilder<T>
+impl<E, T> IndexQueryBuilder<E, T>
 where
+    E: StorageEngine,
     T: Clone
         + Serialize
         + DeserializeOwned
@@ -38,7 +40,7 @@ where
         + Default
         + TitoModelTrait,
 {
-    pub fn new(model: TitoModel<T>, index: String) -> Self {
+    pub fn new(model: TitoModel<E, T>, index: String) -> Self {
         Self {
             model: model.clone(),
             index,

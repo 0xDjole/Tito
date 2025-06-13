@@ -3,8 +3,8 @@ use crate::{
     key_encoder::safe_encode,
     transaction::TitoTransaction,
     types::{
-        TitoFindByIndexPayload, TitoFindOneByIndexPayload, TitoIndexBlockType, TitoModelTrait,
-        TitoPaginated, TitoScanPayload,
+        StorageEngine, TitoFindByIndexPayload, TitoFindOneByIndexPayload, TitoIndexBlockType,
+        TitoModelTrait, TitoPaginated, TitoScanPayload,
     },
     utils::next_string_lexicographically,
     TitoModel,
@@ -13,6 +13,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 
 impl<
+        E: StorageEngine,
         T: Default
             + Clone
             + Serialize
@@ -21,7 +22,7 @@ impl<
             + std::marker::Send
             + Sync
             + TitoModelTrait,
-    > TitoModel<T>
+    > TitoModel<E, T>
 {
     pub fn get_index_keys(
         &self,

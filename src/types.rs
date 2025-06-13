@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tikv_client::Key;
@@ -33,6 +34,14 @@ pub trait StorageEngine: Send + Sync + Clone {
     async fn begin_transaction(&self) -> Result<Self::Transaction, Self::Error>;
 
     fn configs(&self) -> TitoConfigs;
+
+    async fn transaction<F, Fut, T, E>(&self, f: F) -> Result<T, E>
+    where
+        F: FnOnce(Self::Transaction) -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+        E: From<TitoError>;
+
+    async fn clear_active_transactions(&self) -> Result<(), TitoError>;
 }
 
 #[async_trait]
@@ -70,7 +79,7 @@ pub trait StorageTransaction: Send + Sync {
 pub struct TiKvStorageBackend {
     pub client: Arc<TransactionClient>,
     pub configs: TitoConfigs,
-    pub active_transactions: Arc<Mutex<HashMap<String, TiKvTransaction>>>,
+    pub active_transactions: Arc<Mutex<HashMap<String, TiKvStorageTransaction>>>,
 }
 
 #[async_trait]
@@ -83,6 +92,7 @@ impl StorageEngine for TiKvStorageBackend {
             TitoError::TransactionFailed(format!("Failed to begin transaction: {}", e))
         })?;
         Ok(TiKvStorageTransaction {
+            id: DBUuid::new_v4().to_string(),
             inner: Arc::new(tokio::sync::Mutex::new(tx)),
         })
     }
@@ -90,10 +100,64 @@ impl StorageEngine for TiKvStorageBackend {
     fn configs(&self) -> TitoConfigs {
         self.configs.clone()
     }
+
+    async fn transaction<F, Fut, T, E>(&self, f: F) -> Result<T, E>
+    where
+        F: FnOnce(Self::Transaction) -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+        E: From<TitoError>,
+    {
+        let tx = self
+            .begin_transaction()
+            .await
+            .map_err(|e| {
+                TitoError::TransactionFailed(format!("Failed to begin transaction: {}", e))
+            })
+            .map_err(E::from)?;
+
+        let mut active_transactions = self.active_transactions.lock().await;
+        active_transactions.insert(tx.id.clone(), tx.clone());
+        drop(active_transactions); // Release the lock early
+
+        let result = f(tx.clone()).await;
+
+        match &result {
+            Ok(_) => {
+                if let Err(e) = tx.commit().await {
+                    eprintln!("Warning: Transaction commit failed: {:?}", e);
+                }
+            }
+            Err(_) => {
+                if let Err(e) = tx.rollback().await {
+                    eprintln!("Warning: Transaction rollback failed: {:?}", e);
+                }
+            }
+        };
+
+        let mut active_transactions = self.active_transactions.lock().await;
+        active_transactions.remove(&tx.id);
+
+        result
+    }
+
+    async fn clear_active_transactions(&self) -> Result<(), TitoError> {
+        let mut active_transactions = self.active_transactions.lock().await;
+        for (_, mut tx) in active_transactions.drain() {
+            if let Err(e) = tx.rollback().await {
+                eprintln!(
+                    "Warning: Failed to rollback transaction during cleanup: {:?}",
+                    e
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
+#[derive(Clone)]
 pub struct TiKvStorageTransaction {
-    inner: Arc<tokio::sync::Mutex<Transaction>>,
+    pub id: String,
+    pub inner: Arc<tokio::sync::Mutex<Transaction>>,
 }
 
 #[async_trait]
