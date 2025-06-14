@@ -158,7 +158,7 @@ impl<
         &self,
         items: Vec<(String, Value)>,
         rels: Vec<String>,
-        tx: &TitoTransaction,
+        tx: &E::Transaction,
     ) -> Result<Vec<(String, Value)>, TitoError> {
         if rels.is_empty() {
             return Ok(items);

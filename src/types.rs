@@ -37,9 +37,10 @@ pub trait StorageEngine: Send + Sync + Clone {
 
     async fn transaction<F, Fut, T, E>(&self, f: F) -> Result<T, E>
     where
-        F: FnOnce(Self::Transaction) -> Fut,
-        Fut: Future<Output = Result<T, E>>,
-        E: From<TitoError>;
+        F: FnOnce(Self::Transaction) -> Fut + Send,
+        Fut: Future<Output = Result<T, E>> + Send,
+        T: Send,
+        E: From<TitoError> + Send;
 
     async fn clear_active_transactions(&self) -> Result<(), TitoError>;
 }
@@ -103,9 +104,10 @@ impl StorageEngine for TiKvStorageBackend {
 
     async fn transaction<F, Fut, T, E>(&self, f: F) -> Result<T, E>
     where
-        F: FnOnce(Self::Transaction) -> Fut,
-        Fut: Future<Output = Result<T, E>>,
-        E: From<TitoError>,
+        F: FnOnce(Self::Transaction) -> Fut + Send,
+        Fut: Future<Output = Result<T, E>> + Send,
+        T: Send,
+        E: From<TitoError> + Send,
     {
         let tx = self
             .begin_transaction()
@@ -123,12 +125,12 @@ impl StorageEngine for TiKvStorageBackend {
 
         match &result {
             Ok(_) => {
-                if let Err(e) = tx.commit().await {
+                if let Err(e) = tx.clone().commit().await {
                     eprintln!("Warning: Transaction commit failed: {:?}", e);
                 }
             }
             Err(_) => {
-                if let Err(e) = tx.rollback().await {
+                if let Err(e) = tx.clone().rollback().await {
                     eprintln!("Warning: Transaction rollback failed: {:?}", e);
                 }
             }
