@@ -1,6 +1,5 @@
 use crate::{
     error::TitoError,
-    transaction::TitoTransaction,
     types::{StorageEngine, TitoFindByIndexPayload, TitoModelTrait, TitoPaginated},
     TitoModel,
 };
@@ -105,10 +104,7 @@ where
     }
 
     // Terminal method - still consumes self
-    pub async fn execute_tx(
-        &mut self,
-        tx: &TitoTransaction,
-    ) -> Result<TitoPaginated<T>, TitoError> {
+    pub async fn execute_tx(&mut self, tx: &E::Transaction) -> Result<TitoPaginated<T>, TitoError> {
         let payload = TitoFindByIndexPayload {
             index: self.index.clone(),
             values: self.values.clone(),
@@ -140,7 +136,7 @@ where
     // Terminal method - still consumes self
     pub async fn execute_reverse_tx(
         self,
-        tx: &TitoTransaction,
+        tx: &E::Transaction,
     ) -> Result<TitoPaginated<T>, TitoError> {
         let payload = TitoFindByIndexPayload {
             index: self.index,

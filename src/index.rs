@@ -3,8 +3,8 @@ use crate::{
     key_encoder::safe_encode,
     transaction::TitoTransaction,
     types::{
-        StorageEngine, TitoFindByIndexPayload, TitoFindOneByIndexPayload, TitoIndexBlockType,
-        TitoModelTrait, TitoPaginated, TitoScanPayload,
+        StorageEngine, StorageTransaction, TitoFindByIndexPayload, TitoFindOneByIndexPayload,
+        TitoIndexBlockType, TitoModelTrait, TitoPaginated, TitoScanPayload,
     },
     utils::next_string_lexicographically,
     TitoModel,
@@ -104,7 +104,7 @@ impl<
     pub async fn find_by_index_raw(
         &self,
         payload: TitoFindByIndexPayload,
-        tx: &TitoTransaction,
+        tx: &E::Transaction,
     ) -> Result<(Vec<(String, Value)>, bool), TitoError>
     where
         T: serde::de::DeserializeOwned,
@@ -173,7 +173,7 @@ impl<
     pub async fn find_by_index_reverse_raw(
         &self,
         payload: TitoFindByIndexPayload,
-        tx: &TitoTransaction,
+        tx: &E::Transaction,
     ) -> Result<(Vec<(String, Value)>, bool), TitoError>
     where
         T: serde::de::DeserializeOwned,
@@ -227,7 +227,7 @@ impl<
     pub async fn find_by_index_tx(
         &self,
         payload: TitoFindByIndexPayload,
-        tx: &TitoTransaction,
+        tx: &E::Transaction,
     ) -> Result<TitoPaginated<T>, TitoError>
     where
         T: serde::de::DeserializeOwned,
@@ -266,7 +266,7 @@ impl<
     pub async fn find_by_index_reverse_tx(
         &self,
         payload: TitoFindByIndexPayload,
-        tx: &TitoTransaction,
+        tx: &E::Transaction,
     ) -> Result<TitoPaginated<T>, TitoError>
     where
         T: serde::de::DeserializeOwned,
@@ -293,7 +293,7 @@ impl<
     pub async fn find_one_by_index_tx(
         &self,
         payload: TitoFindOneByIndexPayload,
-        tx: &TitoTransaction,
+        tx: &E::Transaction,
     ) -> Result<T, TitoError>
     where
         T: serde::de::DeserializeOwned,
