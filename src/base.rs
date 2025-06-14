@@ -1,17 +1,12 @@
-use std::{
-    collections::{HashMap, HashSet},
-    future::Future,
-    sync::atomic::Ordering,
-};
+use std::{future::Future, sync::atomic::Ordering};
 
 use crate::{
     error::TitoError,
     query::IndexQueryBuilder,
     types::{
-        DBUuid, ReverseIndex, StorageEngine, StorageKvPair, StorageTransaction, TitoConfigs,
-        TitoCursor, TitoDatabase, TitoEmbeddedRelationshipConfig, TitoEvent, TitoEventType,
-        TitoFindPayload, TitoGenerateEventPayload, TitoIndexBlockType, TitoIndexConfig,
-        TitoModelTrait, TitoPaginated, TitoScanPayload,
+        DBUuid, ReverseIndex, StorageEngine, StorageKvPair, StorageTransaction, TitoCursor,
+        TitoEmbeddedRelationshipConfig, TitoEvent, TitoEventType, TitoFindPayload,
+        TitoGenerateEventPayload, TitoModelTrait, TitoPaginated, TitoScanPayload,
     },
     utils::{next_string_lexicographically, previous_string_lexicographically},
 };
