@@ -6,6 +6,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::future::Future;
+use std::ops::Range;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tikv_client::Key;
@@ -25,6 +26,11 @@ pub type TitoKey = Key;
 pub type TiKvTransaction = Transaction;
 
 pub type TitoValue = Vec<u8>;
+
+pub type StorageKey = Vec<u8>;
+pub type StorageValue = Vec<u8>;
+pub type StorageKvPair = (StorageKey, StorageValue);
+pub type StorageRange = Range<StorageKey>;
 
 #[async_trait]
 pub trait StorageEngine: Send + Sync + Clone {
@@ -47,31 +53,30 @@ pub trait StorageEngine: Send + Sync + Clone {
 
 #[async_trait]
 pub trait StorageTransaction: Send + Sync {
-    type Key: Clone + Send + Sync;
-    type Value: Clone + Send + Sync;
-    type KvPair: Clone + Send + Sync;
-    type Range: Send + Sync;
     type Error: std::error::Error + Send + Sync + 'static;
 
-    async fn get(&mut self, key: Self::Key) -> Result<Option<Self::Value>, Self::Error>;
-    async fn get_for_update(&mut self, key: Self::Key) -> Result<Option<Self::Value>, Self::Error>;
-    async fn put(&mut self, key: Self::Key, value: Self::Value) -> Result<(), Self::Error>;
-    async fn delete(&mut self, key: Self::Key) -> Result<(), Self::Error>;
+    async fn get(&self, key: StorageKey) -> Result<Option<StorageValue>, Self::Error>;
+    async fn get_for_update(
+        &mut self,
+        key: StorageKey,
+    ) -> Result<Option<StorageValue>, Self::Error>;
+    async fn put(&self, key: StorageKey, value: StorageValue) -> Result<(), Self::Error>;
+    async fn delete(&self, key: StorageKey) -> Result<(), Self::Error>;
     async fn scan(
-        &mut self,
-        range: Self::Range,
+        &self,
+        range: StorageRange,
         limit: u32,
-    ) -> Result<Vec<Self::KvPair>, Self::Error>;
+    ) -> Result<Vec<StorageKvPair>, Self::Error>;
     async fn scan_reverse(
-        &mut self,
-        range: Self::Range,
+        &self,
+        range: StorageRange,
         limit: u32,
-    ) -> Result<Vec<Self::KvPair>, Self::Error>;
-    async fn batch_get(&mut self, keys: Vec<Self::Key>) -> Result<Vec<Self::KvPair>, Self::Error>;
+    ) -> Result<Vec<StorageKvPair>, Self::Error>;
+    async fn batch_get(&self, keys: Vec<StorageKey>) -> Result<Vec<StorageKvPair>, Self::Error>;
     async fn batch_get_for_update(
-        &mut self,
-        keys: Vec<Self::Key>,
-    ) -> Result<Vec<Self::KvPair>, Self::Error>;
+        &self,
+        keys: Vec<StorageKey>,
+    ) -> Result<Vec<StorageKvPair>, Self::Error>;
     async fn commit(self) -> Result<(), Self::Error>;
     async fn rollback(self) -> Result<(), Self::Error>;
 }
@@ -164,100 +169,122 @@ pub struct TiKvStorageTransaction {
 
 #[async_trait]
 impl StorageTransaction for TiKvStorageTransaction {
-    type Key = tikv_client::Key;
-    type Value = tikv_client::Value;
-    type KvPair = tikv_client::KvPair;
-    type Range = tikv_client::BoundRange;
     type Error = TitoError;
 
-    async fn get(&mut self, key: Self::Key) -> Result<Option<Self::Value>, Self::Error> {
-        self.inner.lock().await.get(key.clone()).await.map_err(|e| {
-            TitoError::QueryFailed(format!("Get operation failed for key {:?}: {}", key, e))
-        })
-    }
+    async fn get(&self, key: StorageKey) -> Result<Option<StorageValue>, Self::Error> {
+        let tikv_key: tikv_client::Key = key.into();
 
-    async fn get_for_update(&mut self, key: Self::Key) -> Result<Option<Self::Value>, Self::Error> {
         self.inner
             .lock()
             .await
-            .get_for_update(key.clone())
+            .get(tikv_key)
             .await
-            .map_err(|e| {
-                TitoError::QueryFailed(format!("Get for update failed for key {:?}: {}", key, e))
-            })
+            .map_err(|e| TitoError::QueryFailed(format!("Get operation failed: {}", e)))
     }
 
-    async fn put(&mut self, key: Self::Key, value: Self::Value) -> Result<(), Self::Error> {
+    async fn get_for_update(
+        &mut self,
+        key: StorageKey,
+    ) -> Result<Option<StorageValue>, Self::Error> {
+        let tikv_key: tikv_client::Key = key.into();
+
         self.inner
             .lock()
             .await
-            .put(key.clone(), value)
+            .get_for_update(tikv_key)
             .await
-            .map_err(|e| {
-                TitoError::UpdateFailed(format!("Put operation failed for key {:?}: {}", key, e))
-            })
+            .map_err(|e| TitoError::QueryFailed(format!("Get for update failed: {}", e)))
     }
 
-    async fn delete(&mut self, key: Self::Key) -> Result<(), Self::Error> {
+    async fn put(&self, key: StorageKey, value: StorageValue) -> Result<(), Self::Error> {
+        let tikv_key: tikv_client::Key = key.into();
+
         self.inner
             .lock()
             .await
-            .delete(key.clone())
+            .put(tikv_key, value)
             .await
-            .map_err(|e| {
-                TitoError::DeleteFailed(format!("Delete operation failed for key {:?}: {}", key, e))
-            })
+            .map_err(|e| TitoError::UpdateFailed(format!("Put operation failed: {}", e)))
+    }
+
+    async fn delete(&self, key: StorageKey) -> Result<(), Self::Error> {
+        let tikv_key: tikv_client::Key = key.into();
+
+        self.inner
+            .lock()
+            .await
+            .delete(tikv_key)
+            .await
+            .map_err(|e| TitoError::DeleteFailed(format!("Delete operation failed: {}", e)))
     }
 
     async fn scan(
-        &mut self,
-        range: Self::Range,
+        &self,
+        range: StorageRange,
         limit: u32,
-    ) -> Result<Vec<Self::KvPair>, Self::Error> {
-        self.inner
+    ) -> Result<Vec<StorageKvPair>, Self::Error> {
+        // Convert Range<Vec<u8>> to tikv_client::BoundRange
+        let bound_range: tikv_client::BoundRange = range.into();
+
+        let result = self
+            .inner
             .lock()
             .await
-            .scan(range, limit)
+            .scan(bound_range, limit)
             .await
-            .map(|iter| iter.collect())
-            .map_err(|e| TitoError::QueryFailed(format!("Scan operation failed: {}", e)))
+            .map_err(|e| TitoError::QueryFailed(format!("Scan operation failed: {}", e)))?;
+
+        Ok(result.map(|kv| (kv.0.into(), kv.1)).collect())
     }
 
     async fn scan_reverse(
-        &mut self,
-        range: Self::Range,
+        &self,
+        range: StorageRange,
         limit: u32,
-    ) -> Result<Vec<Self::KvPair>, Self::Error> {
-        self.inner
+    ) -> Result<Vec<StorageKvPair>, Self::Error> {
+        let bound_range: tikv_client::BoundRange = range.into();
+
+        let result = self
+            .inner
             .lock()
             .await
-            .scan_reverse(range, limit)
+            .scan_reverse(bound_range, limit)
             .await
-            .map(|iter| iter.collect())
-            .map_err(|e| TitoError::QueryFailed(format!("Reverse scan operation failed: {}", e)))
+            .map_err(|e| TitoError::QueryFailed(format!("Reverse scan operation failed: {}", e)))?;
+
+        Ok(result.map(|kv| (kv.0.into(), kv.1)).collect())
     }
 
-    async fn batch_get(&mut self, keys: Vec<Self::Key>) -> Result<Vec<Self::KvPair>, Self::Error> {
-        self.inner
+    async fn batch_get(&self, keys: Vec<StorageKey>) -> Result<Vec<StorageKvPair>, Self::Error> {
+        // Convert Vec<Vec<u8>> to Vec<tikv_client::Key>
+        let tikv_keys: Vec<tikv_client::Key> = keys.into_iter().map(|k| k.into()).collect();
+
+        let result = self
+            .inner
             .lock()
             .await
-            .batch_get(keys)
+            .batch_get(tikv_keys)
             .await
-            .map(|iter| iter.collect())
-            .map_err(|e| TitoError::QueryFailed(format!("Batch get operation failed: {}", e)))
+            .map_err(|e| TitoError::QueryFailed(format!("Batch get operation failed: {}", e)))?;
+
+        Ok(result.map(|kv| (kv.0.into(), kv.1)).collect())
     }
 
     async fn batch_get_for_update(
-        &mut self,
-        keys: Vec<Self::Key>,
-    ) -> Result<Vec<Self::KvPair>, Self::Error> {
-        self.inner
+        &self,
+        keys: Vec<StorageKey>,
+    ) -> Result<Vec<StorageKvPair>, Self::Error> {
+        let tikv_keys: Vec<tikv_client::Key> = keys.into_iter().map(|k| k.into()).collect();
+
+        let result = self
+            .inner
             .lock()
             .await
-            .batch_get_for_update(keys)
+            .batch_get_for_update(tikv_keys)
             .await
-            .map(|iter| iter.into_iter().collect())
-            .map_err(|e| TitoError::QueryFailed(format!("Batch get for update failed: {}", e)))
+            .map_err(|e| TitoError::QueryFailed(format!("Batch get for update failed: {}", e)))?;
+
+        Ok(result.into_iter().map(|kv| (kv.0.into(), kv.1)).collect())
     }
 
     async fn commit(self) -> Result<(), Self::Error> {
