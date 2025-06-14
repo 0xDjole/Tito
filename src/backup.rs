@@ -1,4 +1,4 @@
-use crate::{error::TitoError, transaction::TitoTransaction, utils::next_string_lexicographically};
+use crate::{error::TitoError, types::StorageTransaction, utils::next_string_lexicographically};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
@@ -18,11 +18,11 @@ impl TitoBackupService {
         Self
     }
 
-    pub async fn backup(
+    pub async fn backup<T: StorageTransaction>(
         &self,
         file_path: &str,
         prefixes: Vec<&str>,
-        tx: &TitoTransaction,
+        tx: &T,
     ) -> Result<usize, TitoError> {
         if let Some(parent) = Path::new(file_path).parent() {
             fs::create_dir_all(parent)
@@ -64,12 +64,12 @@ impl TitoBackupService {
         Ok(record_count)
     }
 
-    async fn write_prefix_to_file(
+    async fn write_prefix_to_file<T: StorageTransaction>(
         &self,
         prefix: &str,
         file: &mut fs::File,
         first_record: &mut bool,
-        tx: &TitoTransaction,
+        tx: &T,
     ) -> Result<usize, TitoError> {
         let start_key = prefix.to_string();
         let end_key = next_string_lexicographically(start_key.clone());
@@ -78,12 +78,15 @@ impl TitoBackupService {
         let mut count = 0;
 
         loop {
-            let scan_result = tx.scan(cursor.clone()..end_key.clone(), 1000).await?;
+            let scan_result = tx
+                .scan(cursor.as_bytes()..end_key.as_bytes(), 1000)
+                .await
+                .map_err(|e| TitoError::QueryFailed(format!("Scan failed: {}", e)))?;
             let mut has_records = false;
 
             for kv in scan_result {
                 has_records = true;
-                let key = String::from_utf8(kv.0.into())
+                let key = String::from_utf8(kv.0)
                     .map_err(|_| TitoError::DeserializationFailed("Invalid key".to_string()))?;
 
                 let value: Value = serde_json::from_slice(&kv.1)
@@ -122,18 +125,21 @@ impl TitoBackupService {
         Ok(count)
     }
 
-    pub async fn delete_all_data(&self, tx: &TitoTransaction) -> Result<usize, TitoError> {
+    pub async fn delete_all_data<T: StorageTransaction>(&self, tx: &T) -> Result<usize, TitoError> {
         let start_key = String::new();
         let end_key = String::from_utf8(vec![255; 10]).unwrap(); // Max key
 
         let mut deleted_count = 0;
 
         loop {
-            let scan_result = tx.scan(start_key.clone()..end_key.clone(), 1000).await?;
+            let scan_result = tx
+                .scan(start_key.as_bytes()..end_key.as_bytes(), 1000)
+                .await
+                .map_err(|e| TitoError::QueryFailed(format!("Scan failed: {}", e)))?;
             let mut keys_to_delete = Vec::new();
 
             for kv in scan_result {
-                let key = String::from_utf8(kv.0.into())
+                let key = String::from_utf8(kv.0)
                     .map_err(|_| TitoError::DeserializationFailed("Invalid key".to_string()))?;
                 keys_to_delete.push(key);
             }
@@ -144,7 +150,9 @@ impl TitoBackupService {
 
             // Delete in batches
             for key in &keys_to_delete {
-                tx.delete(key.clone()).await?;
+                tx.delete(key.as_bytes())
+                    .await
+                    .map_err(|e| TitoError::DeleteFailed(format!("Delete failed: {}", e)))?;
                 deleted_count += 1;
             }
         }
@@ -152,10 +160,10 @@ impl TitoBackupService {
         Ok(deleted_count)
     }
 
-    async fn backup_prefix(
+    async fn backup_prefix<T: StorageTransaction>(
         &self,
         prefix: &str,
-        tx: &TitoTransaction,
+        tx: &T,
     ) -> Result<Vec<BackupRecord>, TitoError> {
         let start_key = prefix.to_string();
         let end_key = next_string_lexicographically(start_key.clone());
@@ -164,12 +172,15 @@ impl TitoBackupService {
         let mut cursor = start_key;
 
         loop {
-            let scan_result = tx.scan(cursor.clone()..end_key.clone(), 1000).await?;
+            let scan_result = tx
+                .scan(cursor.as_bytes()..end_key.as_bytes(), 1000)
+                .await
+                .map_err(|e| TitoError::QueryFailed(format!("Scan failed: {}", e)))?;
             let mut has_records = false;
 
             for kv in scan_result {
                 has_records = true;
-                let key = String::from_utf8(kv.0.into())
+                let key = String::from_utf8(kv.0)
                     .map_err(|_| TitoError::DeserializationFailed("Invalid key".to_string()))?;
 
                 let value: Value = serde_json::from_slice(&kv.1)
@@ -191,10 +202,10 @@ impl TitoBackupService {
     }
 
     // Delete specific prefix
-    pub async fn delete_prefix(
+    pub async fn delete_prefix<T: StorageTransaction>(
         &self,
         prefix: &str,
-        tx: &TitoTransaction,
+        tx: &T,
     ) -> Result<usize, TitoError> {
         let start_key = prefix.to_string();
         let end_key = next_string_lexicographically(start_key.clone());
@@ -203,11 +214,14 @@ impl TitoBackupService {
         let mut deleted_count = 0;
 
         loop {
-            let scan_result = tx.scan(cursor.clone()..end_key.clone(), 1000).await?;
+            let scan_result = tx
+                .scan(cursor.as_bytes()..end_key.as_bytes(), 1000)
+                .await
+                .map_err(|e| TitoError::QueryFailed(format!("Scan failed: {}", e)))?;
             let mut keys_to_delete = Vec::new();
 
             for kv in scan_result {
-                let key = String::from_utf8(kv.0.into())
+                let key = String::from_utf8(kv.0)
                     .map_err(|_| TitoError::DeserializationFailed("Invalid key".to_string()))?;
                 keys_to_delete.push(key.clone());
                 cursor = next_string_lexicographically(key);
@@ -219,7 +233,9 @@ impl TitoBackupService {
 
             // Delete batch
             for key in &keys_to_delete {
-                tx.delete(key.clone()).await?;
+                tx.delete(key.as_bytes())
+                    .await
+                    .map_err(|e| TitoError::DeleteFailed(format!("Delete failed: {}", e)))?;
                 deleted_count += 1;
             }
         }
@@ -227,9 +243,9 @@ impl TitoBackupService {
         Ok(deleted_count)
     }
 
-    pub async fn restore_events_and_rebuild(
+    pub async fn restore_events_and_rebuild<T: StorageTransaction>(
         &self,
-        tx: &TitoTransaction,
+        tx: &T,
     ) -> Result<usize, TitoError> {
         let events = self.backup_prefix("event:", tx).await?;
         Ok(events.len())
