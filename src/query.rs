@@ -1,13 +1,13 @@
 use crate::{
     error::TitoError,
-    types::{StorageEngine, TitoFindByIndexPayload, TitoModelTrait, TitoPaginated},
+    types::{TitoEngine, TitoFindByIndexPayload, TitoModelTrait, TitoPaginated},
     TitoModel,
 };
 use serde::{de::DeserializeOwned, Serialize};
 
 pub struct IndexQueryBuilder<E, T>
 where
-    E: StorageEngine,
+    E: TitoEngine,
     T: Default
         + Clone
         + Serialize
@@ -29,7 +29,7 @@ where
 
 impl<E, T> IndexQueryBuilder<E, T>
 where
-    E: StorageEngine,
+    E: TitoEngine,
     T: Clone
         + Serialize
         + DeserializeOwned

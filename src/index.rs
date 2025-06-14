@@ -2,7 +2,7 @@ use crate::{
     error::TitoError,
     key_encoder::safe_encode,
     types::{
-        StorageEngine, StorageTransaction, TitoFindByIndexPayload, TitoFindOneByIndexPayload,
+        TitoEngine, TitoTransaction, TitoFindByIndexPayload, TitoFindOneByIndexPayload,
         TitoIndexBlockType, TitoModelTrait, TitoPaginated, TitoScanPayload,
     },
     utils::next_string_lexicographically,
@@ -12,7 +12,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 
 impl<
-        E: StorageEngine,
+        E: TitoEngine,
         T: Default
             + Clone
             + Serialize

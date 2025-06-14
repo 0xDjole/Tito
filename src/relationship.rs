@@ -1,6 +1,6 @@
 use crate::{
     error::TitoError,
-    types::{StorageEngine, TitoEmbeddedRelationshipConfig, TitoModelTrait},
+    types::{TitoEngine, TitoEmbeddedRelationshipConfig, TitoModelTrait},
     TitoModel,
 };
 use serde::{de::DeserializeOwned, Serialize};
@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 impl<
-        E: StorageEngine,
+        E: TitoEngine,
         T: Default
             + Clone
             + Serialize

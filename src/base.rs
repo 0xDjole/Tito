@@ -4,27 +4,26 @@ use crate::{
     error::TitoError,
     query::IndexQueryBuilder,
     types::{
-        DBUuid, ReverseIndex, StorageEngine, StorageKvPair, StorageTransaction, TitoCursor,
-        TitoEmbeddedRelationshipConfig, TitoEvent, TitoEventType, TitoFindPayload,
-        TitoGenerateEventPayload, TitoModelTrait, TitoPaginated, TitoScanPayload,
+        DBUuid, ReverseIndex, StorageKvPair, TitoCursor, TitoEmbeddedRelationshipConfig,
+        TitoEngine, TitoEvent, TitoEventType, TitoFindPayload, TitoGenerateEventPayload,
+        TitoModelTrait, TitoPaginated, TitoScanPayload, TitoTransaction,
     },
     utils::{next_string_lexicographically, previous_string_lexicographically},
 };
 use base64::{decode, encode};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
-use tikv_client::{Key, KvPair};
 use tokio::time::{sleep, Duration};
 
 #[derive(Clone)]
-pub struct TitoModel<E: StorageEngine, T> {
+pub struct TitoModel<E: TitoEngine, T> {
     pub model: T,
     pub engine: E,
 }
 
 impl<
-        E: StorageEngine,
+        E: TitoEngine,
         T: Default
             + Clone
             + Serialize

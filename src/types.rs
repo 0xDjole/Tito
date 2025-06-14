@@ -33,8 +33,8 @@ pub type StorageKvPair = (StorageKey, StorageValue);
 pub type StorageRange = Range<StorageKey>;
 
 #[async_trait]
-pub trait StorageEngine: Send + Sync + Clone {
-    type Transaction: StorageTransaction;
+pub trait TitoEngine: Send + Sync + Clone {
+    type Transaction: TitoTransaction;
     type Error: std::error::Error + Send + Sync + 'static;
 
     async fn begin_transaction(&self) -> Result<Self::Transaction, Self::Error>;
@@ -52,7 +52,7 @@ pub trait StorageEngine: Send + Sync + Clone {
 }
 
 #[async_trait]
-pub trait StorageTransaction: Send + Sync {
+pub trait TitoTransaction: Send + Sync {
     type Error: std::error::Error + Send + Sync + 'static;
 
     async fn get<K: AsRef<[u8]> + Send>(&self, key: K)
@@ -101,7 +101,7 @@ pub struct TiKvStorageBackend {
 }
 
 #[async_trait]
-impl StorageEngine for TiKvStorageBackend {
+impl TitoEngine for TiKvStorageBackend {
     type Transaction = TiKvStorageTransaction;
     type Error = TitoError;
 
@@ -182,7 +182,7 @@ pub struct TiKvStorageTransaction {
 }
 
 #[async_trait]
-impl StorageTransaction for TiKvStorageTransaction {
+impl TitoTransaction for TiKvStorageTransaction {
     type Error = TitoError;
 
     async fn get<K: AsRef<[u8]> + Send>(

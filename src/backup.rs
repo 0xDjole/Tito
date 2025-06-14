@@ -1,4 +1,4 @@
-use crate::{error::TitoError, types::StorageTransaction, utils::next_string_lexicographically};
+use crate::{error::TitoError, types::TitoTransaction, utils::next_string_lexicographically};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
@@ -18,7 +18,7 @@ impl TitoBackupService {
         Self
     }
 
-    pub async fn backup<T: StorageTransaction>(
+    pub async fn backup<T: TitoTransaction>(
         &self,
         file_path: &str,
         prefixes: Vec<&str>,
@@ -64,7 +64,7 @@ impl TitoBackupService {
         Ok(record_count)
     }
 
-    async fn write_prefix_to_file<T: StorageTransaction>(
+    async fn write_prefix_to_file<T: TitoTransaction>(
         &self,
         prefix: &str,
         file: &mut fs::File,
@@ -125,7 +125,7 @@ impl TitoBackupService {
         Ok(count)
     }
 
-    pub async fn delete_all_data<T: StorageTransaction>(&self, tx: &T) -> Result<usize, TitoError> {
+    pub async fn delete_all_data<T: TitoTransaction>(&self, tx: &T) -> Result<usize, TitoError> {
         let start_key = String::new();
         let end_key = String::from_utf8(vec![255; 10]).unwrap(); // Max key
 
@@ -160,7 +160,7 @@ impl TitoBackupService {
         Ok(deleted_count)
     }
 
-    async fn backup_prefix<T: StorageTransaction>(
+    async fn backup_prefix<T: TitoTransaction>(
         &self,
         prefix: &str,
         tx: &T,
@@ -202,7 +202,7 @@ impl TitoBackupService {
     }
 
     // Delete specific prefix
-    pub async fn delete_prefix<T: StorageTransaction>(
+    pub async fn delete_prefix<T: TitoTransaction>(
         &self,
         prefix: &str,
         tx: &T,
@@ -243,7 +243,7 @@ impl TitoBackupService {
         Ok(deleted_count)
     }
 
-    pub async fn restore_events_and_rebuild<T: StorageTransaction>(
+    pub async fn restore_events_and_rebuild<T: TitoTransaction>(
         &self,
         tx: &T,
     ) -> Result<usize, TitoError> {

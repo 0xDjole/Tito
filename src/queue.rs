@@ -6,16 +6,16 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::time::sleep;
 
-use crate::types::{StorageEngine, StorageTransaction, TitoEvent};
+use crate::types::{TitoEngine, TitoEvent, TitoTransaction};
 use crate::TitoError;
 
 #[derive(Clone)]
-pub struct TitoQueue<E: StorageEngine> {
+pub struct TitoQueue<E: TitoEngine> {
     pub engine: E,
     pub table: String,
 }
 
-impl<E: StorageEngine> TitoQueue<E> {
+impl<E: TitoEngine> TitoQueue<E> {
     pub async fn push(
         &self,
         _message: String,
@@ -169,7 +169,7 @@ impl<E: StorageEngine> TitoQueue<E> {
     }
 }
 
-pub async fn run_worker<E: StorageEngine + 'static, H>(
+pub async fn run_worker<E: TitoEngine + 'static, H>(
     queue: Arc<TitoQueue<E>>,
     handler: H,
     is_leader: Arc<AtomicBool>,
