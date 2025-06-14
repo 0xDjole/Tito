@@ -1,6 +1,5 @@
 use crate::{
     error::TitoError,
-    transaction::TitoTransaction,
     types::{StorageEngine, TitoEmbeddedRelationshipConfig, TitoModelTrait},
     TitoModel,
 };

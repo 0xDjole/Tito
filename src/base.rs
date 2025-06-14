@@ -6,15 +6,12 @@ use std::{
 
 use crate::{
     error::TitoError,
-    key_encoder::safe_encode,
     query::IndexQueryBuilder,
-    transaction::{TitoTransaction, TransactionManager},
     types::{
         DBUuid, ReverseIndex, StorageEngine, StorageKvPair, StorageTransaction, TitoConfigs,
         TitoCursor, TitoDatabase, TitoEmbeddedRelationshipConfig, TitoEvent, TitoEventType,
-        TitoFindByIndexPayload, TitoFindOneByIndexPayload, TitoFindPayload,
-        TitoGenerateEventPayload, TitoIndexBlockType, TitoIndexConfig, TitoModelTrait,
-        TitoPaginated, TitoScanPayload,
+        TitoFindPayload, TitoGenerateEventPayload, TitoIndexBlockType, TitoIndexConfig,
+        TitoModelTrait, TitoPaginated, TitoScanPayload,
     },
     utils::{next_string_lexicographically, previous_string_lexicographically},
 };

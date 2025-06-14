@@ -1,7 +1,6 @@
 use crate::{
     error::TitoError,
     key_encoder::safe_encode,
-    transaction::TitoTransaction,
     types::{
         StorageEngine, StorageTransaction, TitoFindByIndexPayload, TitoFindOneByIndexPayload,
         TitoIndexBlockType, TitoModelTrait, TitoPaginated, TitoScanPayload,
