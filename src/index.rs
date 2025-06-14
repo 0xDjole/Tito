@@ -349,7 +349,7 @@ impl<
 
         self.tx(|tx| async move {
             loop {
-                let scan_range = cursor.clone().into_bytes()..end_key.clone().into_bytes();
+                let scan_range = cursor.clone()..end_key.clone();
                 let kvs = tx.scan(scan_range, 100).await.map_err(|e| {
                     TitoError::TransactionFailed(String::from("Failed migration, scan"))
                 })?;

@@ -10,8 +10,8 @@ use crate::{
     query::IndexQueryBuilder,
     transaction::{TitoTransaction, TransactionManager},
     types::{
-        DBUuid, ReverseIndex, StorageEngine, StorageTransaction, TitoConfigs, TitoCursor,
-        TitoDatabase, TitoEmbeddedRelationshipConfig, TitoEvent, TitoEventType,
+        DBUuid, ReverseIndex, StorageEngine, StorageKvPair, StorageTransaction, TitoConfigs,
+        TitoCursor, TitoDatabase, TitoEmbeddedRelationshipConfig, TitoEvent, TitoEventType,
         TitoFindByIndexPayload, TitoFindOneByIndexPayload, TitoFindPayload,
         TitoGenerateEventPayload, TitoIndexBlockType, TitoIndexConfig, TitoModelTrait,
         TitoPaginated, TitoScanPayload,
@@ -102,11 +102,10 @@ impl<
 
     fn to_results(
         &self,
-        items: impl Iterator<Item = KvPair>,
+        items: impl IntoIterator<Item = StorageKvPair>,
     ) -> Result<Vec<(String, Value)>, TitoError> {
         let mut results = vec![];
-        for kv in items {
-            let key_bytes: Vec<u8> = kv.0.into();
+        for (key_bytes, value_bytes) in items {
             let key = match String::from_utf8(key_bytes) {
                 Ok(k) => k,
                 Err(_) => {
@@ -114,7 +113,7 @@ impl<
                 }
             };
 
-            match serde_json::from_slice::<Value>(&kv.1) {
+            match serde_json::from_slice::<Value>(&value_bytes) {
                 Ok(value) => results.push((key, value)),
                 Err(_err) => continue,
             }
@@ -122,7 +121,6 @@ impl<
 
         Ok(results)
     }
-
     async fn get(
         &self,
         key: &str,
@@ -733,9 +731,9 @@ impl<
         keys: Vec<String>,
         tx: &E::Transaction,
     ) -> Result<bool, TitoError> {
-        let keys: Vec<Key> = keys
+        let keys: Vec<_> = keys
             .into_iter()
-            .map(|key| Key::from(format!("lock:{}", key).into_bytes()))
+            .map(|key| format!("lock:{}", key).into_bytes())
             .collect();
 
         let mut retries = 0;

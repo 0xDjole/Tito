@@ -55,28 +55,40 @@ pub trait StorageEngine: Send + Sync + Clone {
 pub trait StorageTransaction: Send + Sync {
     type Error: std::error::Error + Send + Sync + 'static;
 
-    async fn get(&self, key: StorageKey) -> Result<Option<StorageValue>, Self::Error>;
-    async fn get_for_update(
-        &mut self,
-        key: StorageKey,
+    async fn get<K: AsRef<[u8]> + Send>(&self, key: K)
+        -> Result<Option<StorageValue>, Self::Error>;
+    async fn get_for_update<K: AsRef<[u8]> + Send>(
+        &self,
+        key: K,
     ) -> Result<Option<StorageValue>, Self::Error>;
-    async fn put(&self, key: StorageKey, value: StorageValue) -> Result<(), Self::Error>;
-    async fn delete(&self, key: StorageKey) -> Result<(), Self::Error>;
-    async fn scan(
+    async fn put<K: AsRef<[u8]> + Send, V: AsRef<[u8]> + Send>(
         &self,
-        range: StorageRange,
+        key: K,
+        value: V,
+    ) -> Result<(), Self::Error>;
+    async fn delete<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<(), Self::Error>;
+    async fn scan<K: AsRef<[u8]> + Send>(
+        &self,
+        range: Range<K>,
         limit: u32,
     ) -> Result<Vec<StorageKvPair>, Self::Error>;
-    async fn scan_reverse(
+
+    async fn scan_reverse<K: AsRef<[u8]> + Send>(
         &self,
-        range: StorageRange,
+        range: Range<K>,
         limit: u32,
     ) -> Result<Vec<StorageKvPair>, Self::Error>;
-    async fn batch_get(&self, keys: Vec<StorageKey>) -> Result<Vec<StorageKvPair>, Self::Error>;
-    async fn batch_get_for_update(
+
+    async fn batch_get<K: AsRef<[u8]> + Send>(
         &self,
-        keys: Vec<StorageKey>,
+        keys: Vec<K>,
     ) -> Result<Vec<StorageKvPair>, Self::Error>;
+
+    async fn batch_get_for_update<K: AsRef<[u8]> + Send>(
+        &self,
+        keys: Vec<K>,
+    ) -> Result<Vec<StorageKvPair>, Self::Error>;
+
     async fn commit(self) -> Result<(), Self::Error>;
     async fn rollback(self) -> Result<(), Self::Error>;
 }
@@ -171,8 +183,11 @@ pub struct TiKvStorageTransaction {
 impl StorageTransaction for TiKvStorageTransaction {
     type Error = TitoError;
 
-    async fn get(&self, key: StorageKey) -> Result<Option<StorageValue>, Self::Error> {
-        let tikv_key: tikv_client::Key = key.into();
+    async fn get<K: AsRef<[u8]> + Send>(
+        &self,
+        key: K,
+    ) -> Result<Option<StorageValue>, Self::Error> {
+        let tikv_key: tikv_client::Key = key.as_ref().to_vec().into();
 
         self.inner
             .lock()
@@ -182,11 +197,11 @@ impl StorageTransaction for TiKvStorageTransaction {
             .map_err(|e| TitoError::QueryFailed(format!("Get operation failed: {}", e)))
     }
 
-    async fn get_for_update(
-        &mut self,
-        key: StorageKey,
+    async fn get_for_update<K: AsRef<[u8]> + Send>(
+        &self,
+        key: K,
     ) -> Result<Option<StorageValue>, Self::Error> {
-        let tikv_key: tikv_client::Key = key.into();
+        let tikv_key: tikv_client::Key = key.as_ref().to_vec().into();
 
         self.inner
             .lock()
@@ -196,19 +211,24 @@ impl StorageTransaction for TiKvStorageTransaction {
             .map_err(|e| TitoError::QueryFailed(format!("Get for update failed: {}", e)))
     }
 
-    async fn put(&self, key: StorageKey, value: StorageValue) -> Result<(), Self::Error> {
-        let tikv_key: tikv_client::Key = key.into();
+    async fn put<K: AsRef<[u8]> + Send, V: AsRef<[u8]> + Send>(
+        &self,
+        key: K,
+        value: V,
+    ) -> Result<(), Self::Error> {
+        let tikv_key: tikv_client::Key = key.as_ref().to_vec().into();
+        let value_bytes = value.as_ref().to_vec();
 
         self.inner
             .lock()
             .await
-            .put(tikv_key, value)
+            .put(tikv_key, value_bytes)
             .await
             .map_err(|e| TitoError::UpdateFailed(format!("Put operation failed: {}", e)))
     }
 
-    async fn delete(&self, key: StorageKey) -> Result<(), Self::Error> {
-        let tikv_key: tikv_client::Key = key.into();
+    async fn delete<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<(), Self::Error> {
+        let tikv_key: tikv_client::Key = key.as_ref().to_vec().into();
 
         self.inner
             .lock()
@@ -218,13 +238,15 @@ impl StorageTransaction for TiKvStorageTransaction {
             .map_err(|e| TitoError::DeleteFailed(format!("Delete operation failed: {}", e)))
     }
 
-    async fn scan(
+    async fn scan<K: AsRef<[u8]> + Send>(
         &self,
-        range: StorageRange,
+        range: Range<K>,
         limit: u32,
     ) -> Result<Vec<StorageKvPair>, Self::Error> {
-        // Convert Range<Vec<u8>> to tikv_client::BoundRange
-        let bound_range: tikv_client::BoundRange = range.into();
+        // Convert Range<K> to Range<Vec<u8>> then to tikv_client::BoundRange
+        let start = range.start.as_ref().to_vec();
+        let end = range.end.as_ref().to_vec();
+        let bound_range: tikv_client::BoundRange = (start..end).into();
 
         let result = self
             .inner
@@ -237,12 +259,14 @@ impl StorageTransaction for TiKvStorageTransaction {
         Ok(result.map(|kv| (kv.0.into(), kv.1)).collect())
     }
 
-    async fn scan_reverse(
+    async fn scan_reverse<K: AsRef<[u8]> + Send>(
         &self,
-        range: StorageRange,
+        range: Range<K>,
         limit: u32,
     ) -> Result<Vec<StorageKvPair>, Self::Error> {
-        let bound_range: tikv_client::BoundRange = range.into();
+        let start = range.start.as_ref().to_vec();
+        let end = range.end.as_ref().to_vec();
+        let bound_range: tikv_client::BoundRange = (start..end).into();
 
         let result = self
             .inner
@@ -255,9 +279,12 @@ impl StorageTransaction for TiKvStorageTransaction {
         Ok(result.map(|kv| (kv.0.into(), kv.1)).collect())
     }
 
-    async fn batch_get(&self, keys: Vec<StorageKey>) -> Result<Vec<StorageKvPair>, Self::Error> {
-        // Convert Vec<Vec<u8>> to Vec<tikv_client::Key>
-        let tikv_keys: Vec<tikv_client::Key> = keys.into_iter().map(|k| k.into()).collect();
+    async fn batch_get<K: AsRef<[u8]> + Send>(
+        &self,
+        keys: Vec<K>,
+    ) -> Result<Vec<StorageKvPair>, Self::Error> {
+        let tikv_keys: Vec<tikv_client::Key> =
+            keys.iter().map(|k| k.as_ref().to_vec().into()).collect();
 
         let result = self
             .inner
@@ -270,11 +297,12 @@ impl StorageTransaction for TiKvStorageTransaction {
         Ok(result.map(|kv| (kv.0.into(), kv.1)).collect())
     }
 
-    async fn batch_get_for_update(
+    async fn batch_get_for_update<K: AsRef<[u8]> + Send>(
         &self,
-        keys: Vec<StorageKey>,
+        keys: Vec<K>,
     ) -> Result<Vec<StorageKvPair>, Self::Error> {
-        let tikv_keys: Vec<tikv_client::Key> = keys.into_iter().map(|k| k.into()).collect();
+        let tikv_keys: Vec<tikv_client::Key> =
+            keys.iter().map(|k| k.as_ref().to_vec().into()).collect();
 
         let result = self
             .inner
