@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tito::{
     connect,
     types::{
-        DBUuid, TiKvStorageBackend, TitoConfigs, TitoEventConfig, TitoIndexBlockType, TitoIndexConfig, TitoIndexField,
+        DBUuid, TiKvStorageBackend, TitoConfigs, TitoEngine, TitoEventConfig, TitoIndexBlockType, TitoIndexConfig, TitoIndexField,
         TitoModelTrait, TitoUtilsConnectInput, TitoUtilsConnectPayload,
     },
     TitoError, TitoModel,
@@ -73,7 +73,7 @@ async fn main() -> Result<(), TitoError> {
     };
 
     // Create model
-    let user_model = TitoModel::<TiKvStorageBackend, User>::new(storage_backend);
+    let user_model = TitoModel::<TiKvStorageBackend, User>::new(storage_backend.clone());
 
     // Create a user
     let user_id = DBUuid::new_v4().to_string();
@@ -84,9 +84,11 @@ async fn main() -> Result<(), TitoError> {
     };
 
     // Create user with transaction
-    let saved_user = user_model.tx(|tx| {
-        let user_model = &user_model;
-        async move { user_model.build(user, &tx).await }
+    let saved_user = storage_backend.transaction(|tx| {
+        let user_model = user_model.clone();
+        async move {
+            user_model.build(user, &tx).await
+        }
     }).await?;
 
     println!("Created user: {:?}", saved_user);
@@ -102,17 +104,21 @@ async fn main() -> Result<(), TitoError> {
         email: "john_updated@example.com".to_string(),
     };
 
-    user_model.tx(|tx| {
-        let user_model = &user_model;
-        async move { user_model.update(updated_user, &tx).await }
+    storage_backend.transaction(|tx| {
+        let user_model = user_model.clone();
+        async move {
+            user_model.update(updated_user, &tx).await
+        }
     }).await?;
 
     println!("User updated successfully");
 
     // Delete user
-    user_model.tx(|tx| {
-        let user_model = &user_model;
-        async move { user_model.delete_by_id(&user_id, &tx).await }
+    storage_backend.transaction(|tx| {
+        let user_model = user_model.clone();
+        async move {
+            user_model.delete_by_id(&user_id, &tx).await
+        }
     }).await?;
 
     println!("User deleted successfully");

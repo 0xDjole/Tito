@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tito::{
     connect,
     types::{
-        DBUuid, TiKvStorageBackend, TitoConfigs, TitoEmbeddedRelationshipConfig, TitoEventConfig, TitoIndexBlockType,
+        DBUuid, TiKvStorageBackend, TitoConfigs, TitoEmbeddedRelationshipConfig, TitoEngine, TitoEventConfig, TitoIndexBlockType,
         TitoIndexConfig, TitoIndexField, TitoModelTrait, TitoUtilsConnectInput,
         TitoUtilsConnectPayload,
     },
@@ -151,18 +151,15 @@ impl BlogService {
     async fn create_tag(&self, name: String, description: String) -> Result<Tag, TitoError> {
         let tag_id = DBUuid::new_v4().to_string();
 
-        self.tag_model.tx(|tx| {
-            let tag_model = &self.tag_model;
-            async move {
-                let tag = Tag {
-                    id: tag_id,
-                    name,
-                    description,
-                };
+        self.storage_backend.transaction(|tx| async move {
+            let tag = Tag {
+                id: tag_id,
+                name,
+                description,
+            };
 
-                tag_model.build(tag.clone(), &tx).await?;
-                Ok::<_, TitoError>(tag)
-            }
+            self.tag_model.build(tag.clone(), &tx).await?;
+            Ok::<_, TitoError>(tag)
         }).await
     }
 
@@ -176,21 +173,18 @@ impl BlogService {
     ) -> Result<Post, TitoError> {
         let post_id = DBUuid::new_v4().to_string();
 
-        self.post_model.tx(|tx| {
-            let post_model = &self.post_model;
-            async move {
-                let post = Post {
-                    id: post_id,
-                    title,
-                    content,
-                    author,
-                    tag_ids,
-                    tags: Vec::new(),
-                };
+        self.storage_backend.transaction(|tx| async move {
+            let post = Post {
+                id: post_id,
+                title,
+                content,
+                author,
+                tag_ids,
+                tags: Vec::new(),
+            };
 
-                post_model.build(post.clone(), &tx).await?;
-                Ok::<_, TitoError>(post)
-            }
+            self.post_model.build(post.clone(), &tx).await?;
+            Ok::<_, TitoError>(post)
         }).await
     }
 
@@ -238,41 +232,35 @@ impl BlogService {
 
     // Add a tag to a post
     async fn add_tag_to_post(&self, post_id: &str, tag_id: &str) -> Result<Post, TitoError> {
-        self.post_model.tx(|tx| {
-            let post_model = &self.post_model;
-            async move {
-                // Get the current post
-                let mut post = post_model.find_by_id_tx(post_id, vec![], &tx).await?;
+        self.storage_backend.transaction(|tx| async move {
+            // Get the current post
+            let mut post = self.post_model.find_by_id_tx(post_id, vec![], &tx).await?;
 
-                // Add the tag ID if it's not already there
-                if !post.tag_ids.contains(&tag_id.to_string()) {
-                    post.tag_ids.push(tag_id.to_string());
+            // Add the tag ID if it's not already there
+            if !post.tag_ids.contains(&tag_id.to_string()) {
+                post.tag_ids.push(tag_id.to_string());
 
-                    // Update the post
-                    post_model.update(post.clone(), &tx).await?;
-                }
-
-                Ok::<_, TitoError>(post)
+                // Update the post
+                self.post_model.update(post.clone(), &tx).await?;
             }
+
+            Ok::<_, TitoError>(post)
         }).await
     }
 
     // Remove a tag from a post
     async fn remove_tag_from_post(&self, post_id: &str, tag_id: &str) -> Result<Post, TitoError> {
-        self.post_model.tx(|tx| {
-            let post_model = &self.post_model;
-            async move {
-                // Get the current post
-                let mut post = post_model.find_by_id_tx(post_id, vec![], &tx).await?;
+        self.storage_backend.transaction(|tx| async move {
+            // Get the current post
+            let mut post = self.post_model.find_by_id_tx(post_id, vec![], &tx).await?;
 
-                // Remove the tag ID if it exists
-                post.tag_ids.retain(|id| id != tag_id);
+            // Remove the tag ID if it exists
+            post.tag_ids.retain(|id| id != tag_id);
 
-                // Update the post
-                post_model.update(post.clone(), &tx).await?;
+            // Update the post
+            self.post_model.update(post.clone(), &tx).await?;
 
-                Ok::<_, TitoError>(post)
-            }
+            Ok::<_, TitoError>(post)
         }).await
     }
 

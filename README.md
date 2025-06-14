@@ -99,12 +99,9 @@ let user = User {
 };
 
 // Create user with transaction
-let saved_user = tx_manager
-    .transaction(|tx| {
-        let model = &user_model;
-        async move { model.build(user, &tx).await }
-    })
-    .await?;
+let saved_user = storage_backend.transaction(|tx| async move {
+    user_model.build(user, &tx).await
+}).await?;
 
 // Find user by ID
 let found_user = user_model.find_by_id(&user_id, vec![]).await?;
@@ -116,25 +113,19 @@ let updated_user = User {
     email: "john_updated@example.com".to_string(),
 };
 
-tx_manager
-    .transaction(|tx| {
-        let model = &user_model;
-        async move { model.update(updated_user, &tx).await }
-    })
-    .await?;
+storage_backend.transaction(|tx| async move {
+    user_model.update(updated_user, &tx).await
+}).await?;
 
 // Delete user
-tx_manager
-    .transaction(|tx| {
-        let model = &user_model;
-        async move { model.delete_by_id(&user_id, &tx).await }
-    })
-    .await?;
+storage_backend.transaction(|tx| async move {
+    user_model.delete_by_id(&user_id, &tx).await
+}).await?;
 ```
 
 ## Using the Query Builder
 
-Tito v0.1.2 introduces a powerful query builder pattern for easier and more readable querying.
+Tito provides a powerful query builder pattern for easier and more readable querying.
 
 ### Basic Query
 
@@ -209,7 +200,7 @@ let latest_posts = query
 ### Transaction-Specific Queries
 
 ```rust
-tx_manager.transaction(|tx| async move {
+storage_backend.transaction(|tx| async move {
     // Query within transaction context
     let mut query = user_model.query_by_index("by_email");
     let user = query
