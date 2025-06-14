@@ -3,14 +3,15 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tito::{
     connect,
-    transaction::TransactionManager,
     types::{
-        DBUuid, TitoConfigs, TitoEmbeddedRelationshipConfig, TitoEventConfig, TitoIndexBlockType,
+        DBUuid, TiKvStorageBackend, TitoConfigs, TitoEmbeddedRelationshipConfig, TitoEventConfig, TitoIndexBlockType,
         TitoIndexConfig, TitoIndexField, TitoModelTrait, TitoUtilsConnectInput,
         TitoUtilsConnectPayload,
     },
     TitoError, TitoModel,
 };
+use futures::lock::Mutex;
+use std::collections::HashMap;
 
 // Simple Tag model
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
@@ -128,19 +129,19 @@ impl TitoModelTrait for Post {
 
 // Blog service to handle posts and tags
 struct BlogService {
-    transaction_manager: TransactionManager,
-    post_model: TitoModel<Post>,
-    tag_model: TitoModel<Tag>,
+    storage_backend: TiKvStorageBackend,
+    post_model: TitoModel<TiKvStorageBackend, Post>,
+    tag_model: TitoModel<TiKvStorageBackend, Tag>,
 }
 
 impl BlogService {
     fn new(
-        transaction_manager: TransactionManager,
-        post_model: TitoModel<Post>,
-        tag_model: TitoModel<Tag>,
+        storage_backend: TiKvStorageBackend,
+        post_model: TitoModel<TiKvStorageBackend, Post>,
+        tag_model: TitoModel<TiKvStorageBackend, Tag>,
     ) -> Self {
         Self {
-            transaction_manager,
+            storage_backend,
             post_model,
             tag_model,
         }
@@ -150,22 +151,19 @@ impl BlogService {
     async fn create_tag(&self, name: String, description: String) -> Result<Tag, TitoError> {
         let tag_id = DBUuid::new_v4().to_string();
 
-        self.transaction_manager
-            .transaction(|tx| {
-                let tag_model = &self.tag_model;
+        self.tag_model.tx(|tx| {
+            let tag_model = &self.tag_model;
+            async move {
+                let tag = Tag {
+                    id: tag_id,
+                    name,
+                    description,
+                };
 
-                async move {
-                    let tag = Tag {
-                        id: tag_id,
-                        name,
-                        description,
-                    };
-
-                    tag_model.build(tag.clone(), &tx).await?;
-                    Ok::<_, TitoError>(tag)
-                }
-            })
-            .await
+                tag_model.build(tag.clone(), &tx).await?;
+                Ok::<_, TitoError>(tag)
+            }
+        }).await
     }
 
     // Create a new post with multiple tags
@@ -178,25 +176,22 @@ impl BlogService {
     ) -> Result<Post, TitoError> {
         let post_id = DBUuid::new_v4().to_string();
 
-        self.transaction_manager
-            .transaction(|tx| {
-                let post_model = &self.post_model;
+        self.post_model.tx(|tx| {
+            let post_model = &self.post_model;
+            async move {
+                let post = Post {
+                    id: post_id,
+                    title,
+                    content,
+                    author,
+                    tag_ids,
+                    tags: Vec::new(),
+                };
 
-                async move {
-                    let post = Post {
-                        id: post_id,
-                        title,
-                        content,
-                        author,
-                        tag_ids,
-                        tags: Vec::new(),
-                    };
-
-                    post_model.build(post.clone(), &tx).await?;
-                    Ok::<_, TitoError>(post)
-                }
-            })
-            .await
+                post_model.build(post.clone(), &tx).await?;
+                Ok::<_, TitoError>(post)
+            }
+        }).await
     }
 
     // Get a post with all its tags
@@ -243,48 +238,42 @@ impl BlogService {
 
     // Add a tag to a post
     async fn add_tag_to_post(&self, post_id: &str, tag_id: &str) -> Result<Post, TitoError> {
-        self.transaction_manager
-            .transaction(|tx| {
-                let post_model = &self.post_model;
+        self.post_model.tx(|tx| {
+            let post_model = &self.post_model;
+            async move {
+                // Get the current post
+                let mut post = post_model.find_by_id_tx(post_id, vec![], &tx).await?;
 
-                async move {
-                    // Get the current post
-                    let mut post = post_model.find_by_id_tx(post_id, vec![], &tx).await?;
+                // Add the tag ID if it's not already there
+                if !post.tag_ids.contains(&tag_id.to_string()) {
+                    post.tag_ids.push(tag_id.to_string());
 
-                    // Add the tag ID if it's not already there
-                    if !post.tag_ids.contains(&tag_id.to_string()) {
-                        post.tag_ids.push(tag_id.to_string());
-
-                        // Update the post
-                        post_model.update(post.clone(), &tx).await?;
-                    }
-
-                    Ok::<_, TitoError>(post)
+                    // Update the post
+                    post_model.update(post.clone(), &tx).await?;
                 }
-            })
-            .await
+
+                Ok::<_, TitoError>(post)
+            }
+        }).await
     }
 
     // Remove a tag from a post
     async fn remove_tag_from_post(&self, post_id: &str, tag_id: &str) -> Result<Post, TitoError> {
-        self.transaction_manager
-            .transaction(|tx| {
-                let post_model = &self.post_model;
+        self.post_model.tx(|tx| {
+            let post_model = &self.post_model;
+            async move {
+                // Get the current post
+                let mut post = post_model.find_by_id_tx(post_id, vec![], &tx).await?;
 
-                async move {
-                    // Get the current post
-                    let mut post = post_model.find_by_id_tx(post_id, vec![], &tx).await?;
+                // Remove the tag ID if it exists
+                post.tag_ids.retain(|id| id != tag_id);
 
-                    // Remove the tag ID if it exists
-                    post.tag_ids.retain(|id| id != tag_id);
+                // Update the post
+                post_model.update(post.clone(), &tx).await?;
 
-                    // Update the post
-                    post_model.update(post.clone(), &tx).await?;
-
-                    Ok::<_, TitoError>(post)
-                }
-            })
-            .await
+                Ok::<_, TitoError>(post)
+            }
+        }).await
     }
 
     // Search for posts with title containing a keyword using QueryBuilder
@@ -320,15 +309,19 @@ async fn main() -> Result<(), TitoError> {
         is_read_only: Arc::new(AtomicBool::new(false)),
     };
 
-    // Create transaction manager
-    let tx_manager = TransactionManager::new(Arc::new(tikv_client.clone()));
+    // Create storage backend
+    let storage_backend = TiKvStorageBackend {
+        client: Arc::new(tikv_client),
+        configs: configs.clone(),
+        active_transactions: Arc::new(Mutex::new(HashMap::new())),
+    };
 
     // Create models
-    let post_model = TitoModel::<Post>::new(configs.clone(), tx_manager.clone());
-    let tag_model = TitoModel::<Tag>::new(configs.clone(), tx_manager.clone());
+    let post_model = TitoModel::<TiKvStorageBackend, Post>::new(storage_backend.clone());
+    let tag_model = TitoModel::<TiKvStorageBackend, Tag>::new(storage_backend.clone());
 
     // Create blog service
-    let blog_service = BlogService::new(tx_manager.clone(), post_model.clone(), tag_model.clone());
+    let blog_service = BlogService::new(storage_backend.clone(), post_model.clone(), tag_model.clone());
 
     // Create some tags
     let tech_tag = blog_service

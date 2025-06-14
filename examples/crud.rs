@@ -4,13 +4,14 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tito::{
     connect,
-    transaction::TransactionManager,
     types::{
-        DBUuid, TitoConfigs, TitoEventConfig, TitoIndexBlockType, TitoIndexConfig, TitoIndexField,
+        DBUuid, TiKvStorageBackend, TitoConfigs, TitoEventConfig, TitoIndexBlockType, TitoIndexConfig, TitoIndexField,
         TitoModelTrait, TitoUtilsConnectInput, TitoUtilsConnectPayload,
     },
     TitoError, TitoModel,
 };
+use futures::lock::Mutex;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct User {
@@ -64,11 +65,15 @@ async fn main() -> Result<(), TitoError> {
         is_read_only: Arc::new(AtomicBool::new(false)),
     };
 
-    // Create transaction manager
-    let tx_manager = TransactionManager::new(Arc::new(tikv_client));
+    // Create storage backend
+    let storage_backend = TiKvStorageBackend {
+        client: Arc::new(tikv_client),
+        configs: configs.clone(),
+        active_transactions: Arc::new(Mutex::new(HashMap::new())),
+    };
 
     // Create model
-    let user_model = TitoModel::<User>::new(configs, tx_manager.clone());
+    let user_model = TitoModel::<TiKvStorageBackend, User>::new(storage_backend);
 
     // Create a user
     let user_id = DBUuid::new_v4().to_string();
@@ -79,12 +84,10 @@ async fn main() -> Result<(), TitoError> {
     };
 
     // Create user with transaction
-    let saved_user = tx_manager
-        .transaction(|tx| {
-            let model = &user_model; // Use reference to avoid moving
-            async move { model.build(user, &tx).await }
-        })
-        .await?;
+    let saved_user = user_model.tx(|tx| {
+        let user_model = &user_model;
+        async move { user_model.build(user, &tx).await }
+    }).await?;
 
     println!("Created user: {:?}", saved_user);
 
@@ -99,22 +102,18 @@ async fn main() -> Result<(), TitoError> {
         email: "john_updated@example.com".to_string(),
     };
 
-    tx_manager
-        .transaction(|tx| {
-            let model = &user_model; // Use reference to avoid moving
-            async move { model.update(updated_user, &tx).await }
-        })
-        .await?;
+    user_model.tx(|tx| {
+        let user_model = &user_model;
+        async move { user_model.update(updated_user, &tx).await }
+    }).await?;
 
     println!("User updated successfully");
 
     // Delete user
-    tx_manager
-        .transaction(|tx| {
-            let model = &user_model; // Use reference to avoid moving
-            async move { model.delete_by_id(&user_id, &tx).await }
-        })
-        .await?;
+    user_model.tx(|tx| {
+        let user_model = &user_model;
+        async move { user_model.delete_by_id(&user_id, &tx).await }
+    }).await?;
 
     println!("User deleted successfully");
 
