@@ -97,19 +97,19 @@ pub trait TitoTransaction: Send + Sync {
 pub struct TiKvStorageBackend {
     pub client: Arc<TransactionClient>,
     pub configs: TitoConfigs,
-    pub active_transactions: Arc<Mutex<HashMap<String, TiKvStorageTransaction>>>,
+    pub active_transactions: Arc<Mutex<HashMap<String, TiKvTitoTransaction>>>,
 }
 
 #[async_trait]
 impl TitoEngine for TiKvStorageBackend {
-    type Transaction = TiKvStorageTransaction;
+    type Transaction = TiKvTitoTransaction;
     type Error = TitoError;
 
     async fn begin_transaction(&self) -> Result<Self::Transaction, Self::Error> {
         let tx = self.client.begin_pessimistic().await.map_err(|e| {
             TitoError::TransactionFailed(format!("Failed to begin transaction: {}", e))
         })?;
-        Ok(TiKvStorageTransaction {
+        Ok(TiKvTitoTransaction {
             id: DBUuid::new_v4().to_string(),
             inner: Arc::new(tokio::sync::Mutex::new(tx)),
         })
@@ -176,13 +176,13 @@ impl TitoEngine for TiKvStorageBackend {
 }
 
 #[derive(Clone)]
-pub struct TiKvStorageTransaction {
+pub struct TiKvTitoTransaction {
     pub id: String,
     pub inner: Arc<tokio::sync::Mutex<Transaction>>,
 }
 
 #[async_trait]
-impl TitoTransaction for TiKvStorageTransaction {
+impl TitoTransaction for TiKvTitoTransaction {
     type Error = TitoError;
 
     async fn get<K: AsRef<[u8]> + Send>(
