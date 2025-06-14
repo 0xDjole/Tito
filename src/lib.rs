@@ -4,7 +4,6 @@ pub use connect::connect;
 pub mod types;
 
 mod base;
-pub mod transaction;
 
 pub use base::TitoModel;
 

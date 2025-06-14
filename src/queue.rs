@@ -6,20 +6,16 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::time::sleep;
 
+use crate::types::{StorageEngine, StorageTransaction, TitoEvent};
 use crate::TitoError;
-use crate::{
-    transaction::TransactionManager,
-    types::{TitoDatabase, TitoEvent},
-};
 
 #[derive(Clone)]
-pub struct TitoQueue {
-    pub db: TitoDatabase,
-    pub tx_manager: TransactionManager,
+pub struct TitoQueue<E: StorageEngine> {
+    pub engine: E,
     pub table: String,
 }
 
-impl TitoQueue {
+impl<E: StorageEngine> TitoQueue<E> {
     pub async fn push(
         &self,
         _message: String,
@@ -37,9 +33,12 @@ impl TitoQueue {
         let end_bound = format!("event:{}:PENDING:{}", self.table, current_time);
 
         let jobs = self
-            .tx_manager
+            .engine
             .transaction(|tx| async move {
-                let scan_stream = tx.scan(start_bound..end_bound, limit).await?;
+                let scan_stream = tx
+                    .scan(start_bound.as_bytes()..end_bound.as_bytes(), limit)
+                    .await
+                    .map_err(|e| TitoError::QueryFailed(format!("Scan failed: {}", e)))?;
 
                 for item in scan_stream {
                     if let Ok(job) = serde_json::from_slice::<TitoEvent>(&item.1) {
@@ -48,7 +47,9 @@ impl TitoQueue {
                 }
 
                 for job in jobs.iter_mut() {
-                    tx.delete(job.key.clone()).await;
+                    tx.delete(job.key.as_bytes())
+                        .await
+                        .map_err(|e| TitoError::DeleteFailed(format!("Delete failed: {}", e)))?;
 
                     job.status = String::from("PROGRESS");
                     let new_key = job.key.replace("PENDING", "PROGRESS");
@@ -57,8 +58,9 @@ impl TitoQueue {
                     let json_job = serde_json::to_value(job.clone());
 
                     if let Ok(value) = json_job {
-                        tx.put(new_key.clone(), serde_json::to_vec(&value).unwrap())
-                            .await;
+                        tx.put(new_key.as_bytes(), serde_json::to_vec(&value).unwrap())
+                            .await
+                            .map_err(|e| TitoError::UpdateFailed(format!("Put failed: {}", e)))?;
                     }
                 }
 
@@ -72,9 +74,12 @@ impl TitoQueue {
     pub async fn success_job(&self, job_id: String) -> Result<(), TitoError> {
         let new_key = job_id.replace("PROGRESS", "COMPLETED");
 
-        self.tx_manager
+        self.engine
             .transaction(|tx| async move {
-                let job = tx.get(job_id.clone()).await?;
+                let job = tx
+                    .get(job_id.as_bytes())
+                    .await
+                    .map_err(|e| TitoError::QueryFailed(format!("Get failed: {}", e)))?;
 
                 if let Some(job_bytes) = job {
                     let mut job: TitoEvent = serde_json::from_slice(&job_bytes).map_err(|_| {
@@ -83,24 +88,27 @@ impl TitoQueue {
                     job.status = "COMPLETED".to_string();
                     job.key = new_key.clone();
 
-                    tx.delete(job_id)
+                    tx.delete(job_id.as_bytes())
                         .await
-                        .map_err(|_| TitoError::DeleteFailed(String::from("Failed job")))?;
-                    tx.put(new_key.clone(), serde_json::to_vec(&job).unwrap())
+                        .map_err(|e| TitoError::DeleteFailed(format!("Delete failed: {}", e)))?;
+                    tx.put(new_key.as_bytes(), serde_json::to_vec(&job).unwrap())
                         .await
-                        .map_err(|_| TitoError::UpdateFailed(String::from("Failed job")))?;
+                        .map_err(|e| TitoError::UpdateFailed(format!("Put failed: {}", e)))?;
                 }
                 Ok::<_, TitoError>(())
             })
-            .await;
+            .await?;
 
         Ok(())
     }
 
     pub async fn fail_job(&self, job_id: String) -> Result<(), TitoError> {
-        self.tx_manager
+        self.engine
             .transaction(|tx| async move {
-                let job = tx.get(job_id.clone()).await?;
+                let job = tx
+                    .get(job_id.as_bytes())
+                    .await
+                    .map_err(|e| TitoError::QueryFailed(format!("Get failed: {}", e)))?;
 
                 if let Some(job_bytes) = job {
                     let mut job: TitoEvent = serde_json::from_slice(&job_bytes).map_err(|_| {
@@ -124,32 +132,34 @@ impl TitoQueue {
                             job.retries += 1;
                             job.status = "PENDING".to_string();
 
-                            tx.delete(job_id)
-                                .await
-                                .map_err(|_| TitoError::DeleteFailed(String::from("Failed job")))?;
+                            tx.delete(job_id.as_bytes()).await.map_err(|e| {
+                                TitoError::DeleteFailed(format!("Delete failed: {}", e))
+                            })?;
 
-                            tx.put(new_key, serde_json::to_vec(&job).unwrap())
+                            tx.put(new_key.as_bytes(), serde_json::to_vec(&job).unwrap())
                                 .await
-                                .map_err(|_| TitoError::DeleteFailed(String::from("Failed job")))?;
+                                .map_err(|e| {
+                                    TitoError::UpdateFailed(format!("Put failed: {}", e))
+                                })?;
                         }
                     } else {
                         let new_key = job_id.replace("PROGRESS", "FAILED");
                         job.key = new_key.clone();
                         job.status = "FAILED".to_string();
 
-                        tx.delete(job_id)
-                            .await
-                            .map_err(|_| TitoError::DeleteFailed(String::from("Failed job")))?;
+                        tx.delete(job_id.as_bytes()).await.map_err(|e| {
+                            TitoError::DeleteFailed(format!("Delete failed: {}", e))
+                        })?;
 
-                        tx.put(new_key, serde_json::to_vec(&job).unwrap())
+                        tx.put(new_key.as_bytes(), serde_json::to_vec(&job).unwrap())
                             .await
-                            .map_err(|_| TitoError::DeleteFailed(String::from("Failed job")))?;
+                            .map_err(|e| TitoError::UpdateFailed(format!("Put failed: {}", e)))?;
                     }
                 }
 
                 Ok::<_, TitoError>(())
             })
-            .await;
+            .await?;
 
         Ok(())
     }
@@ -159,8 +169,8 @@ impl TitoQueue {
     }
 }
 
-pub async fn run_worker<H>(
-    queue: Arc<TitoQueue>,
+pub async fn run_worker<E: StorageEngine + 'static, H>(
+    queue: Arc<TitoQueue<E>>,
     handler: H,
     is_leader: Arc<AtomicBool>,
     concurrency: u32,

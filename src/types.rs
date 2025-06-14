@@ -140,21 +140,23 @@ impl StorageEngine for TiKvStorageBackend {
 
         let result = f(tx.clone()).await;
 
+        // Remove from active transactions first to ensure only one reference remains
+        let mut active_transactions = self.active_transactions.lock().await;
+        let tx = active_transactions.remove(&tx.id).unwrap_or(tx);
+        drop(active_transactions); // Release the lock early
+
         match &result {
             Ok(_) => {
-                if let Err(e) = tx.clone().commit().await {
+                if let Err(e) = tx.commit().await {
                     eprintln!("Warning: Transaction commit failed: {:?}", e);
                 }
             }
             Err(_) => {
-                if let Err(e) = tx.clone().rollback().await {
+                if let Err(e) = tx.rollback().await {
                     eprintln!("Warning: Transaction rollback failed: {:?}", e);
                 }
             }
         };
-
-        let mut active_transactions = self.active_transactions.lock().await;
-        active_transactions.remove(&tx.id);
 
         result
     }
