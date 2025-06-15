@@ -20,7 +20,7 @@ Add Tito to your project:
 
 ```toml
 [dependencies]
-tito = "0.1.2"
+tito = "0.1.6"
 ```
 
 ## Quick Start
@@ -28,19 +28,15 @@ tito = "0.1.2"
 ### Setting up a Connection
 
 ```rust
-let tikv_client = connect(TitoUtilsConnectInput {
-    payload: TitoUtilsConnectPayload {
-        uri: "127.0.0.1:2379".to_string(),
-    },
-}).await?;
+// Connect to TiKV with multiple endpoints
+let storage_backend = TiKV::connect(vec!["127.0.0.1:2379"]).await?;
 
-// Initialize config
-let configs = TitoConfigs {
-    is_read_only: Arc::new(AtomicBool::new(false)),
-};
-
-// Create transaction manager
-let tx_manager = TransactionManager::new(Arc::new(tikv_client));
+// For production, use multiple PD endpoints for high availability
+let storage_backend = TiKV::connect(vec![
+    "pd1.example.com:2379",
+    "pd2.example.com:2379", 
+    "pd3.example.com:2379"
+]).await?;
 ```
 
 ### Creating a Model
@@ -74,8 +70,8 @@ impl TitoModelTrait for User {
         "users".to_string()
     }
 
-    fn has_event(&self) -> bool {
-        false
+    fn get_events(&self) -> Vec<TitoEventConfig> {
+        vec![]
     }
 
     fn get_id(&self) -> String {
@@ -83,8 +79,8 @@ impl TitoModelTrait for User {
     }
 }
 
-// Create model
-let user_model = TitoModel::<User>::new(configs, tx_manager.clone());
+// Create model with the storage backend
+let user_model: TitoModel<_, User> = TitoModel::new(storage_backend.clone());
 ```
 
 ### Basic CRUD Operations
@@ -99,8 +95,11 @@ let user = User {
 };
 
 // Create user with transaction
-let saved_user = storage_backend.transaction(|tx| async move {
-    user_model.build(user, &tx).await
+let saved_user = storage_backend.transaction(|tx| {
+    let user_model = user_model.clone();
+    async move {
+        user_model.build(user, &tx).await
+    }
 }).await?;
 
 // Find user by ID
@@ -113,13 +112,19 @@ let updated_user = User {
     email: "john_updated@example.com".to_string(),
 };
 
-storage_backend.transaction(|tx| async move {
-    user_model.update(updated_user, &tx).await
+storage_backend.transaction(|tx| {
+    let user_model = user_model.clone();
+    async move {
+        user_model.update(updated_user, &tx).await
+    }
 }).await?;
 
 // Delete user
-storage_backend.transaction(|tx| async move {
-    user_model.delete_by_id(&user_id, &tx).await
+storage_backend.transaction(|tx| {
+    let user_model = user_model.clone();
+    async move {
+        user_model.delete_by_id(&user_id, &tx).await
+    }
 }).await?;
 ```
 
@@ -200,21 +205,24 @@ let latest_posts = query
 ### Transaction-Specific Queries
 
 ```rust
-storage_backend.transaction(|tx| async move {
-    // Query within transaction context
-    let mut query = user_model.query_by_index("by_email");
-    let user = query
-        .value("john@example.com")
-        .execute_tx(&tx)        // Execute within transaction
-        .await?;
+storage_backend.transaction(|tx| {
+    let user_model = user_model.clone();
+    async move {
+        // Query within transaction context
+        let mut query = user_model.query_by_index("by_email");
+        let user = query
+            .value("john@example.com")
+            .execute_tx(&tx)        // Execute within transaction
+            .await?;
+            
+        // Update user in same transaction
+        if let Some(mut user) = user.items.first().cloned() {
+            user.name = "John Smith".to_string();
+            user_model.update(user, &tx).await?;
+        }
         
-    // Update user in same transaction
-    if let Some(mut user) = user.items.first().cloned() {
-        user.name = "John Smith".to_string();
-        user_model.update(user, &tx).await?;
+        Ok::<_, TitoError>(())
     }
-    
-    Ok::<_, TitoError>(())
 }).await?;
 ```
 
