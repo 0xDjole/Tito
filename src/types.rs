@@ -1,4 +1,4 @@
-use crate::TitoError;
+use crate::{TitoError, TitoModel};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde::Serialize;
@@ -7,11 +7,15 @@ use std::ops::Range;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use uuid::Uuid;
+use serde::de::DeserializeOwned;
 
 #[derive(Clone)]
 pub struct TitoConfigs {
     pub is_read_only: Arc<AtomicBool>,
 }
+
+pub trait TitoModelConstraints: Default + Clone + Serialize + DeserializeOwned + Unpin + std::marker::Send + Sync + TitoModelTrait {}
+impl<T> TitoModelConstraints for T where T: Default + Clone + Serialize + DeserializeOwned + Unpin + std::marker::Send + Sync + TitoModelTrait {}
 
 pub type TitoKey = Vec<u8>;
 pub type TitoValue = Vec<u8>;
@@ -35,6 +39,10 @@ pub trait TitoEngine: Send + Sync + Clone {
         E: From<TitoError> + Send;
 
     async fn clear_active_transactions(&self) -> Result<(), TitoError>;
+
+    fn model<T: TitoModelConstraints>(self) -> TitoModel<Self, T> {
+        TitoModel::new(self)
+    }
 }
 
 #[async_trait]

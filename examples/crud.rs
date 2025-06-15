@@ -51,7 +51,7 @@ async fn main() -> Result<(), TitoError> {
     let tito_db = TiKV::connect(vec!["127.0.0.1:2379"]).await?;
 
     // Create model with dynamic backend
-    let user_model: TitoModel<_, User> = TitoModel::new(tito_db.clone());
+    let user_model = tito_db.clone().model::<User>();
 
     // Create a user
     let user_id = DBUuid::new_v4().to_string();

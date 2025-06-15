@@ -125,8 +125,8 @@ async fn main() -> Result<(), TitoError> {
     let tito_db = TiKV::connect(vec!["127.0.0.1:2379"]).await?;
 
     // Create models
-    let post_model = TitoModel::new(tito_db.clone());
-    let tag_model = TitoModel::new(tito_db.clone());
+    let post_model = tito_db.clone().model::<Post>();
+    let tag_model = tito_db.clone().model::<Tag>();
 
     // Create some tags
     let tech_tag = tito_db

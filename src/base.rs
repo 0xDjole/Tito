@@ -22,19 +22,8 @@ pub struct TitoModel<E: TitoEngine, T> {
     pub engine: E,
 }
 
-impl<
-        E: TitoEngine,
-        T: Default
-            + Clone
-            + Serialize
-            + DeserializeOwned
-            + Unpin
-            + std::marker::Send
-            + Sync
-            + TitoModelTrait,
-    > TitoModel<E, T>
-{
-    pub fn new(engine: E) -> Self {
+impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
+    pub(crate) fn new(engine: E) -> Self {
         Self {
             model: T::default(),
             engine,

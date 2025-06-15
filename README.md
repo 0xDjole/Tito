@@ -20,7 +20,7 @@ Add Tito to your project:
 
 ```toml
 [dependencies]
-tito = "0.1.8"
+tito = "0.1.9"
 ```
 
 ## Quick Start
@@ -79,8 +79,8 @@ impl TitoModelTrait for User {
     }
 }
 
-// Create model with the storage backend
-let user_model: TitoModel<_, User> = TitoModel::new(tito_db.clone());
+// Create model with the storage backend  
+let user_model = tito_db.clone().model::<User>();
 ```
 
 ### Basic CRUD Operations
