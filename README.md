@@ -20,7 +20,7 @@ Add Tito to your project:
 
 ```toml
 [dependencies]
-tito = "0.1.7"
+tito = "0.1.8"
 ```
 
 ## Quick Start
