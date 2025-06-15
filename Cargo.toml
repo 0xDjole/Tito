@@ -2,7 +2,7 @@
 name = "tito"
 version = "0.1.5"
 edition = "2021"
-description = "A flexible database layer built on top of TiKV with powerful indexing strategies and relationship modeling"
+description = "A flexible database layer with powerful indexing strategies and relationship modeling, supporting multiple backends"
 license = "Apache-2.0"
 authors = ["0xDjole 0xdjole@gmail.com"]
 
@@ -40,3 +40,4 @@ base64 = "0.22.0"
 regex = "1"
 typed-builder = "0.10"
 async-trait = "0.1"
+

@@ -1,17 +1,13 @@
 // examples/basic_crud.rs
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 use tito::{
-    connect,
+    TiKV,
     types::{
-        DBUuid, TiKvStorageBackend, TitoConfigs, TitoEngine, TitoEventConfig, TitoIndexBlockType, TitoIndexConfig, TitoIndexField,
-        TitoModelTrait, TitoUtilsConnectInput, TitoUtilsConnectPayload,
+        DBUuid, TitoEngine, TitoEventConfig, TitoIndexBlockType, TitoIndexConfig, TitoIndexField,
+        TitoModelTrait,
     },
     TitoError, TitoModel,
 };
-use futures::lock::Mutex;
-use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct User {
@@ -53,27 +49,10 @@ impl TitoModelTrait for User {
 #[tokio::main]
 async fn main() -> Result<(), TitoError> {
     // Connect to TiKV
-    let tikv_client = connect(TitoUtilsConnectInput {
-        payload: TitoUtilsConnectPayload {
-            uri: "127.0.0.1:2379".to_string(),
-        },
-    })
-    .await?;
+    let storage_backend = TiKV::connect(vec!["127.0.0.1:2379"]).await?;
 
-    // Initialize config
-    let configs = TitoConfigs {
-        is_read_only: Arc::new(AtomicBool::new(false)),
-    };
-
-    // Create storage backend
-    let storage_backend = TiKvStorageBackend {
-        client: Arc::new(tikv_client),
-        configs: configs.clone(),
-        active_transactions: Arc::new(Mutex::new(HashMap::new())),
-    };
-
-    // Create model
-    let user_model = TitoModel::<TiKvStorageBackend, User>::new(storage_backend.clone());
+    // Create model with dynamic backend
+    let user_model: TitoModel<_, User> = TitoModel::new(storage_backend.clone());
 
     // Create a user
     let user_id = DBUuid::new_v4().to_string();

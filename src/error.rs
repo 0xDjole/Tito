@@ -52,4 +52,7 @@ pub enum TitoError {
 
     #[error("Unexpected error: {0}")]
     Internal(String),
+
+    #[error("Configuration error: {0}")]
+    Configuration(String),
 }
