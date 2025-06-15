@@ -20,7 +20,7 @@ Add Tito to your project:
 
 ```toml
 [dependencies]
-tito = "0.1.6"
+tito = "0.1.7"
 ```
 
 ## Quick Start
@@ -34,7 +34,7 @@ let storage_backend = TiKV::connect(vec!["127.0.0.1:2379"]).await?;
 // For production, use multiple PD endpoints for high availability
 let storage_backend = TiKV::connect(vec![
     "pd1.example.com:2379",
-    "pd2.example.com:2379", 
+    "pd2.example.com:2379",
     "pd3.example.com:2379"
 ]).await?;
 ```
@@ -176,7 +176,7 @@ let active_admins = query
     .limit(Some(20))            // Limit results
     .execute()
     .await?;
-    
+
 // Use cursor for pagination
 if let Some(cursor) = active_admins.cursor {
     // Get next page using the same query with a cursor
@@ -214,13 +214,13 @@ storage_backend.transaction(|tx| {
             .value("john@example.com")
             .execute_tx(&tx)        // Execute within transaction
             .await?;
-            
+
         // Update user in same transaction
         if let Some(mut user) = user.items.first().cloned() {
             user.name = "John Smith".to_string();
             user_model.update(user, &tx).await?;
         }
-        
+
         Ok::<_, TitoError>(())
     }
 }).await?;
