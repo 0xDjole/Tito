@@ -17,13 +17,12 @@ use serde_json::Value;
 use tokio::time::{sleep, Duration};
 
 #[derive(Clone)]
-pub struct TitoModel<E: TitoEngine, T> {
+pub struct TitoModel<T: TitoModelTrait> {
     pub model: T,
-    pub engine: E,
+    pub engine: T::Engine,
 }
 
 impl<
-        E: TitoEngine,
         T: Default
             + Clone
             + Serialize
@@ -32,9 +31,9 @@ impl<
             + std::marker::Send
             + Sync
             + TitoModelTrait,
-    > TitoModel<E, T>
+    > TitoModel<T>
 {
-    pub fn new(engine: E) -> Self {
+    pub fn new(engine: T::Engine) -> Self {
         Self {
             model: T::default(),
             engine,
@@ -57,7 +56,7 @@ impl<
             .unwrap_or_else(|| key)
     }
 
-    pub fn query_by_index(&self, index: impl Into<String>) -> IndexQueryBuilder<E, T> {
+    pub fn query_by_index(&self, index: impl Into<String>) -> IndexQueryBuilder<T> {
         IndexQueryBuilder::new(self.clone(), index.into())
     }
 
@@ -83,7 +82,7 @@ impl<
 
     pub async fn tx<F, Fut, R, Err>(&self, f: F) -> Result<R, Err>
     where
-        F: FnOnce(E::Transaction) -> Fut + Send,
+        F: FnOnce(<T::Engine as TitoEngine>::Transaction) -> Fut + Send,
         Fut: Future<Output = Result<R, Err>> + Send,
         Err: From<TitoError> + Send + Sync + std::fmt::Debug, // Added Sync trait bound
         R: Send,
@@ -117,7 +116,7 @@ impl<
         key: &str,
         max_retries: usize,
         initial_delay_ms: u64,
-        tx: &E::Transaction,
+        tx: &<T::Engine as TitoEngine>::Transaction,
     ) -> Result<(String, Value), TitoError> {
         let mut retries = 0;
         let mut delay = initial_delay_ms;
@@ -154,7 +153,7 @@ impl<
             }
         }
     }
-    pub async fn get_key(&self, key: &str, tx: &E::Transaction) -> Result<Value, TitoError> {
+    pub async fn get_key(&self, key: &str, tx: &<T::Engine as TitoEngine>::Transaction) -> Result<Value, TitoError> {
         let result = tx
             .get(key.to_string())
             .await
@@ -166,7 +165,7 @@ impl<
             .map_err(|_| TitoError::NotFound("Not found".to_string()))
     }
 
-    async fn put<P>(&self, key: String, payload: P, tx: &E::Transaction) -> Result<bool, TitoError>
+    async fn put<P>(&self, key: String, payload: P, tx: &<T::Engine as TitoEngine>::Transaction) -> Result<bool, TitoError>
     where
         P: Serialize + Unpin + std::marker::Send + Sync,
     {
@@ -213,7 +212,7 @@ impl<
         }
     }
 
-    pub async fn delete(&self, key: String, tx: &E::Transaction) -> Result<bool, TitoError> {
+    pub async fn delete(&self, key: String, tx: &<T::Engine as TitoEngine>::Transaction) -> Result<bool, TitoError> {
         let mut retries = 0;
         let mut delay = 10;
         let max_retries = 10;
@@ -295,7 +294,7 @@ impl<
     async fn get_reverse_index(
         &self,
         key: &str,
-        tx: &E::Transaction,
+        tx: &<T::Engine as TitoEngine>::Transaction,
     ) -> Result<ReverseIndex, TitoError> {
         let result = tx.get(key.to_string()).await.map_err(|e| {
             TitoError::NotFound(format!(
@@ -354,7 +353,7 @@ impl<
         }
     }
 
-    pub async fn build(&self, payload: T, tx: &E::Transaction) -> Result<T, TitoError>
+    pub async fn build(&self, payload: T, tx: &<T::Engine as TitoEngine>::Transaction) -> Result<T, TitoError>
     where
         T: serde::de::DeserializeOwned,
     {
@@ -366,7 +365,7 @@ impl<
         &self,
         payload: T,
         event_action: Option<String>,
-        tx: &E::Transaction,
+        tx: &<T::Engine as TitoEngine>::Transaction,
     ) -> Result<T, TitoError>
     where
         T: serde::de::DeserializeOwned,
@@ -412,7 +411,7 @@ impl<
     async fn generate_event(
         &self,
         payload: TitoGenerateEventPayload,
-        tx: &E::Transaction,
+        tx: &<T::Engine as TitoEngine>::Transaction,
     ) -> Result<bool, TitoError> {
         if let Some(action) = payload.action.clone() {
             for event_config in self.model.get_events().iter() {
@@ -471,7 +470,7 @@ impl<
         &self,
         id: &str,
         rels: Vec<String>,
-        tx: &E::Transaction,
+        tx: &<T::Engine as TitoEngine>::Transaction,
     ) -> Result<T, TitoError>
     where
         T: serde::de::DeserializeOwned,
@@ -526,7 +525,7 @@ impl<
     pub async fn scan(
         &self,
         payload: TitoScanPayload,
-        tx: &E::Transaction,
+        tx: &<T::Engine as TitoEngine>::Transaction,
     ) -> Result<(Vec<(String, Value)>, bool), TitoError>
     where
         T: DeserializeOwned,
@@ -576,7 +575,7 @@ impl<
         &self,
         ids: Vec<String>,
         rels: Vec<String>,
-        tx: &E::Transaction,
+        tx: &<T::Engine as TitoEngine>::Transaction,
     ) -> Result<Vec<T>, TitoError>
     where
         T: DeserializeOwned,
@@ -598,7 +597,7 @@ impl<
         &self,
         ids: Vec<String>,
         rels: Vec<String>,
-        tx: &E::Transaction,
+        tx: &<T::Engine as TitoEngine>::Transaction,
     ) -> Result<Vec<(String, Value)>, TitoError>
     where
         T: DeserializeOwned,
@@ -638,7 +637,7 @@ impl<
     pub async fn scan_reverse(
         &self,
         payload: TitoScanPayload,
-        tx: &E::Transaction,
+        tx: &<T::Engine as TitoEngine>::Transaction,
     ) -> Result<(Vec<(String, Value)>, bool), TitoError>
     where
         T: DeserializeOwned,
@@ -685,7 +684,7 @@ impl<
         Ok((items, has_more))
     }
 
-    pub async fn update(&self, payload: T, tx: &E::Transaction) -> Result<bool, TitoError>
+    pub async fn update(&self, payload: T, tx: &<T::Engine as TitoEngine>::Transaction) -> Result<bool, TitoError>
     where
         T: serde::de::DeserializeOwned,
     {
@@ -701,7 +700,7 @@ impl<
         &self,
         payload: T,
         trigger_event: bool,
-        tx: &E::Transaction,
+        tx: &<T::Engine as TitoEngine>::Transaction,
     ) -> Result<bool, TitoError>
     where
         T: serde::de::DeserializeOwned,
@@ -720,7 +719,7 @@ impl<
     pub async fn lock_keys(
         &self,
         keys: Vec<String>,
-        tx: &E::Transaction,
+        tx: &<T::Engine as TitoEngine>::Transaction,
     ) -> Result<bool, TitoError> {
         let keys: Vec<_> = keys
             .into_iter()
@@ -754,7 +753,7 @@ impl<
         keys: Vec<String>,
         max_retries: usize,
         initial_delay_ms: u64,
-        tx: &E::Transaction,
+        tx: &<T::Engine as TitoEngine>::Transaction,
     ) -> Result<Vec<(String, Value)>, TitoError> {
         let mut retries = 0;
         let mut delay = initial_delay_ms;
@@ -783,7 +782,7 @@ impl<
         &self,
         raw_id: &str,
         trigger_event: bool,
-        tx: &E::Transaction,
+        tx: &<T::Engine as TitoEngine>::Transaction,
     ) -> Result<bool, TitoError> {
         let id = format!("{}:{}", self.get_table(), raw_id);
         let reverse_index_key = format!("reverse-index:{}", id);
@@ -812,7 +811,7 @@ impl<
         Ok(true)
     }
 
-    pub async fn delete_by_id(&self, raw_id: &str, tx: &E::Transaction) -> Result<bool, TitoError> {
+    pub async fn delete_by_id(&self, raw_id: &str, tx: &<T::Engine as TitoEngine>::Transaction) -> Result<bool, TitoError> {
         self.delete_by_id_with_options(raw_id, true, tx).await
     }
 

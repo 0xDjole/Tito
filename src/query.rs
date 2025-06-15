@@ -5,9 +5,8 @@ use crate::{
 };
 use serde::{de::DeserializeOwned, Serialize};
 
-pub struct IndexQueryBuilder<E, T>
+pub struct IndexQueryBuilder<T>
 where
-    E: TitoEngine,
     T: Default
         + Clone
         + Serialize
@@ -17,7 +16,7 @@ where
         + Sync
         + TitoModelTrait,
 {
-    model: TitoModel<E, T>,
+    model: TitoModel<T>,
     index: String,
     values: Vec<String>,
     rels: Vec<String>,
@@ -27,9 +26,8 @@ where
     cursor: Option<String>,
 }
 
-impl<E, T> IndexQueryBuilder<E, T>
+impl<T> IndexQueryBuilder<T>
 where
-    E: TitoEngine,
     T: Clone
         + Serialize
         + DeserializeOwned
@@ -39,7 +37,7 @@ where
         + Default
         + TitoModelTrait,
 {
-    pub fn new(model: TitoModel<E, T>, index: String) -> Self {
+    pub fn new(model: TitoModel<T>, index: String) -> Self {
         Self {
             model: model.clone(),
             index,
@@ -104,7 +102,7 @@ where
     }
 
     // Terminal method - still consumes self
-    pub async fn execute_tx(&mut self, tx: &E::Transaction) -> Result<TitoPaginated<T>, TitoError> {
+    pub async fn execute_tx(&mut self, tx: &<T::Engine as TitoEngine>::Transaction) -> Result<TitoPaginated<T>, TitoError> {
         let payload = TitoFindByIndexPayload {
             index: self.index.clone(),
             values: self.values.clone(),
@@ -136,7 +134,7 @@ where
     // Terminal method - still consumes self
     pub async fn execute_reverse_tx(
         self,
-        tx: &E::Transaction,
+        tx: &<T::Engine as TitoEngine>::Transaction,
     ) -> Result<TitoPaginated<T>, TitoError> {
         let payload = TitoFindByIndexPayload {
             index: self.index,

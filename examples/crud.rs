@@ -16,6 +16,8 @@ struct User {
 }
 
 impl TitoModelTrait for User {
+    type Engine = tito::backend::tikv::TiKVBackend;
+    
     fn get_embedded_relationships(&self) -> Vec<tito::types::TitoEmbeddedRelationshipConfig> {
         vec![]
     }
@@ -51,7 +53,7 @@ async fn main() -> Result<(), TitoError> {
     let tito_db = TiKV::connect(vec!["127.0.0.1:2379"]).await?;
 
     // Create model with dynamic backend
-    let user_model: TitoModel<_, User> = TitoModel::new(tito_db.clone());
+    let user_model = TitoModel::new(tito_db.clone());
 
     // Create a user
     let user_id = DBUuid::new_v4().to_string();

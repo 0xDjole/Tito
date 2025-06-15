@@ -50,6 +50,8 @@ struct User {
 }
 
 impl TitoModelTrait for User {
+    type Engine = tito::backend::tikv::TiKVBackend;
+    
     fn get_embedded_relationships(&self) -> Vec<tito::types::TitoEmbeddedRelationshipConfig> {
         vec![] // No relationships for this simple model
     }
@@ -80,7 +82,7 @@ impl TitoModelTrait for User {
 }
 
 // Create model with the storage backend
-let user_model: TitoModel<_, User> = TitoModel::new(tito_db.clone());
+let user_model = TitoModel::new(tito_db.clone());
 ```
 
 ### Basic CRUD Operations

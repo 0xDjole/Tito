@@ -138,6 +138,8 @@ pub struct TitoRelIndexConfig {
 }
 
 pub trait TitoModelTrait {
+    type Engine: TitoEngine;
+    
     fn get_embedded_relationships(&self) -> Vec<TitoEmbeddedRelationshipConfig>;
     fn get_indexes(&self) -> Vec<TitoIndexConfig>;
     fn get_table_name(&self) -> String;

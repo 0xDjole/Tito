@@ -8,7 +8,6 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 impl<
-        E: TitoEngine,
         T: Default
             + Clone
             + Serialize
@@ -17,7 +16,7 @@ impl<
             + std::marker::Send
             + Sync
             + TitoModelTrait,
-    > TitoModel<E, T>
+    > TitoModel<T>
 {
     pub fn stitch_relationship(
         &self,
@@ -157,7 +156,7 @@ impl<
         &self,
         items: Vec<(String, Value)>,
         rels: Vec<String>,
-        tx: &E::Transaction,
+        tx: &<T::Engine as TitoEngine>::Transaction,
     ) -> Result<Vec<(String, Value)>, TitoError> {
         if rels.is_empty() {
             return Ok(items);

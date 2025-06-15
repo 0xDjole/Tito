@@ -31,10 +31,12 @@ struct Post {
     tags: Vec<Tag>,
 }
 
-// Implement TitoModelTrait for Tag
+// implement titomodeltrait for tag
 impl TitoModelTrait for Tag {
+    type Engine = tito::backend::tikv::TiKVBackend;
+
     fn get_embedded_relationships(&self) -> Vec<TitoEmbeddedRelationshipConfig> {
-        // Tags don't embed anything
+        // tags don't embed anything
         vec![]
     }
 
@@ -65,6 +67,8 @@ impl TitoModelTrait for Tag {
 
 // Implement TitoModelTrait for Post
 impl TitoModelTrait for Post {
+    type Engine = tito::backend::tikv::TiKVBackend;
+
     fn get_embedded_relationships(&self) -> Vec<TitoEmbeddedRelationshipConfig> {
         // Posts embed multiple tags
         vec![TitoEmbeddedRelationshipConfig {

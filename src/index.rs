@@ -12,7 +12,6 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 
 impl<
-        E: TitoEngine,
         T: Default
             + Clone
             + Serialize
@@ -21,7 +20,7 @@ impl<
             + std::marker::Send
             + Sync
             + TitoModelTrait,
-    > TitoModel<E, T>
+    > TitoModel<T>
 {
     pub fn get_index_keys(
         &self,
@@ -103,7 +102,7 @@ impl<
     pub async fn find_by_index_raw(
         &self,
         payload: TitoFindByIndexPayload,
-        tx: &E::Transaction,
+        tx: &<T::Engine as TitoEngine>::Transaction,
     ) -> Result<(Vec<(String, Value)>, bool), TitoError>
     where
         T: serde::de::DeserializeOwned,
@@ -172,7 +171,7 @@ impl<
     pub async fn find_by_index_reverse_raw(
         &self,
         payload: TitoFindByIndexPayload,
-        tx: &E::Transaction,
+        tx: &<T::Engine as TitoEngine>::Transaction,
     ) -> Result<(Vec<(String, Value)>, bool), TitoError>
     where
         T: serde::de::DeserializeOwned,
@@ -226,7 +225,7 @@ impl<
     pub async fn find_by_index_tx(
         &self,
         payload: TitoFindByIndexPayload,
-        tx: &E::Transaction,
+        tx: &<T::Engine as TitoEngine>::Transaction,
     ) -> Result<TitoPaginated<T>, TitoError>
     where
         T: serde::de::DeserializeOwned,
@@ -265,7 +264,7 @@ impl<
     pub async fn find_by_index_reverse_tx(
         &self,
         payload: TitoFindByIndexPayload,
-        tx: &E::Transaction,
+        tx: &<T::Engine as TitoEngine>::Transaction,
     ) -> Result<TitoPaginated<T>, TitoError>
     where
         T: serde::de::DeserializeOwned,
@@ -292,7 +291,7 @@ impl<
     pub async fn find_one_by_index_tx(
         &self,
         payload: TitoFindOneByIndexPayload,
-        tx: &E::Transaction,
+        tx: &<T::Engine as TitoEngine>::Transaction,
     ) -> Result<T, TitoError>
     where
         T: serde::de::DeserializeOwned,
