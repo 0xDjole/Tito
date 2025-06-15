@@ -1,12 +1,11 @@
 // examples/basic_crud.rs
 use serde::{Deserialize, Serialize};
 use tito::{
-    TiKV,
     types::{
         DBUuid, TitoEngine, TitoEventConfig, TitoIndexBlockType, TitoIndexConfig, TitoIndexField,
         TitoModelTrait,
     },
-    TitoError, TitoModel,
+    TiKV, TitoError, TitoModel,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -49,10 +48,10 @@ impl TitoModelTrait for User {
 #[tokio::main]
 async fn main() -> Result<(), TitoError> {
     // Connect to TiKV
-    let storage_backend = TiKV::connect(vec!["127.0.0.1:2379"]).await?;
+    let tito_db = TiKV::connect(vec!["127.0.0.1:2379"]).await?;
 
     // Create model with dynamic backend
-    let user_model: TitoModel<_, User> = TitoModel::new(storage_backend.clone());
+    let user_model: TitoModel<_, User> = TitoModel::new(tito_db.clone());
 
     // Create a user
     let user_id = DBUuid::new_v4().to_string();
@@ -63,12 +62,12 @@ async fn main() -> Result<(), TitoError> {
     };
 
     // Create user with transaction
-    let saved_user = storage_backend.transaction(|tx| {
-        let user_model = user_model.clone();
-        async move {
-            user_model.build(user, &tx).await
-        }
-    }).await?;
+    let saved_user = tito_db
+        .transaction(|tx| {
+            let user_model = user_model.clone();
+            async move { user_model.build(user, &tx).await }
+        })
+        .await?;
 
     println!("Created user: {:?}", saved_user);
 
@@ -83,22 +82,22 @@ async fn main() -> Result<(), TitoError> {
         email: "john_updated@example.com".to_string(),
     };
 
-    storage_backend.transaction(|tx| {
-        let user_model = user_model.clone();
-        async move {
-            user_model.update(updated_user, &tx).await
-        }
-    }).await?;
+    tito_db
+        .transaction(|tx| {
+            let user_model = user_model.clone();
+            async move { user_model.update(updated_user, &tx).await }
+        })
+        .await?;
 
     println!("User updated successfully");
 
     // Delete user
-    storage_backend.transaction(|tx| {
-        let user_model = user_model.clone();
-        async move {
-            user_model.delete_by_id(&user_id, &tx).await
-        }
-    }).await?;
+    tito_db
+        .transaction(|tx| {
+            let user_model = user_model.clone();
+            async move { user_model.delete_by_id(&user_id, &tx).await }
+        })
+        .await?;
 
     println!("User deleted successfully");
 

@@ -29,10 +29,10 @@ tito = "0.1.7"
 
 ```rust
 // Connect to TiKV with multiple endpoints
-let storage_backend = TiKV::connect(vec!["127.0.0.1:2379"]).await?;
+let tito_db = TiKV::connect(vec!["127.0.0.1:2379"]).await?;
 
 // For production, use multiple PD endpoints for high availability
-let storage_backend = TiKV::connect(vec![
+let tito_db = TiKV::connect(vec![
     "pd1.example.com:2379",
     "pd2.example.com:2379",
     "pd3.example.com:2379"
@@ -80,7 +80,7 @@ impl TitoModelTrait for User {
 }
 
 // Create model with the storage backend
-let user_model: TitoModel<_, User> = TitoModel::new(storage_backend.clone());
+let user_model: TitoModel<_, User> = TitoModel::new(tito_db.clone());
 ```
 
 ### Basic CRUD Operations
@@ -95,7 +95,7 @@ let user = User {
 };
 
 // Create user with transaction
-let saved_user = storage_backend.transaction(|tx| {
+let saved_user = tito_db.transaction(|tx| {
     let user_model = user_model.clone();
     async move {
         user_model.build(user, &tx).await
@@ -112,7 +112,7 @@ let updated_user = User {
     email: "john_updated@example.com".to_string(),
 };
 
-storage_backend.transaction(|tx| {
+tito_db.transaction(|tx| {
     let user_model = user_model.clone();
     async move {
         user_model.update(updated_user, &tx).await
@@ -120,7 +120,7 @@ storage_backend.transaction(|tx| {
 }).await?;
 
 // Delete user
-storage_backend.transaction(|tx| {
+tito_db.transaction(|tx| {
     let user_model = user_model.clone();
     async move {
         user_model.delete_by_id(&user_id, &tx).await
@@ -205,7 +205,7 @@ let latest_posts = query
 ### Transaction-Specific Queries
 
 ```rust
-storage_backend.transaction(|tx| {
+tito_db.transaction(|tx| {
     let user_model = user_model.clone();
     async move {
         // Query within transaction context

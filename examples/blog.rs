@@ -1,11 +1,10 @@
 use serde::{Deserialize, Serialize};
 use tito::{
-    TiKV,
     types::{
         DBUuid, TitoEmbeddedRelationshipConfig, TitoEngine, TitoEventConfig, TitoIndexBlockType,
         TitoIndexConfig, TitoIndexField, TitoModelTrait,
     },
-    TitoError, TitoModel,
+    TiKV, TitoError, TitoModel,
 };
 
 // Simple Tag model
@@ -123,72 +122,80 @@ impl TitoModelTrait for Post {
 #[tokio::main]
 async fn main() -> Result<(), TitoError> {
     // Connect to TiKV
-    let storage_backend = TiKV::connect(vec!["127.0.0.1:2379"]).await?;
+    let tito_db = TiKV::connect(vec!["127.0.0.1:2379"]).await?;
 
     // Create models
-    let post_model = TitoModel::new(storage_backend.clone());
-    let tag_model = TitoModel::new(storage_backend.clone());
+    let post_model = TitoModel::new(tito_db.clone());
+    let tag_model = TitoModel::new(tito_db.clone());
 
     // Create some tags
-    let tech_tag = storage_backend.transaction(|tx| {
-        let tag_model = tag_model.clone();
-        let tag = Tag {
-            id: DBUuid::new_v4().to_string(),
-            name: "Technology".to_string(),
-            description: "All about tech".to_string(),
-        };
-        let tag_clone = tag.clone();
-        
-        async move {
-            tag_model.build(tag_clone, &tx).await?;
-            Ok::<_, TitoError>(tag)
-        }
-    }).await?;
+    let tech_tag = tito_db
+        .transaction(|tx| {
+            let tag_model = tag_model.clone();
+            let tag = Tag {
+                id: DBUuid::new_v4().to_string(),
+                name: "Technology".to_string(),
+                description: "All about tech".to_string(),
+            };
+            let tag_clone = tag.clone();
 
-    let travel_tag = storage_backend.transaction(|tx| {
-        let tag_model = tag_model.clone();
-        let tag = Tag {
-            id: DBUuid::new_v4().to_string(),
-            name: "Travel".to_string(),
-            description: "Adventures around the world".to_string(),
-        };
-        let tag_clone = tag.clone();
-        
-        async move {
-            tag_model.build(tag_clone, &tx).await?;
-            Ok::<_, TitoError>(tag)
-        }
-    }).await?;
+            async move {
+                tag_model.build(tag_clone, &tx).await?;
+                Ok::<_, TitoError>(tag)
+            }
+        })
+        .await?;
 
-    let rust_tag = storage_backend.transaction(|tx| {
-        let tag_model = tag_model.clone();
-        let tag = Tag {
-            id: DBUuid::new_v4().to_string(),
-            name: "Rust".to_string(),
-            description: "Rust programming language".to_string(),
-        };
-        let tag_clone = tag.clone();
-        
-        async move {
-            tag_model.build(tag_clone, &tx).await?;
-            Ok::<_, TitoError>(tag)
-        }
-    }).await?;
+    let travel_tag = tito_db
+        .transaction(|tx| {
+            let tag_model = tag_model.clone();
+            let tag = Tag {
+                id: DBUuid::new_v4().to_string(),
+                name: "Travel".to_string(),
+                description: "Adventures around the world".to_string(),
+            };
+            let tag_clone = tag.clone();
 
-    let database_tag = storage_backend.transaction(|tx| {
-        let tag_model = tag_model.clone();
-        let tag = Tag {
-            id: DBUuid::new_v4().to_string(),
-            name: "Databases".to_string(),
-            description: "Database systems and technologies".to_string(),
-        };
-        let tag_clone = tag.clone();
-        
-        async move {
-            tag_model.build(tag_clone, &tx).await?;
-            Ok::<_, TitoError>(tag)
-        }
-    }).await?;
+            async move {
+                tag_model.build(tag_clone, &tx).await?;
+                Ok::<_, TitoError>(tag)
+            }
+        })
+        .await?;
+
+    let rust_tag = tito_db
+        .transaction(|tx| {
+            let tag_model = tag_model.clone();
+            let tag = Tag {
+                id: DBUuid::new_v4().to_string(),
+                name: "Rust".to_string(),
+                description: "Rust programming language".to_string(),
+            };
+            let tag_clone = tag.clone();
+
+            async move {
+                tag_model.build(tag_clone, &tx).await?;
+                Ok::<_, TitoError>(tag)
+            }
+        })
+        .await?;
+
+    let database_tag = tito_db
+        .transaction(|tx| {
+            let tag_model = tag_model.clone();
+            let tag = Tag {
+                id: DBUuid::new_v4().to_string(),
+                name: "Databases".to_string(),
+                description: "Database systems and technologies".to_string(),
+            };
+            let tag_clone = tag.clone();
+
+            async move {
+                tag_model.build(tag_clone, &tx).await?;
+                Ok::<_, TitoError>(tag)
+            }
+        })
+        .await?;
 
     println!("Created tags:");
     println!("- {}: {}", tech_tag.name, tech_tag.id);
@@ -197,63 +204,69 @@ async fn main() -> Result<(), TitoError> {
     println!("- {}: {}", database_tag.name, database_tag.id);
 
     // Create some posts with multiple tags
-    let post1 = storage_backend.transaction(|tx| {
-        let post_model = post_model.clone();
-        let post = Post {
-            id: DBUuid::new_v4().to_string(),
-            title: "Introduction to TiKV".to_string(),
-            content: "TiKV is a distributed key-value storage system...".to_string(),
-            author: "Alice".to_string(),
-            tag_ids: vec![tech_tag.id.clone(), database_tag.id.clone()],
-            tags: Vec::new(),
-        };
-        let post_clone = post.clone();
-        
-        async move {
-            post_model.build(post_clone, &tx).await?;
-            Ok::<_, TitoError>(post)
-        }
-    }).await?;
+    let post1 = tito_db
+        .transaction(|tx| {
+            let post_model = post_model.clone();
+            let post = Post {
+                id: DBUuid::new_v4().to_string(),
+                title: "Introduction to TiKV".to_string(),
+                content: "TiKV is a distributed key-value storage system...".to_string(),
+                author: "Alice".to_string(),
+                tag_ids: vec![tech_tag.id.clone(), database_tag.id.clone()],
+                tags: Vec::new(),
+            };
+            let post_clone = post.clone();
 
-    let post2 = storage_backend.transaction(|tx| {
-        let post_model = post_model.clone();
-        let post = Post {
-            id: DBUuid::new_v4().to_string(),
-            title: "Best cities to visit in Europe".to_string(),
-            content: "Europe offers a diverse range of cities...".to_string(),
-            author: "Bob".to_string(),
-            tag_ids: vec![travel_tag.id.clone()],
-            tags: Vec::new(),
-        };
-        let post_clone = post.clone();
-        
-        async move {
-            post_model.build(post_clone, &tx).await?;
-            Ok::<_, TitoError>(post)
-        }
-    }).await?;
+            async move {
+                post_model.build(post_clone, &tx).await?;
+                Ok::<_, TitoError>(post)
+            }
+        })
+        .await?;
 
-    let post3 = storage_backend.transaction(|tx| {
-        let post_model = post_model.clone();
-        let post = Post {
-            id: DBUuid::new_v4().to_string(),
-            title: "Using Rust with TiKV".to_string(),
-            content: "Here are some examples of using Rust with TiKV...".to_string(),
-            author: "Alice".to_string(),
-            tag_ids: vec![
-                tech_tag.id.clone(),
-                rust_tag.id.clone(),
-                database_tag.id.clone(),
-            ],
-            tags: Vec::new(),
-        };
-        let post_clone = post.clone();
-        
-        async move {
-            post_model.build(post_clone, &tx).await?;
-            Ok::<_, TitoError>(post)
-        }
-    }).await?;
+    let post2 = tito_db
+        .transaction(|tx| {
+            let post_model = post_model.clone();
+            let post = Post {
+                id: DBUuid::new_v4().to_string(),
+                title: "Best cities to visit in Europe".to_string(),
+                content: "Europe offers a diverse range of cities...".to_string(),
+                author: "Bob".to_string(),
+                tag_ids: vec![travel_tag.id.clone()],
+                tags: Vec::new(),
+            };
+            let post_clone = post.clone();
+
+            async move {
+                post_model.build(post_clone, &tx).await?;
+                Ok::<_, TitoError>(post)
+            }
+        })
+        .await?;
+
+    let post3 = tito_db
+        .transaction(|tx| {
+            let post_model = post_model.clone();
+            let post = Post {
+                id: DBUuid::new_v4().to_string(),
+                title: "Using Rust with TiKV".to_string(),
+                content: "Here are some examples of using Rust with TiKV...".to_string(),
+                author: "Alice".to_string(),
+                tag_ids: vec![
+                    tech_tag.id.clone(),
+                    rust_tag.id.clone(),
+                    database_tag.id.clone(),
+                ],
+                tags: Vec::new(),
+            };
+            let post_clone = post.clone();
+
+            async move {
+                post_model.build(post_clone, &tx).await?;
+                Ok::<_, TitoError>(post)
+            }
+        })
+        .await?;
 
     println!("\nCreated posts:");
     println!("1. {} (by {})", post1.title, post1.author);
@@ -261,7 +274,9 @@ async fn main() -> Result<(), TitoError> {
     println!("3. {} (by {})", post3.title, post3.author);
 
     // Get a post with all its tags
-    let post_with_tags = post_model.find_by_id(&post1.id, vec!["tags".to_string()]).await?;
+    let post_with_tags = post_model
+        .find_by_id(&post1.id, vec!["tags".to_string()])
+        .await?;
     println!("\nPost with tags:");
     println!("Title: {}", post_with_tags.title);
     println!("Tags:");
