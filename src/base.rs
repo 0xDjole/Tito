@@ -4,9 +4,9 @@ use crate::{
     error::TitoError,
     query::IndexQueryBuilder,
     types::{
-        DBUuid, ReverseIndex, StorageKvPair, TitoCursor, TitoEmbeddedRelationshipConfig,
-        TitoEngine, TitoEvent, TitoEventType, TitoFindPayload, TitoGenerateEventPayload,
-        TitoModelTrait, TitoPaginated, TitoScanPayload, TitoTransaction,
+        DBUuid, ReverseIndex, TitoCursor, TitoEmbeddedRelationshipConfig, TitoEngine, TitoEvent,
+        TitoEventType, TitoFindPayload, TitoGenerateEventPayload, TitoKvPair, TitoModelTrait,
+        TitoPaginated, TitoScanPayload, TitoTransaction,
     },
     utils::{next_string_lexicographically, previous_string_lexicographically},
 };
@@ -93,7 +93,7 @@ impl<
 
     fn to_results(
         &self,
-        items: impl IntoIterator<Item = StorageKvPair>,
+        items: impl IntoIterator<Item = TitoKvPair>,
     ) -> Result<Vec<(String, Value)>, TitoError> {
         let mut results = vec![];
         for (key_bytes, value_bytes) in items {

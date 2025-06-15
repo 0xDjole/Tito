@@ -1,7 +1,5 @@
 use crate::error::TitoError;
-use crate::types::{
-    DBUuid, StorageKvPair, StorageValue, TitoConfigs, TitoEngine, TitoTransaction,
-};
+use crate::types::{DBUuid, TitoConfigs, TitoEngine, TitoKvPair, TitoTransaction, TitoValue};
 use async_trait::async_trait;
 use futures::lock::Mutex;
 use std::collections::HashMap;
@@ -17,7 +15,6 @@ pub struct TiKVBackend {
     pub configs: TitoConfigs,
     pub active_transactions: Arc<Mutex<HashMap<String, TiKVTransaction>>>,
 }
-
 
 #[async_trait]
 impl TitoEngine for TiKVBackend {
@@ -103,10 +100,7 @@ pub struct TiKVTransaction {
 impl TitoTransaction for TiKVTransaction {
     type Error = TitoError;
 
-    async fn get<K: AsRef<[u8]> + Send>(
-        &self,
-        key: K,
-    ) -> Result<Option<StorageValue>, Self::Error> {
+    async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<TitoValue>, Self::Error> {
         let tikv_key: tikv_client::Key = key.as_ref().to_vec().into();
 
         self.inner
@@ -120,7 +114,7 @@ impl TitoTransaction for TiKVTransaction {
     async fn get_for_update<K: AsRef<[u8]> + Send>(
         &self,
         key: K,
-    ) -> Result<Option<StorageValue>, Self::Error> {
+    ) -> Result<Option<TitoValue>, Self::Error> {
         let tikv_key: tikv_client::Key = key.as_ref().to_vec().into();
 
         self.inner
@@ -162,7 +156,7 @@ impl TitoTransaction for TiKVTransaction {
         &self,
         range: Range<K>,
         limit: u32,
-    ) -> Result<Vec<StorageKvPair>, Self::Error> {
+    ) -> Result<Vec<TitoKvPair>, Self::Error> {
         let start = range.start.as_ref().to_vec();
         let end = range.end.as_ref().to_vec();
         let bound_range: tikv_client::BoundRange = (start..end).into();
@@ -182,7 +176,7 @@ impl TitoTransaction for TiKVTransaction {
         &self,
         range: Range<K>,
         limit: u32,
-    ) -> Result<Vec<StorageKvPair>, Self::Error> {
+    ) -> Result<Vec<TitoKvPair>, Self::Error> {
         let start = range.start.as_ref().to_vec();
         let end = range.end.as_ref().to_vec();
         let bound_range: tikv_client::BoundRange = (start..end).into();
@@ -201,7 +195,7 @@ impl TitoTransaction for TiKVTransaction {
     async fn batch_get<K: AsRef<[u8]> + Send>(
         &self,
         keys: Vec<K>,
-    ) -> Result<Vec<StorageKvPair>, Self::Error> {
+    ) -> Result<Vec<TitoKvPair>, Self::Error> {
         let tikv_keys: Vec<tikv_client::Key> =
             keys.iter().map(|k| k.as_ref().to_vec().into()).collect();
 
@@ -219,7 +213,7 @@ impl TitoTransaction for TiKVTransaction {
     async fn batch_get_for_update<K: AsRef<[u8]> + Send>(
         &self,
         keys: Vec<K>,
-    ) -> Result<Vec<StorageKvPair>, Self::Error> {
+    ) -> Result<Vec<TitoKvPair>, Self::Error> {
         let tikv_keys: Vec<tikv_client::Key> =
             keys.iter().map(|k| k.as_ref().to_vec().into()).collect();
 
@@ -266,11 +260,14 @@ pub struct TiKV;
 impl TiKV {
     /// Connect to TiKV with PD endpoints
     pub async fn connect<S: AsRef<str>>(endpoints: Vec<S>) -> Result<TiKVBackend, TitoError> {
-        let endpoint_strings: Vec<String> = endpoints.iter().map(|s| s.as_ref().to_string()).collect();
-        let client = TransactionClient::new(endpoint_strings).await.map_err(|e| {
-            TitoError::ConnectionFailed(format!("Failed to connect to TiKV: {}", e))
-        })?;
-        
+        let endpoint_strings: Vec<String> =
+            endpoints.iter().map(|s| s.as_ref().to_string()).collect();
+        let client = TransactionClient::new(endpoint_strings)
+            .await
+            .map_err(|e| {
+                TitoError::ConnectionFailed(format!("Failed to connect to TiKV: {}", e))
+            })?;
+
         Ok(TiKVBackend {
             client: Arc::new(client),
             configs: TitoConfigs {

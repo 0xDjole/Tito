@@ -13,11 +13,10 @@ pub struct TitoConfigs {
     pub is_read_only: Arc<AtomicBool>,
 }
 
-
-pub type StorageKey = Vec<u8>;
-pub type StorageValue = Vec<u8>;
-pub type StorageKvPair = (StorageKey, StorageValue);
-pub type StorageRange = Range<StorageKey>;
+pub type TitoKey = Vec<u8>;
+pub type TitoValue = Vec<u8>;
+pub type TitoKvPair = (TitoKey, TitoValue);
+pub type TitoRange = Range<TitoKey>;
 
 #[async_trait]
 pub trait TitoEngine: Send + Sync + Clone {
@@ -42,12 +41,11 @@ pub trait TitoEngine: Send + Sync + Clone {
 pub trait TitoTransaction: Send + Sync {
     type Error: std::error::Error + Send + Sync + 'static;
 
-    async fn get<K: AsRef<[u8]> + Send>(&self, key: K)
-        -> Result<Option<StorageValue>, Self::Error>;
+    async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<TitoValue>, Self::Error>;
     async fn get_for_update<K: AsRef<[u8]> + Send>(
         &self,
         key: K,
-    ) -> Result<Option<StorageValue>, Self::Error>;
+    ) -> Result<Option<TitoValue>, Self::Error>;
     async fn put<K: AsRef<[u8]> + Send, V: AsRef<[u8]> + Send>(
         &self,
         key: K,
@@ -58,29 +56,27 @@ pub trait TitoTransaction: Send + Sync {
         &self,
         range: Range<K>,
         limit: u32,
-    ) -> Result<Vec<StorageKvPair>, Self::Error>;
+    ) -> Result<Vec<TitoKvPair>, Self::Error>;
 
     async fn scan_reverse<K: AsRef<[u8]> + Send>(
         &self,
         range: Range<K>,
         limit: u32,
-    ) -> Result<Vec<StorageKvPair>, Self::Error>;
+    ) -> Result<Vec<TitoKvPair>, Self::Error>;
 
     async fn batch_get<K: AsRef<[u8]> + Send>(
         &self,
         keys: Vec<K>,
-    ) -> Result<Vec<StorageKvPair>, Self::Error>;
+    ) -> Result<Vec<TitoKvPair>, Self::Error>;
 
     async fn batch_get_for_update<K: AsRef<[u8]> + Send>(
         &self,
         keys: Vec<K>,
-    ) -> Result<Vec<StorageKvPair>, Self::Error>;
+    ) -> Result<Vec<TitoKvPair>, Self::Error>;
 
     async fn commit(self) -> Result<(), Self::Error>;
     async fn rollback(self) -> Result<(), Self::Error>;
 }
-
-
 
 pub struct TitoLockItem {
     pub key: String,
