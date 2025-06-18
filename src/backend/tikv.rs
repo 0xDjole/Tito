@@ -81,20 +81,20 @@ impl TitoEngine for TiKVBackend {
         let mut active_transactions = self.active_transactions.lock().await;
         let transactions: Vec<_> = active_transactions.drain().collect();
         drop(active_transactions);
-        
-        // Try to rollback each transaction, but don't fail if it's already being used
+
+        // Wait for and rollback each transaction - we CANNOT skip them
+        // because skipping means they get dropped without commit/rollback
         for (tx_id, tx) in transactions {
-            // Check if this transaction Arc only has one reference (from our HashMap)
-            match Arc::try_unwrap(tx.inner) {
-                Ok(mutex_tx) => {
-                    // We have exclusive access, safe to rollback
-                    if let Err(e) = mutex_tx.into_inner().rollback().await {
-                        eprintln!("Warning: Failed to rollback transaction {}: {:?}", tx_id, e);
-                    }
-                },
-                Err(_) => {
-                    // Transaction is still being used elsewhere, let it finish naturally
-                    eprintln!("Warning: Transaction {} still in use during cleanup", tx_id);
+            eprintln!("Waiting for transaction {} to become available for cleanup...", tx_id);
+            
+            // Use .lock().await to WAIT for the transaction to become available
+            // This blocks until the transaction is no longer being used
+            match tx.inner.lock().await.rollback().await {
+                Ok(_) => {
+                    eprintln!("Successfully rolled back transaction {} during cleanup", tx_id);
+                }
+                Err(e) => {
+                    eprintln!("Warning: Failed to rollback transaction {}: {:?}", tx_id, e);
                 }
             }
         }
