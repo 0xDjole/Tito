@@ -50,40 +50,52 @@ impl TitoEngine for TiKVBackend {
             })
             .map_err(E::from)?;
 
-        let mut active_transactions = self.active_transactions.lock().await;
-        active_transactions.insert(tx.id.clone(), tx.clone());
-        drop(active_transactions);
+        // Store in active transactions for cleanup
+        {
+            let mut active_transactions = self.active_transactions.lock().await;
+            active_transactions.insert(tx.id.clone(), tx.clone());
+        }
 
         let result = f(tx.clone()).await;
 
-        let mut active_transactions = self.active_transactions.lock().await;
-        let tx = active_transactions.remove(&tx.id).unwrap_or(tx);
-        drop(active_transactions);
-
-        match &result {
-            Ok(_) => {
-                if let Err(e) = tx.commit().await {
-                    eprintln!("Warning: Transaction commit failed: {:?}", e);
-                }
-            }
-            Err(_) => {
-                if let Err(e) = tx.rollback().await {
-                    eprintln!("Warning: Transaction rollback failed: {:?}", e);
-                }
-            }
+        // Remove from active transactions and get the transaction
+        let tx = {
+            let mut active_transactions = self.active_transactions.lock().await;
+            active_transactions.remove(&tx.id).unwrap_or(tx)
         };
+
+        // Always ensure transaction is properly finalized
+        let finalize_result = match &result {
+            Ok(_) => tx.commit().await,
+            Err(_) => tx.rollback().await,
+        };
+
+        if let Err(e) = finalize_result {
+            eprintln!("Warning: Transaction finalization failed: {:?}", e);
+        }
 
         result
     }
 
     async fn clear_active_transactions(&self) -> Result<(), TitoError> {
         let mut active_transactions = self.active_transactions.lock().await;
-        for (_, mut tx) in active_transactions.drain() {
-            if let Err(e) = tx.rollback().await {
-                eprintln!(
-                    "Warning: Failed to rollback transaction during cleanup: {:?}",
-                    e
-                );
+        let transactions: Vec<_> = active_transactions.drain().collect();
+        drop(active_transactions);
+        
+        // Try to rollback each transaction, but don't fail if it's already being used
+        for (tx_id, tx) in transactions {
+            // Check if this transaction Arc only has one reference (from our HashMap)
+            match Arc::try_unwrap(tx.inner) {
+                Ok(mutex_tx) => {
+                    // We have exclusive access, safe to rollback
+                    if let Err(e) = mutex_tx.into_inner().rollback().await {
+                        eprintln!("Warning: Failed to rollback transaction {}: {:?}", tx_id, e);
+                    }
+                },
+                Err(_) => {
+                    // Transaction is still being used elsewhere, let it finish naturally
+                    eprintln!("Warning: Transaction {} still in use during cleanup", tx_id);
+                }
             }
         }
         Ok(())
@@ -229,11 +241,9 @@ impl TitoTransaction for TiKVTransaction {
     }
 
     async fn commit(self) -> Result<(), Self::Error> {
-        Arc::try_unwrap(self.inner)
-            .map_err(|_| {
-                TitoError::TransactionFailed("Transaction still has references".to_string())
-            })?
-            .into_inner()
+        self.inner
+            .lock()
+            .await
             .commit()
             .await
             .map(|_| ())
@@ -241,16 +251,9 @@ impl TitoTransaction for TiKVTransaction {
     }
 
     async fn rollback(self) -> Result<(), Self::Error> {
-        Arc::try_unwrap(self.inner)
-            .map_err(|_| {
-                TitoError::TransactionFailed("Transaction still has references".to_string())
-            })?
-            .into_inner()
-            .rollback()
-            .await
-            .map_err(|e| {
-                TitoError::TransactionFailed(format!("Transaction rollback failed: {}", e))
-            })
+        self.inner.lock().await.rollback().await.map_err(|e| {
+            TitoError::TransactionFailed(format!("Transaction rollback failed: {}", e))
+        })
     }
 }
 
