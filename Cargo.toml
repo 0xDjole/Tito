@@ -1,6 +1,6 @@
 [package]
 name = "tito"
-version = "0.1.12"
+version = "0.1.16"
 edition = "2021"
 description = "A flexible database layer with powerful indexing strategies and relationship modeling, supporting multiple backends"
 license = "Apache-2.0"
