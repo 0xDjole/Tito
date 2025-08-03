@@ -6,7 +6,7 @@ use crate::{
     types::{
         DBUuid, ReverseIndex, TitoCursor, TitoEmbeddedRelationshipConfig, TitoEngine, TitoEvent,
         TitoEventType, TitoFindPayload, TitoGenerateEventPayload, TitoKvPair, TitoModelTrait,
-        TitoPaginated, TitoScanPayload, TitoTransaction,
+        TitoOptions, TitoPaginated, TitoScanPayload, TitoTransaction,
     },
     utils::{next_string_lexicographically, previous_string_lexicographically},
 };
@@ -347,14 +347,14 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     where
         T: serde::de::DeserializeOwned,
     {
-        self.build_with_options(payload, Some(String::from("CREATE")), tx)
+        self.build_with_options(payload, TitoOptions::with_event("CREATE"), tx)
             .await
     }
 
     pub async fn build_with_options(
         &self,
         payload: T,
-        event_action: Option<String>,
+        options: TitoOptions,
         tx: &E::Transaction,
     ) -> Result<T, TitoError>
     where
@@ -388,8 +388,8 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         self.generate_event(
             TitoGenerateEventPayload {
                 key: id.clone(),
-                action: event_action,
-                scheduled_for: None,
+                action: options.event_action,
+                scheduled_for: options.event_scheduled_at,
             },
             tx,
         )
@@ -678,7 +678,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     where
         T: serde::de::DeserializeOwned,
     {
-        self.update_with_options(payload, true, tx).await
+        self.update_with_options(payload, TitoOptions::with_event("UPDATE"), tx).await
     }
 
     pub fn get_last_id(&self, key: String) -> Option<String> {
@@ -689,7 +689,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     pub async fn update_with_options(
         &self,
         payload: T,
-        trigger_event: bool,
+        options: TitoOptions,
         tx: &E::Transaction,
     ) -> Result<bool, TitoError>
     where
@@ -697,11 +697,9 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     {
         let raw_id = payload.get_id();
 
-        let trigger_event = trigger_event.then_some(String::from("UPDATE"));
+        let deleted = self.delete_by_id_with_options(&raw_id, TitoOptions::default(), tx).await;
 
-        let deleted = self.delete_by_id_with_options(&raw_id, false, tx).await;
-
-        self.build_with_options(payload, trigger_event, tx).await?;
+        self.build_with_options(payload, options, tx).await?;
 
         Ok(true)
     }
@@ -771,7 +769,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     pub async fn delete_by_id_with_options(
         &self,
         raw_id: &str,
-        trigger_event: bool,
+        options: TitoOptions,
         tx: &E::Transaction,
     ) -> Result<bool, TitoError> {
         let id = format!("{}:{}", self.get_table(), raw_id);
@@ -791,8 +789,8 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         self.generate_event(
             TitoGenerateEventPayload {
                 key: id.to_string(),
-                action: trigger_event.then(|| String::from("DELETE")),
-                scheduled_for: None,
+                action: options.event_action,
+                scheduled_for: options.event_scheduled_at,
             },
             tx,
         )
@@ -802,7 +800,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     }
 
     pub async fn delete_by_id(&self, raw_id: &str, tx: &E::Transaction) -> Result<bool, TitoError> {
-        self.delete_by_id_with_options(raw_id, true, tx).await
+        self.delete_by_id_with_options(raw_id, TitoOptions::with_event("DELETE"), tx).await
     }
 
     pub async fn find(&self, payload: TitoFindPayload) -> Result<TitoPaginated<T>, TitoError>
@@ -861,7 +859,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                             TitoError::TransactionFailed(String::from("Failed migration, model"))
                         })?;
 
-                    self.update_with_options(model_instance, false, &tx).await?;
+                    self.update_with_options(model_instance, TitoOptions::default(), &tx).await?;
 
                     cursor = next_string_lexicographically(key);
                 }
@@ -907,7 +905,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                                 ))
                             })?;
 
-                        self.update_with_options(model_instance, false, &tx).await?;
+                        self.update_with_options(model_instance, TitoOptions::default(), &tx).await?;
                     }
 
                     cursor = next_string_lexicographically(key);

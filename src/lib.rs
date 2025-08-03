@@ -23,6 +23,6 @@ pub mod index;
 pub mod relationship;
 
 pub use error::TitoError;
-pub use types::TitoEvent;
+pub use types::{TitoEvent, TitoOptions};
 
 pub mod backup;

@@ -3,7 +3,7 @@ use crate::{
     key_encoder::safe_encode,
     types::{
         TitoEngine, TitoFindByIndexPayload, TitoFindOneByIndexPayload, TitoIndexBlockType,
-        TitoModelTrait, TitoPaginated, TitoScanPayload, TitoTransaction,
+        TitoModelTrait, TitoOptions, TitoPaginated, TitoScanPayload, TitoTransaction,
     },
     utils::next_string_lexicographically,
     TitoModel,
@@ -365,7 +365,7 @@ impl<
                             TitoError::TransactionFailed(String::from("Failed migration, model"))
                         })?;
 
-                    self.update_with_options(model_instance, false, &tx).await?;
+                    self.update_with_options(model_instance, TitoOptions::default(), &tx).await?;
 
                     cursor = next_string_lexicographically(key);
                 }

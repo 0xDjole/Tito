@@ -295,3 +295,25 @@ pub enum TitoEventType {
     Queue,
     Audit,
 }
+
+#[derive(Debug, Clone, Default)]
+pub struct TitoOptions {
+    pub event_action: Option<String>,
+    pub event_scheduled_at: Option<i64>,
+}
+
+impl TitoOptions {
+    pub fn with_event(action: &str) -> Self {
+        Self {
+            event_action: Some(action.to_string()),
+            event_scheduled_at: None,
+        }
+    }
+    
+    pub fn with_scheduled_event(action: &str, timestamp: i64) -> Self {
+        Self {
+            event_action: Some(action.to_string()),
+            event_scheduled_at: Some(timestamp),
+        }
+    }
+}
