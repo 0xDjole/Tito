@@ -390,6 +390,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                 key: id.clone(),
                 action: options.event_action,
                 scheduled_for: options.event_scheduled_at,
+                metadata: options.event_metadata,
             },
             tx,
         )
@@ -447,6 +448,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                     scheduled_for,
                     created_at: created_at,
                     updated_at: created_at,
+                    metadata: payload.metadata.clone(),
                 };
 
                 self.put(key.clone(), &event, tx).await?;
@@ -791,6 +793,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                 key: id.to_string(),
                 action: options.event_action,
                 scheduled_for: options.event_scheduled_at,
+                metadata: options.event_metadata,
             },
             tx,
         )

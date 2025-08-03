@@ -104,6 +104,7 @@ pub struct TitoGenerateEventPayload {
     pub key: String,
     pub action: Option<String>,
     pub scheduled_for: Option<i64>,
+    pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +172,7 @@ pub struct TitoEvent {
     pub scheduled_for: i64,
     pub created_at: i64,
     pub updated_at: i64,
+    pub metadata: Option<serde_json::Value>,
 }
 
 impl TitoEvent {
@@ -300,6 +302,7 @@ pub enum TitoEventType {
 pub struct TitoOptions {
     pub event_action: Option<String>,
     pub event_scheduled_at: Option<i64>,
+    pub event_metadata: Option<serde_json::Value>,
 }
 
 impl TitoOptions {
@@ -307,6 +310,7 @@ impl TitoOptions {
         Self {
             event_action: Some(action.to_string()),
             event_scheduled_at: None,
+            event_metadata: None,
         }
     }
     
@@ -314,6 +318,23 @@ impl TitoOptions {
         Self {
             event_action: Some(action.to_string()),
             event_scheduled_at: Some(timestamp),
+            event_metadata: None,
+        }
+    }
+
+    pub fn with_event_metadata(action: &str, metadata: serde_json::Value) -> Self {
+        Self {
+            event_action: Some(action.to_string()),
+            event_scheduled_at: None,
+            event_metadata: Some(metadata),
+        }
+    }
+
+    pub fn with_scheduled_event_metadata(action: &str, timestamp: i64, metadata: serde_json::Value) -> Self {
+        Self {
+            event_action: Some(action.to_string()),
+            event_scheduled_at: Some(timestamp),
+            event_metadata: Some(metadata),
         }
     }
 }
