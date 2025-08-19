@@ -104,7 +104,7 @@ pub struct TitoGenerateEventPayload {
     pub key: String,
     pub action: Option<String>,
     pub scheduled_for: Option<i64>,
-    pub metadata: Option<serde_json::Value>,
+    pub metadata: serde_json::Value,
 }
 
 #[derive(Debug, Clone)]
@@ -172,7 +172,7 @@ pub struct TitoEvent {
     pub scheduled_for: i64,
     pub created_at: i64,
     pub updated_at: i64,
-    pub metadata: Option<serde_json::Value>,
+    pub metadata: serde_json::Value,
 }
 
 impl TitoEvent {

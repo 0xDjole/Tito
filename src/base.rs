@@ -347,8 +347,9 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     where
         T: serde::de::DeserializeOwned,
     {
-        self.build_with_options(payload, TitoOptions::with_event("CREATE"), tx)
-            .await
+        let metadata = serde_json::to_value(&payload).unwrap_or_default();
+        let options = TitoOptions::with_event_metadata("CREATE", metadata);
+        self.build_with_options(payload, options, tx).await
     }
 
     pub async fn build_with_options(
@@ -385,12 +386,23 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
         self.put(reverse_key.clone(), index_json_key, tx).await?;
 
+        let mut metadata = serde_json::to_value(&payload).unwrap_or_default();
+        if let Some(custom_metadata) = options.event_metadata {
+            if let (Some(base_obj), Some(custom_obj)) = (metadata.as_object_mut(), custom_metadata.as_object()) {
+                for (key, value) in custom_obj {
+                    base_obj.insert(key.clone(), value.clone());
+                }
+            } else if custom_metadata.is_object() {
+                metadata = custom_metadata;
+            }
+        }
+
         self.generate_event(
             TitoGenerateEventPayload {
                 key: id.clone(),
                 action: options.event_action,
                 scheduled_for: options.event_scheduled_at,
-                metadata: options.event_metadata,
+                metadata,
             },
             tx,
         )
@@ -680,7 +692,9 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     where
         T: serde::de::DeserializeOwned,
     {
-        self.update_with_options(payload, TitoOptions::with_event("UPDATE"), tx).await
+        let metadata = serde_json::to_value(&payload).unwrap_or_default();
+        let options = TitoOptions::with_event_metadata("UPDATE", metadata);
+        self.update_with_options(payload, options, tx).await
     }
 
     pub fn get_last_id(&self, key: String) -> Option<String> {
@@ -777,6 +791,26 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         let id = format!("{}:{}", self.get_table(), raw_id);
         let reverse_index_key = format!("reverse-index:{}", id);
 
+        let mut metadata = match tx.get(&id).await {
+            Ok(Some(entity_data)) => {
+                match serde_json::from_slice::<serde_json::Value>(&entity_data) {
+                    Ok(entity_json) => entity_json,
+                    Err(_) => serde_json::json!({}),
+                }
+            },
+            _ => serde_json::json!({})
+        };
+
+        if let Some(custom_metadata) = options.event_metadata {
+            if let (Some(base_obj), Some(custom_obj)) = (metadata.as_object_mut(), custom_metadata.as_object()) {
+                for (key, value) in custom_obj {
+                    base_obj.insert(key.clone(), value.clone());
+                }
+            } else if custom_metadata.is_object() {
+                metadata = custom_metadata;
+            }
+        }
+
         let reverse_index = self.get_reverse_index(&reverse_index_key, tx).await?;
         let mut keys = reverse_index.value;
 
@@ -793,7 +827,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                 key: id.to_string(),
                 action: options.event_action,
                 scheduled_for: options.event_scheduled_at,
-                metadata: options.event_metadata,
+                metadata,
             },
             tx,
         )
