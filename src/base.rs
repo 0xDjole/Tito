@@ -163,11 +163,9 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         let mut delay = 10;
         let max_retries = 10;
 
-        // Serialize the payload to serde_json::Value
         let mut value = serde_json::to_value(&payload)
             .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
 
-        // Always set created_at and updated_at timestamps, overriding any passed values
         if let serde_json::Value::Object(ref mut map) = value {
             let now = Utc::now().timestamp();
             map.insert("created_at".to_string(), serde_json::json!(now));
