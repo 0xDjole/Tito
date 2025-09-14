@@ -167,9 +167,10 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         let mut value = serde_json::to_value(&payload)
             .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
 
-        // Add the updated_at timestamp only if the value is an object
+        // Always set created_at and updated_at timestamps, overriding any passed values
         if let serde_json::Value::Object(ref mut map) = value {
             let now = Utc::now().timestamp();
+            map.insert("created_at".to_string(), serde_json::json!(now));
             map.insert("updated_at".to_string(), serde_json::json!(now));
         }
 
