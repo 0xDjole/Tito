@@ -168,7 +168,11 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
         if let serde_json::Value::Object(ref mut map) = value {
             let now = Utc::now().timestamp();
-            map.insert("created_at".to_string(), serde_json::json!(now));
+
+            let existing = tx.get(&key).await;
+            if existing.is_err() || existing.unwrap().is_none() {
+                map.insert("created_at".to_string(), serde_json::json!(now));
+            }
             map.insert("updated_at".to_string(), serde_json::json!(now));
         }
 
