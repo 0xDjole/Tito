@@ -298,11 +298,30 @@ pub enum TitoEventType {
     Audit,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum TitoOperationType {
+    Insert,
+    Update,
+    Delete,
+}
+
+#[derive(Debug, Clone)]
 pub struct TitoOptions {
     pub event_action: Option<String>,
     pub event_scheduled_at: Option<i64>,
     pub event_metadata: Option<serde_json::Value>,
+    pub operation_type: TitoOperationType,
+}
+
+impl Default for TitoOptions {
+    fn default() -> Self {
+        Self {
+            event_action: None,
+            event_scheduled_at: None,
+            event_metadata: None,
+            operation_type: TitoOperationType::Update,
+        }
+    }
 }
 
 impl TitoOptions {
@@ -311,6 +330,7 @@ impl TitoOptions {
             event_action: Some(action.to_string()),
             event_scheduled_at: None,
             event_metadata: None,
+            operation_type: TitoOperationType::Update,
         }
     }
     
@@ -319,6 +339,7 @@ impl TitoOptions {
             event_action: Some(action.to_string()),
             event_scheduled_at: Some(timestamp),
             event_metadata: None,
+            operation_type: TitoOperationType::Update,
         }
     }
 
@@ -327,6 +348,7 @@ impl TitoOptions {
             event_action: Some(action.to_string()),
             event_scheduled_at: None,
             event_metadata: Some(metadata),
+            operation_type: TitoOperationType::Update,
         }
     }
 
@@ -335,6 +357,34 @@ impl TitoOptions {
             event_action: Some(action.to_string()),
             event_scheduled_at: Some(timestamp),
             event_metadata: Some(metadata),
+            operation_type: TitoOperationType::Update,
+        }
+    }
+
+    pub fn insert_with_metadata(metadata: serde_json::Value) -> Self {
+        Self {
+            event_action: Some("INSERT".to_string()),
+            event_scheduled_at: None,
+            event_metadata: Some(metadata),
+            operation_type: TitoOperationType::Insert,
+        }
+    }
+
+    pub fn update_with_metadata(metadata: serde_json::Value) -> Self {
+        Self {
+            event_action: Some("UPDATE".to_string()),
+            event_scheduled_at: None,
+            event_metadata: Some(metadata),
+            operation_type: TitoOperationType::Update,
+        }
+    }
+
+    pub fn delete_with_metadata(metadata: serde_json::Value) -> Self {
+        Self {
+            event_action: Some("DELETE".to_string()),
+            event_scheduled_at: None,
+            event_metadata: Some(metadata),
+            operation_type: TitoOperationType::Delete,
         }
     }
 }
