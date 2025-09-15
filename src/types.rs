@@ -387,4 +387,14 @@ impl TitoOptions {
             operation_type: TitoOperationType::Delete,
         }
     }
+
+    pub fn delete_on_update() -> Self {
+        Self {
+            event_action: None,
+            event_scheduled_at: None,
+            event_metadata: None,
+            operation_type: TitoOperationType::Delete,
+        }
+    }
+
 }

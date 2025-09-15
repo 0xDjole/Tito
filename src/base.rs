@@ -716,8 +716,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     {
         let raw_id = payload.get_id();
 
-        let metadata = serde_json::json!({});
-        let deleted = self.delete_by_id_with_options(&raw_id, TitoOptions::delete_with_metadata(metadata), tx).await;
+        let deleted = self.delete_by_id_with_options(&raw_id, TitoOptions::delete_on_update(), tx).await;
 
         self.build_with_options(payload, options, tx).await?;
 
