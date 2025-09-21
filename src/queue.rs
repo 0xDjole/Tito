@@ -122,10 +122,10 @@ impl<E: TitoEngine> TitoQueue<E> {
                         let new_key = job_id.replace("PROGRESS", "PENDING");
 
                         let mut parts: Vec<&str> = new_key.split(':').collect();
-                        if parts.len() >= 4 {
-                            // Replace the timestamp (third from last element) with the new timestamp
+                        if parts.len() >= 5 {
+                            // Replace the timestamp (fourth element) with the new timestamp, keep status intact
                             let schedule_part = job.scheduled_for.to_string();
-                            parts[2] = &schedule_part;
+                            parts[3] = &schedule_part;
                             let new_key = parts.join(":");
 
                             job.key = new_key.clone();
