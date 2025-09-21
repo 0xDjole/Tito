@@ -365,7 +365,8 @@ impl<
                             TitoError::TransactionFailed(String::from("Failed migration, model"))
                         })?;
 
-                    self.update_with_options(model_instance, TitoOptions::default(), &tx).await?;
+                    self.update_with_options(model_instance, TitoOptions::default(), &tx)
+                        .await?;
 
                     cursor = next_string_lexicographically(key);
                 }

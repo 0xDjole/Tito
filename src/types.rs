@@ -1,21 +1,36 @@
 use crate::{TitoError, TitoModel};
 use async_trait::async_trait;
+use chrono::Utc;
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde::Serialize;
+use std::fmt;
 use std::future::Future;
 use std::ops::Range;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use uuid::Uuid;
-use serde::de::DeserializeOwned;
 
 #[derive(Clone)]
 pub struct TitoConfigs {
     pub is_read_only: Arc<AtomicBool>,
 }
 
-pub trait TitoModelConstraints: Default + Clone + Serialize + DeserializeOwned + Unpin + std::marker::Send + Sync + TitoModelTrait {}
-impl<T> TitoModelConstraints for T where T: Default + Clone + Serialize + DeserializeOwned + Unpin + std::marker::Send + Sync + TitoModelTrait {}
+pub trait TitoModelConstraints:
+    Default + Clone + Serialize + DeserializeOwned + Unpin + std::marker::Send + Sync + TitoModelTrait
+{
+}
+impl<T> TitoModelConstraints for T where
+    T: Default
+        + Clone
+        + Serialize
+        + DeserializeOwned
+        + Unpin
+        + std::marker::Send
+        + Sync
+        + TitoModelTrait
+{
+}
 
 pub type TitoKey = Vec<u8>;
 pub type TitoValue = Vec<u8>;
@@ -102,8 +117,8 @@ pub struct TitoUtilsConnectInput {
 #[derive(Debug, Clone)]
 pub struct TitoGenerateEventPayload {
     pub key: String,
-    pub action: Option<String>,
-    pub scheduled_for: Option<i64>,
+    pub operation: TitoOperation,
+    pub event_at: Option<i64>,
     pub metadata: serde_json::Value,
 }
 
@@ -299,102 +314,100 @@ pub enum TitoEventType {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum TitoOperationType {
+pub enum TitoOperation {
     Insert,
     Update,
     Delete,
 }
 
+impl fmt::Display for TitoOperation {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            TitoOperation::Insert => write!(f, "INSERT"),
+            TitoOperation::Update => write!(f, "UPDATE"),
+            TitoOperation::Delete => write!(f, "DELETE"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TitoOptions {
-    pub event_action: Option<String>,
-    pub event_scheduled_at: Option<i64>,
+    pub event_at: Option<i64>,
     pub event_metadata: Option<serde_json::Value>,
-    pub operation_type: TitoOperationType,
+    pub operation: TitoOperation,
 }
 
 impl Default for TitoOptions {
     fn default() -> Self {
         Self {
-            event_action: None,
-            event_scheduled_at: None,
+            event_at: Some(Utc::now().timestamp()),
             event_metadata: None,
-            operation_type: TitoOperationType::Update,
+            operation: TitoOperation::Update,
         }
     }
 }
 
 impl TitoOptions {
-    pub fn with_event(action: &str) -> Self {
+    pub fn with_event() -> Self {
         Self {
-            event_action: Some(action.to_string()),
-            event_scheduled_at: None,
+            event_at: Some(Utc::now().timestamp()),
             event_metadata: None,
-            operation_type: TitoOperationType::Update,
+            operation: TitoOperation::Update,
         }
     }
-    
-    pub fn with_scheduled_event(action: &str, timestamp: i64) -> Self {
+    pub fn with_scheduled_event(timestamp: i64) -> Self {
         Self {
-            event_action: Some(action.to_string()),
-            event_scheduled_at: Some(timestamp),
+            event_at: Some(timestamp),
             event_metadata: None,
-            operation_type: TitoOperationType::Update,
+            operation: TitoOperation::Update,
         }
     }
 
-    pub fn with_event_metadata(action: &str, metadata: serde_json::Value) -> Self {
+    pub fn with_event_metadata(metadata: serde_json::Value) -> Self {
         Self {
-            event_action: Some(action.to_string()),
-            event_scheduled_at: None,
+            event_at: Some(Utc::now().timestamp()),
             event_metadata: Some(metadata),
-            operation_type: TitoOperationType::Update,
+            operation: TitoOperation::Update,
         }
     }
 
-    pub fn with_scheduled_event_metadata(action: &str, timestamp: i64, metadata: serde_json::Value) -> Self {
+    pub fn with_scheduled_event_metadata(timestamp: i64, metadata: serde_json::Value) -> Self {
         Self {
-            event_action: Some(action.to_string()),
-            event_scheduled_at: Some(timestamp),
+            event_at: Some(timestamp),
             event_metadata: Some(metadata),
-            operation_type: TitoOperationType::Update,
+            operation: TitoOperation::Update,
         }
     }
 
     pub fn insert_with_metadata(metadata: serde_json::Value) -> Self {
         Self {
-            event_action: Some("INSERT".to_string()),
-            event_scheduled_at: None,
+            event_at: Some(Utc::now().timestamp()),
             event_metadata: Some(metadata),
-            operation_type: TitoOperationType::Insert,
+            operation: TitoOperation::Insert,
         }
     }
 
     pub fn update_with_metadata(metadata: serde_json::Value) -> Self {
         Self {
-            event_action: Some("UPDATE".to_string()),
-            event_scheduled_at: None,
+            event_at: Some(Utc::now().timestamp()),
             event_metadata: Some(metadata),
-            operation_type: TitoOperationType::Update,
+            operation: TitoOperation::Update,
         }
     }
 
     pub fn delete_with_metadata(metadata: serde_json::Value) -> Self {
         Self {
-            event_action: Some("DELETE".to_string()),
-            event_scheduled_at: None,
+            event_at: Some(Utc::now().timestamp()),
             event_metadata: Some(metadata),
-            operation_type: TitoOperationType::Delete,
+            operation: TitoOperation::Delete,
         }
     }
 
     pub fn delete_on_update() -> Self {
         Self {
-            event_action: None,
-            event_scheduled_at: None,
+            event_at: Some(Utc::now().timestamp()),
             event_metadata: None,
-            operation_type: TitoOperationType::Delete,
+            operation: TitoOperation::Delete,
         }
     }
-
 }

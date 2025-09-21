@@ -391,7 +391,9 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
         let mut metadata = serde_json::to_value(&payload).unwrap_or_default();
         if let Some(custom_metadata) = options.event_metadata {
-            if let (Some(base_obj), Some(custom_obj)) = (metadata.as_object_mut(), custom_metadata.as_object()) {
+            if let (Some(base_obj), Some(custom_obj)) =
+                (metadata.as_object_mut(), custom_metadata.as_object())
+            {
                 for (key, value) in custom_obj {
                     base_obj.insert(key.clone(), value.clone());
                 }
@@ -403,8 +405,8 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         self.generate_event(
             TitoGenerateEventPayload {
                 key: id.clone(),
-                action: options.event_action,
-                scheduled_for: options.event_scheduled_at,
+                operation: options.operation,
+                event_at: options.event_at,
                 metadata,
             },
             tx,
@@ -419,16 +421,12 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         payload: TitoGenerateEventPayload,
         tx: &E::Transaction,
     ) -> Result<bool, TitoError> {
-        if let Some(action) = payload.action.clone() {
+        if let Some(event_at) = payload.event_at.clone() {
             for event_config in self.model.get_events().iter() {
                 self.lock_keys(vec![payload.key.clone()], tx).await?;
                 let created_at = Utc::now().timestamp();
 
-                let scheduled_for = if let Some(scheduled_for) = payload.scheduled_for {
-                    scheduled_for
-                } else {
-                    created_at
-                };
+                let scheduled_for = event_at;
 
                 let message = event_config.name.to_string();
 
@@ -455,7 +453,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                     id: uuid_str,
                     key: key.clone(),
                     entity: payload.key.clone(),
-                    action: action.clone(),
+                    action: payload.operation.to_string(),
                     status,
                     message,
                     retries: 0,
@@ -716,7 +714,9 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     {
         let raw_id = payload.get_id();
 
-        let deleted = self.delete_by_id_with_options(&raw_id, TitoOptions::delete_on_update(), tx).await;
+        let deleted = self
+            .delete_by_id_with_options(&raw_id, TitoOptions::delete_on_update(), tx)
+            .await;
 
         self.build_with_options(payload, options, tx).await?;
 
@@ -800,12 +800,14 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                     Ok(entity_json) => entity_json,
                     Err(_) => serde_json::json!({}),
                 }
-            },
-            _ => serde_json::json!({})
+            }
+            _ => serde_json::json!({}),
         };
 
         if let Some(custom_metadata) = options.event_metadata {
-            if let (Some(base_obj), Some(custom_obj)) = (metadata.as_object_mut(), custom_metadata.as_object()) {
+            if let (Some(base_obj), Some(custom_obj)) =
+                (metadata.as_object_mut(), custom_metadata.as_object())
+            {
                 for (key, value) in custom_obj {
                     base_obj.insert(key.clone(), value.clone());
                 }
@@ -828,8 +830,8 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         self.generate_event(
             TitoGenerateEventPayload {
                 key: id.to_string(),
-                action: options.event_action,
-                scheduled_for: options.event_scheduled_at,
+                operation: options.operation,
+                event_at: options.event_at,
                 metadata,
             },
             tx,
@@ -841,7 +843,8 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
     pub async fn delete_by_id(&self, raw_id: &str, tx: &E::Transaction) -> Result<bool, TitoError> {
         let metadata = serde_json::json!({});
-        self.delete_by_id_with_options(raw_id, TitoOptions::delete_with_metadata(metadata), tx).await
+        self.delete_by_id_with_options(raw_id, TitoOptions::delete_with_metadata(metadata), tx)
+            .await
     }
 
     pub async fn find(&self, payload: TitoFindPayload) -> Result<TitoPaginated<T>, TitoError>
@@ -900,7 +903,8 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                             TitoError::TransactionFailed(String::from("Failed migration, model"))
                         })?;
 
-                    self.update_with_options(model_instance, TitoOptions::default(), &tx).await?;
+                    self.update_with_options(model_instance, TitoOptions::default(), &tx)
+                        .await?;
 
                     cursor = next_string_lexicographically(key);
                 }
@@ -946,7 +950,8 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                                 ))
                             })?;
 
-                        self.update_with_options(model_instance, TitoOptions::default(), &tx).await?;
+                        self.update_with_options(model_instance, TitoOptions::default(), &tx)
+                            .await?;
                     }
 
                     cursor = next_string_lexicographically(key);
