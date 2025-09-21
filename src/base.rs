@@ -6,7 +6,7 @@ use crate::{
     types::{
         DBUuid, ReverseIndex, TitoCursor, TitoEmbeddedRelationshipConfig, TitoEngine, TitoEvent,
         TitoEventType, TitoFindPayload, TitoGenerateEventPayload, TitoKvPair, TitoModelTrait,
-        TitoOptions, TitoPaginated, TitoScanPayload, TitoTransaction,
+        TitoOperation, TitoOptions, TitoPaginated, TitoScanPayload, TitoTransaction,
     },
     utils::{next_string_lexicographically, previous_string_lexicographically},
 };
@@ -351,7 +351,11 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         T: serde::de::DeserializeOwned,
     {
         let metadata = serde_json::to_value(&payload).unwrap_or_default();
-        let options = TitoOptions::insert_with_metadata(metadata);
+        let options = TitoOptions {
+            event_at: Some(Utc::now().timestamp()),
+            event_metadata: Some(metadata),
+            operation: TitoOperation::Insert,
+        };
         self.build_with_options(payload, options, tx).await
     }
 
@@ -694,7 +698,11 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         T: serde::de::DeserializeOwned,
     {
         let metadata = serde_json::to_value(&payload).unwrap_or_default();
-        let options = TitoOptions::update_with_metadata(metadata);
+        let options = TitoOptions {
+            event_at: Some(Utc::now().timestamp()),
+            event_metadata: Some(metadata),
+            operation: TitoOperation::Update,
+        };
         self.update_with_options(payload, options, tx).await
     }
 
@@ -715,7 +723,11 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         let raw_id = payload.get_id();
 
         let deleted = self
-            .delete_by_id_with_options(&raw_id, TitoOptions::delete_on_update(), tx)
+            .delete_by_id_with_options(&raw_id, TitoOptions {
+                event_at: None,
+                event_metadata: None,
+                operation: TitoOperation::Delete,
+            }, tx)
             .await;
 
         self.build_with_options(payload, options, tx).await?;
@@ -842,8 +854,11 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     }
 
     pub async fn delete_by_id(&self, raw_id: &str, tx: &E::Transaction) -> Result<bool, TitoError> {
-        let metadata = serde_json::json!({});
-        self.delete_by_id_with_options(raw_id, TitoOptions::delete_with_metadata(metadata), tx)
+        self.delete_by_id_with_options(raw_id, TitoOptions {
+            event_at: Some(Utc::now().timestamp()),
+            event_metadata: None,
+            operation: TitoOperation::Delete,
+        }, tx)
             .await
     }
 
@@ -903,7 +918,11 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                             TitoError::TransactionFailed(String::from("Failed migration, model"))
                         })?;
 
-                    self.update_with_options(model_instance, TitoOptions::default(), &tx)
+                    self.update_with_options(model_instance, TitoOptions {
+                        event_at: Some(Utc::now().timestamp()),
+                        event_metadata: None,
+                        operation: TitoOperation::Update,
+                    }, &tx)
                         .await?;
 
                     cursor = next_string_lexicographically(key);
@@ -950,7 +969,11 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                                 ))
                             })?;
 
-                        self.update_with_options(model_instance, TitoOptions::default(), &tx)
+                        self.update_with_options(model_instance, TitoOptions {
+                        event_at: Some(Utc::now().timestamp()),
+                        event_metadata: None,
+                        operation: TitoOperation::Update,
+                    }, &tx)
                             .await?;
                     }
 

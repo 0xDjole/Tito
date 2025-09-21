@@ -3,13 +3,14 @@ use crate::{
     key_encoder::safe_encode,
     types::{
         TitoEngine, TitoFindByIndexPayload, TitoFindOneByIndexPayload, TitoIndexBlockType,
-        TitoModelTrait, TitoOptions, TitoPaginated, TitoScanPayload, TitoTransaction,
+        TitoModelTrait, TitoOperation, TitoOptions, TitoPaginated, TitoScanPayload, TitoTransaction,
     },
     utils::next_string_lexicographically,
     TitoModel,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
+use chrono::Utc;
 
 impl<
         E: TitoEngine,
@@ -365,7 +366,11 @@ impl<
                             TitoError::TransactionFailed(String::from("Failed migration, model"))
                         })?;
 
-                    self.update_with_options(model_instance, TitoOptions::default(), &tx)
+                    self.update_with_options(model_instance, TitoOptions {
+                        event_at: Some(Utc::now().timestamp()),
+                        event_metadata: None,
+                        operation: TitoOperation::Update,
+                    }, &tx)
                         .await?;
 
                     cursor = next_string_lexicographically(key);
