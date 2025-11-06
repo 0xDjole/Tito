@@ -129,6 +129,9 @@ pub struct TitoEmbeddedRelationshipConfig {
     pub model: String,
 }
 
+// Transitional alias toward a simpler name
+pub type TitoRelationshipConfig = TitoEmbeddedRelationshipConfig;
+
 #[derive(Debug, Clone)]
 pub enum TitoIndexBlockType {
     String,
@@ -162,7 +165,20 @@ pub struct TitoRelIndexConfig {
 }
 
 pub trait TitoModelTrait {
-    fn get_embedded_relationships(&self) -> Vec<TitoEmbeddedRelationshipConfig>;
+    // Existing hydration relationships (deprecated naming but kept for now)
+    fn get_embedded_relationships(&self) -> Vec<TitoEmbeddedRelationshipConfig> {
+        vec![]
+    }
+    // New, clearer alias
+    fn get_relationships(&self) -> Vec<TitoRelationshipConfig> {
+        self.get_embedded_relationships()
+    }
+
+    // Reference graph: declare outbound reference targets (globally-unique IDs)
+    fn get_ref_targets(&self) -> Vec<String> {
+        vec![]
+    }
+
     fn get_indexes(&self) -> Vec<TitoIndexConfig>;
     fn get_table_name(&self) -> String;
     fn get_events(&self) -> Vec<TitoEventConfig>;

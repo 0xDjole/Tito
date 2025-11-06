@@ -4,7 +4,7 @@ use crate::{
     error::TitoError,
     query::IndexQueryBuilder,
     types::{
-        DBUuid, ReverseIndex, TitoCursor, TitoEmbeddedRelationshipConfig, TitoEngine, TitoEvent,
+        DBUuid, ReverseIndex, TitoCursor, TitoEmbeddedRelationshipConfig, TitoRelationshipConfig, TitoEngine, TitoEvent,
         TitoEventType, TitoFindPayload, TitoGenerateEventPayload, TitoKvPair, TitoModelTrait,
         TitoOperation, TitoOptions, TitoPaginated, TitoScanPayload, TitoTransaction,
     },
@@ -32,6 +32,10 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
     pub fn get_embedded_relationships(&self) -> Vec<TitoEmbeddedRelationshipConfig> {
         self.model.get_embedded_relationships()
+    }
+
+    pub fn get_relationships(&self) -> Vec<TitoRelationshipConfig> {
+        self.model.get_relationships()
     }
 
     pub fn get_table(&self) -> String {
@@ -416,6 +420,11 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             tx,
         )
         .await?;
+
+        // Sync references graph (outbound from this entity)
+        let source_typed = format!("{}:{}", self.model.get_table_name(), payload.get_id());
+        let targets = payload.get_ref_targets();
+        self.sync_refs(&source_typed, targets, tx).await?;
 
         Ok(payload)
     }
@@ -806,6 +815,10 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         let id = format!("{}:{}", self.get_table(), raw_id);
         let reverse_index_key = format!("reverse-index:{}", id);
 
+        // Clear references graph for this source (typed)
+        let source_typed = format!("{}:{}", self.model.get_table_name(), raw_id);
+        self.clear_refs(&source_typed, tx).await?;
+
         let mut metadata = match tx.get(&id).await {
             Ok(Some(entity_data)) => {
                 match serde_json::from_slice::<serde_json::Value>(&entity_data) {
@@ -860,6 +873,109 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             operation: TitoOperation::Delete,
         }, tx)
             .await
+    }
+
+    // References graph API
+    pub async fn has_inbound_refs(
+        engine: &E,
+        target_id: &str,
+        tx: &E::Transaction,
+    ) -> Result<bool, TitoError> {
+        let prefix = format!("ref:i:target:{}:", target_id);
+        let end = next_string_lexicographically(prefix.clone());
+        let results = tx
+            .scan(prefix.clone()..end, 1)
+            .await
+            .map_err(|e| TitoError::QueryFailed(e.to_string()))?;
+        Ok(!results.is_empty())
+    }
+
+    pub async fn inbound_refs(
+        engine: &E,
+        target_id: &str,
+        limit: u32,
+        tx: &E::Transaction,
+    ) -> Result<Vec<String>, TitoError> {
+        let prefix = format!("ref:i:target:{}:", target_id);
+        let end = next_string_lexicographically(prefix.clone());
+        let items = tx
+            .scan(prefix.clone()..end, limit)
+            .await
+            .map_err(|e| TitoError::QueryFailed(e.to_string()))?;
+        let mut out = Vec::new();
+        for (k, _) in items {
+            if let Ok(s) = String::from_utf8(k) {
+                if let Some(src) = s.split("source:").nth(1) {
+                    out.push(src.to_string());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub async fn outbound_refs(
+        engine: &E,
+        source_id: &str,
+        limit: u32,
+        tx: &E::Transaction,
+    ) -> Result<Vec<String>, TitoError> {
+        let prefix = format!("ref:o:source:{}:", source_id);
+        let end = next_string_lexicographically(prefix.clone());
+        let items = tx
+            .scan(prefix.clone()..end, limit)
+            .await
+            .map_err(|e| TitoError::QueryFailed(e.to_string()))?;
+        let mut out = Vec::new();
+        for (k, _) in items {
+            if let Ok(s) = String::from_utf8(k) {
+                if let Some(dst) = s.split("target:").nth(1) {
+                    out.push(dst.to_string());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn clear_refs(&self, source_id: &str, tx: &E::Transaction) -> Result<(), TitoError> {
+        let prefix = format!("ref:o:source:{}:", source_id);
+        let end = next_string_lexicographically(prefix.clone());
+        let items = tx
+            .scan(prefix.clone()..end, 10_000)
+            .await
+            .map_err(|e| TitoError::QueryFailed(e.to_string()))?;
+        for (k, _) in items {
+            if let Ok(s) = String::from_utf8(k.clone()) {
+                if let Some(dst) = s.split("target:").nth(1) {
+                    // delete forward
+                    tx.delete(k.clone()).await.map_err(|e| TitoError::DeleteFailed(e.to_string()))?;
+                    // delete reverse
+                    let rev = format!("ref:i:target:{}:source:{}", dst, source_id);
+                    let _ = tx.delete(rev).await; // ignore missing
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn sync_refs(
+        &self,
+        source_id: &str,
+        targets: Vec<String>,
+        tx: &E::Transaction,
+    ) -> Result<(), TitoError> {
+        // Clear old
+        self.clear_refs(source_id, tx).await?;
+        // Insert new
+        use std::collections::HashSet;
+        let unique: HashSet<String> = targets.into_iter().filter(|t| !t.is_empty()).collect();
+        for dst in unique.into_iter() {
+            let fwd = format!("ref:o:source:{}:target:{}", source_id, dst);
+            let marker = serde_json::to_vec(&1).map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
+            tx.put(&fwd, marker.clone()).await.map_err(|e| TitoError::CreateFailed(e.to_string()))?;
+            let rev = format!("ref:i:target:{}:source:{}", dst, source_id);
+            tx.put(&rev, marker.clone()).await.map_err(|e| TitoError::CreateFailed(e.to_string()))?;
+        }
+        Ok(())
     }
 
     pub async fn find(&self, payload: TitoFindPayload) -> Result<TitoPaginated<T>, TitoError>

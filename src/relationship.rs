@@ -1,6 +1,6 @@
 use crate::{
     error::TitoError,
-    types::{TitoEmbeddedRelationshipConfig, TitoEngine, TitoModelTrait},
+    types::{TitoRelationshipConfig, TitoEngine, TitoModelTrait},
     TitoModel,
 };
 use serde::{de::DeserializeOwned, Serialize};
@@ -24,7 +24,7 @@ impl<
         &self,
         item: &mut Value,
         rel_map: &HashMap<String, Value>,
-        config: &TitoEmbeddedRelationshipConfig,
+        config: &TitoRelationshipConfig,
     ) {
         let source_parts: Vec<&str> = config.source_field_name.split('.').collect();
         let dest_parts: Vec<&str> = config.destination_field_name.split('.').collect();
@@ -38,7 +38,7 @@ impl<
         source_path: &[&str],
         dest_path: &[&str],
         rel_map: &HashMap<String, Value>,
-        config: &TitoEmbeddedRelationshipConfig,
+        config: &TitoRelationshipConfig,
     ) {
         // Use a stack to manage traversal, mimicking a recursive call stack safely.
         let mut stack: Vec<(&mut Value, &[&str], &[&str])> = Vec::new();
@@ -116,9 +116,9 @@ impl<
     pub fn get_relationship_data(
         &self,
         items: &Vec<(String, Value)>,
-        rels_config: &[TitoEmbeddedRelationshipConfig],
+        rels_config: &[TitoRelationshipConfig],
         rels: &Vec<String>, // List of destination_field_names to populate
-    ) -> Vec<(TitoEmbeddedRelationshipConfig, String)> {
+    ) -> Vec<(TitoRelationshipConfig, String)> {
         let mut relationship_keys_to_fetch = Vec::new();
 
         for (_, item_value) in items {
@@ -167,7 +167,7 @@ impl<
             return Ok(items);
         }
 
-        let rels_config = self.get_embedded_relationships();
+        let rels_config = self.get_relationships();
         let relationship_data = self.get_relationship_data(&items, &rels_config, &rels);
 
         let rel_keys: Vec<String> = relationship_data.into_iter().map(|item| item.1).collect();
