@@ -164,24 +164,20 @@ pub struct TitoRelIndexConfig {
 }
 
 pub trait TitoModelTrait {
-    // Existing hydration relationships (deprecated naming but kept for now)
-    fn get_embedded_relationships(&self) -> Vec<TitoEmbeddedRelationshipConfig> {
+    // Hydration relationships
+    fn relationships(&self) -> Vec<TitoRelationshipConfig> {
         vec![]
-    }
-    // New, clearer alias
-    fn get_relationships(&self) -> Vec<TitoRelationshipConfig> {
-        self.get_embedded_relationships()
     }
 
     // Reference graph: declare outbound reference targets (globally-unique IDs)
-    fn get_ref_targets(&self) -> Vec<String> {
+    fn references(&self) -> Vec<String> {
         vec![]
     }
 
-    fn get_indexes(&self) -> Vec<TitoIndexConfig>;
-    fn get_table_name(&self) -> String;
-    fn get_events(&self) -> Vec<TitoEventConfig>;
-    fn get_id(&self) -> String;
+    fn indexes(&self) -> Vec<TitoIndexConfig>;
+    fn table(&self) -> String;
+    fn events(&self) -> Vec<TitoEventConfig>;
+    fn id(&self) -> String;
 }
 
 #[derive(Clone, Serialize, Deserialize)]

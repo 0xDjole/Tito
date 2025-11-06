@@ -32,7 +32,7 @@ impl<
     ) -> Result<Vec<(String, Value)>, TitoError> {
         let mut all_index_keys = vec![];
 
-        for index_config in value.get_indexes().iter() {
+        for index_config in value.indexes().iter() {
             if !index_config.condition {
                 continue;
             }
@@ -100,7 +100,7 @@ impl<
     where
         T: serde::de::DeserializeOwned,
     {
-        let indexes = self.model.get_indexes();
+        let indexes = self.model.indexes();
 
         let index = indexes
             .iter()
@@ -169,7 +169,7 @@ impl<
     where
         T: serde::de::DeserializeOwned,
     {
-        let indexes = self.model.get_indexes();
+        let indexes = self.model.indexes();
         let index = indexes
             .iter()
             .find(|index_config| index_config.name == payload.index)

@@ -167,7 +167,7 @@ impl<
             return Ok(items);
         }
 
-        let rels_config = self.get_relationships();
+        let rels_config = self.relationships();
         let relationship_data = self.get_relationship_data(&items, &rels_config, &rels);
 
         let rel_keys: Vec<String> = relationship_data.into_iter().map(|item| item.1).collect();

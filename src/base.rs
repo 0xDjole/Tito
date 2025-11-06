@@ -30,16 +30,12 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         }
     }
 
-    pub fn get_embedded_relationships(&self) -> Vec<TitoEmbeddedRelationshipConfig> {
-        self.model.get_embedded_relationships()
-    }
-
-    pub fn get_relationships(&self) -> Vec<TitoRelationshipConfig> {
-        self.model.get_relationships()
+    pub fn relationships(&self) -> Vec<TitoRelationshipConfig> {
+        self.model.relationships()
     }
 
     pub fn get_table(&self) -> String {
-        format!("table:{}", self.model.get_table_name())
+        format!("table:{}", self.model.table())
     }
 
     pub fn get_id_from_table(&self, key: String) -> String {
@@ -374,7 +370,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     {
         let value = serde_json::to_value(&payload).unwrap();
 
-        let raw_id = payload.get_id();
+        let raw_id = payload.id();
 
         let id = format!("{}:{}", self.get_table(), raw_id);
 
@@ -422,9 +418,9 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         .await?;
 
         // Sync references graph (outbound from this entity)
-        let source_typed = format!("{}:{}", self.model.get_table_name(), payload.get_id());
-        let targets = payload.get_ref_targets();
-        self.sync_refs(&source_typed, targets, tx).await?;
+        let source_typed = format!("{}:{}", self.model.table(), payload.id());
+        let targets = payload.references();
+        self.sync_references(&source_typed, targets, tx).await?;
 
         Ok(payload)
     }
@@ -435,7 +431,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         tx: &E::Transaction,
     ) -> Result<bool, TitoError> {
         if let Some(event_at) = payload.event_at.clone() {
-            for event_config in self.model.get_events().iter() {
+            for event_config in self.model.events().iter() {
                 self.lock_keys(vec![payload.key.clone()], tx).await?;
                 let created_at = Utc::now().timestamp();
 
@@ -729,7 +725,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     where
         T: serde::de::DeserializeOwned,
     {
-        let raw_id = payload.get_id();
+        let raw_id = payload.id();
 
         let deleted = self
             .delete_by_id_with_options(&raw_id, TitoOptions {
@@ -816,8 +812,8 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         let reverse_index_key = format!("reverse-index:{}", id);
 
         // Clear references graph for this source (typed)
-        let source_typed = format!("{}:{}", self.model.get_table_name(), raw_id);
-        self.clear_refs(&source_typed, tx).await?;
+        let source_typed = format!("{}:{}", self.model.table(), raw_id);
+        self.clear_references(&source_typed, tx).await?;
 
         let mut metadata = match tx.get(&id).await {
             Ok(Some(entity_data)) => {
@@ -876,12 +872,12 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     }
 
     // References graph API
-    pub async fn has_inbound_refs(
+    pub async fn has_inbound_references(
         engine: &E,
         target_id: &str,
         tx: &E::Transaction,
     ) -> Result<bool, TitoError> {
-        let prefix = format!("ref:i:target:{}:", target_id);
+        let prefix = format!("reference:i:target:{}:", target_id);
         let end = next_string_lexicographically(prefix.clone());
         let results = tx
             .scan(prefix.clone()..end, 1)
@@ -890,13 +886,13 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         Ok(!results.is_empty())
     }
 
-    pub async fn inbound_refs(
+    pub async fn inbound_references(
         engine: &E,
         target_id: &str,
         limit: u32,
         tx: &E::Transaction,
     ) -> Result<Vec<String>, TitoError> {
-        let prefix = format!("ref:i:target:{}:", target_id);
+        let prefix = format!("reference:i:target:{}:", target_id);
         let end = next_string_lexicographically(prefix.clone());
         let items = tx
             .scan(prefix.clone()..end, limit)
@@ -913,13 +909,13 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         Ok(out)
     }
 
-    pub async fn outbound_refs(
+    pub async fn outbound_references(
         engine: &E,
         source_id: &str,
         limit: u32,
         tx: &E::Transaction,
     ) -> Result<Vec<String>, TitoError> {
-        let prefix = format!("ref:o:source:{}:", source_id);
+        let prefix = format!("reference:o:source:{}:", source_id);
         let end = next_string_lexicographically(prefix.clone());
         let items = tx
             .scan(prefix.clone()..end, limit)
@@ -936,8 +932,8 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         Ok(out)
     }
 
-    async fn clear_refs(&self, source_id: &str, tx: &E::Transaction) -> Result<(), TitoError> {
-        let prefix = format!("ref:o:source:{}:", source_id);
+    async fn clear_references(&self, source_id: &str, tx: &E::Transaction) -> Result<(), TitoError> {
+        let prefix = format!("reference:o:source:{}:", source_id);
         let end = next_string_lexicographically(prefix.clone());
         let items = tx
             .scan(prefix.clone()..end, 10_000)
@@ -949,7 +945,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                     // delete forward
                     tx.delete(k.clone()).await.map_err(|e| TitoError::DeleteFailed(e.to_string()))?;
                     // delete reverse
-                    let rev = format!("ref:i:target:{}:source:{}", dst, source_id);
+                    let rev = format!("reference:i:target:{}:source:{}", dst, source_id);
                     let _ = tx.delete(rev).await; // ignore missing
                 }
             }
@@ -957,22 +953,22 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         Ok(())
     }
 
-    async fn sync_refs(
+    async fn sync_references(
         &self,
         source_id: &str,
         targets: Vec<String>,
         tx: &E::Transaction,
     ) -> Result<(), TitoError> {
         // Clear old
-        self.clear_refs(source_id, tx).await?;
+        self.clear_references(source_id, tx).await?;
         // Insert new
         use std::collections::HashSet;
         let unique: HashSet<String> = targets.into_iter().filter(|t| !t.is_empty()).collect();
         for dst in unique.into_iter() {
-            let fwd = format!("ref:o:source:{}:target:{}", source_id, dst);
+            let fwd = format!("reference:o:source:{}:target:{}", source_id, dst);
             let marker = serde_json::to_vec(&1).map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
             tx.put(&fwd, marker.clone()).await.map_err(|e| TitoError::CreateFailed(e.to_string()))?;
-            let rev = format!("ref:i:target:{}:source:{}", dst, source_id);
+            let rev = format!("reference:i:target:{}:source:{}", dst, source_id);
             tx.put(&rev, marker.clone()).await.map_err(|e| TitoError::CreateFailed(e.to_string()))?;
         }
         Ok(())
