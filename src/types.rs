@@ -155,7 +155,6 @@ pub struct TitoIndexConfig {
     pub condition: bool,
     pub fields: Vec<TitoIndexField>,
     pub name: String,
-    pub custom_generator: Option<Box<dyn Fn() -> Result<Vec<String>, TitoError> + Send + Sync>>,
 }
 
 #[derive(Debug, Clone)]

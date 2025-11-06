@@ -41,15 +41,6 @@ impl<
 
             let mut combinations: Vec<String> = vec![String::new()];
 
-            if let Some(generator) = &index_config.custom_generator {
-                let custom_keys = generator()?;
-                for key in custom_keys {
-                    let key = format!("{}{}:{}", base_key, key, id);
-                    if !key.is_empty() {
-                        all_index_keys.push((key, json.clone()));
-                    }
-                }
-            }
 
             for field in index_config.fields.iter() {
                 let field_values = match self.get_nested_values(json, &field.name) {
