@@ -2,15 +2,16 @@ use crate::{
     error::TitoError,
     key_encoder::safe_encode,
     types::{
-        TitoEngine, TitoFindByIndexPayload, TitoFindOneByIndexPayload, TitoIndexBlockType,
-        TitoModelTrait, TitoOperation, TitoOptions, TitoPaginated, TitoScanPayload, TitoTransaction,
+        FieldValue, TitoEngine, TitoFindByIndexPayload, TitoFindOneByIndexPayload,
+        TitoIndexBlockType, TitoModelTrait, TitoOperation, TitoOptions, TitoPaginated,
+        TitoScanPayload, TitoTransaction,
     },
     utils::next_string_lexicographically,
     TitoModel,
 };
+use chrono::Utc;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
-use chrono::Utc;
 
 impl<
         E: TitoEngine,
@@ -41,27 +42,41 @@ impl<
 
             let mut combinations: Vec<String> = vec![String::new()];
 
-
             for field in index_config.fields.iter() {
                 let field_values = match self.get_nested_values(json, &field.name) {
                     Some(values) if !values.is_empty() => values,
-                    _ => {
-                        vec![Value::String("__null__".to_string())]
-                    }
+                    _ => vec![FieldValue::Simple(Value::String("__null__".to_string()))],
                 };
 
                 let mut new_combinations = vec![];
 
-                for value in field_values {
-                    let field_str = match field.r#type {
-                        TitoIndexBlockType::String => match value.as_str() {
-                            Some("") => Some(format!("{}:__null__", field.name)),
-                            Some(s) => Some(format!("{}:{}", field.name, safe_encode(&s))),
-                            None => Some(format!("{}:__null__", field.name)),
+                for field_value in field_values {
+                    let field_str = match field_value {
+                        // Handle HashMap entries with key-value pairs
+                        FieldValue::HashMapEntry { key, value } => match field.r#type {
+                            TitoIndexBlockType::String => match value.as_str() {
+                                Some("") => Some(format!("{}:{}.__null__", field.name, key)),
+                                Some(s) => {
+                                    Some(format!("{}:{}.{}", field.name, key, safe_encode(&s)))
+                                }
+                                None => Some(format!("{}:{}.__null__", field.name, key)),
+                            },
+                            TitoIndexBlockType::Number => match value.as_i64() {
+                                Some(n) => Some(format!("{}:{}:{:0>10}", field.name, key, n)),
+                                None => Some(format!("{}:{}:__null__", field.name, key)),
+                            },
                         },
-                        TitoIndexBlockType::Number => match value.as_i64() {
-                            Some(n) => Some(format!("{}:{:0>10}", field.name, n)),
-                            None => Some(format!("{}:__null__", field.name)),
+                        // Handle simple values
+                        FieldValue::Simple(value) => match field.r#type {
+                            TitoIndexBlockType::String => match value.as_str() {
+                                Some("") => Some(format!("{}:__null__", field.name)),
+                                Some(s) => Some(format!("{}:{}", field.name, safe_encode(&s))),
+                                None => Some(format!("{}:__null__", field.name)),
+                            },
+                            TitoIndexBlockType::Number => match value.as_i64() {
+                                Some(n) => Some(format!("{}:{:0>10}", field.name, n)),
+                                None => Some(format!("{}:__null__", field.name)),
+                            },
                         },
                     };
 
@@ -357,12 +372,16 @@ impl<
                             TitoError::TransactionFailed(String::from("Failed migration, model"))
                         })?;
 
-                    self.update_with_options(model_instance, TitoOptions {
-                        event_at: Some(Utc::now().timestamp()),
-                        event_metadata: None,
-                        operation: TitoOperation::Update,
-                    }, &tx)
-                        .await?;
+                    self.update_with_options(
+                        model_instance,
+                        TitoOptions {
+                            event_at: Some(Utc::now().timestamp()),
+                            event_metadata: None,
+                            operation: TitoOperation::Update,
+                        },
+                        &tx,
+                    )
+                    .await?;
 
                     cursor = next_string_lexicographically(key);
                 }

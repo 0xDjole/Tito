@@ -139,6 +139,15 @@ pub enum TitoIndexBlockType {
 }
 
 #[derive(Debug, Clone)]
+pub enum FieldValue {
+    Simple(serde_json::Value),
+    HashMapEntry {
+        key: String,
+        value: serde_json::Value,
+    },
+}
+
+#[derive(Debug, Clone)]
 pub struct TitoIndexField {
     pub name: String,
     pub r#type: TitoIndexBlockType,
@@ -348,6 +357,4 @@ pub struct TitoOptions {
     pub operation: TitoOperation,
 }
 
-
-impl TitoOptions {
-}
+impl TitoOptions {}

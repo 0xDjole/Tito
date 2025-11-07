@@ -1,6 +1,6 @@
 use crate::{
     error::TitoError,
-    types::{TitoRelationshipConfig, TitoEngine, TitoModelTrait},
+    types::{FieldValue, TitoEngine, TitoModelTrait, TitoRelationshipConfig},
     TitoModel,
 };
 use serde::{de::DeserializeOwned, Serialize};
@@ -128,15 +128,21 @@ impl<
                     if let Some(found_values_at_source_path) =
                         self.get_nested_values(item_value, &config.source_field_name)
                     {
-                        for value_or_array_of_values in found_values_at_source_path {
-                            if let Some(id_str) = value_or_array_of_values.as_str() {
+                        for field_value in found_values_at_source_path {
+                            // Extract the actual value from FieldValue enum
+                            let actual_value = match field_value {
+                                FieldValue::Simple(v) => v,
+                                FieldValue::HashMapEntry { value, .. } => value,
+                            };
+
+                            if let Some(id_str) = actual_value.as_str() {
                                 if id_str != "__null__" {
                                     relationship_keys_to_fetch.push((
                                         config.clone(),
                                         format!("table:{}:{}", config.model, id_str),
                                     ));
                                 }
-                            } else if let Some(id_array) = value_or_array_of_values.as_array() {
+                            } else if let Some(id_array) = actual_value.as_array() {
                                 for id_element in id_array {
                                     if let Some(id_str) = id_element.as_str() {
                                         if id_str != "__null__" {

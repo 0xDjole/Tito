@@ -4,9 +4,10 @@ use crate::{
     error::TitoError,
     query::IndexQueryBuilder,
     types::{
-        DBUuid, ReverseIndex, TitoCursor, TitoEmbeddedRelationshipConfig, TitoRelationshipConfig, TitoEngine, TitoEvent,
-        TitoEventType, TitoFindPayload, TitoGenerateEventPayload, TitoKvPair, TitoModelTrait,
-        TitoOperation, TitoOptions, TitoPaginated, TitoScanPayload, TitoTransaction,
+        DBUuid, FieldValue, ReverseIndex, TitoCursor, TitoEmbeddedRelationshipConfig, TitoEngine,
+        TitoEvent, TitoEventType, TitoFindPayload, TitoGenerateEventPayload, TitoKvPair,
+        TitoModelTrait, TitoOperation, TitoOptions, TitoPaginated, TitoRelationshipConfig,
+        TitoScanPayload, TitoTransaction,
     },
     utils::{next_string_lexicographically, previous_string_lexicographically},
 };
@@ -308,14 +309,26 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             ))
         })
     }
-    pub fn get_nested_values(&self, json: &Value, field_path: &str) -> Option<Vec<Value>> {
+    pub fn get_nested_values(&self, json: &Value, field_path: &str) -> Option<Vec<FieldValue>> {
         let mut results = Vec::new();
         let mut to_process = vec![(json.clone(), 0)];
         let parts: Vec<&str> = field_path.split('.').collect();
 
         while let Some((current_value, depth)) = to_process.pop() {
             if depth == parts.len() {
-                results.push(current_value);
+                // Check if the final value is a HashMap (JSON object)
+                // If so, expand it into key-value pairs
+                if let Some(obj) = current_value.as_object() {
+                    // This is a HashMap - expand each entry
+                    for (key, value) in obj.iter() {
+                        results.push(FieldValue::HashMapEntry {
+                            key: key.clone(),
+                            value: value.clone(),
+                        });
+                    }
+                } else {
+                    results.push(FieldValue::Simple(current_value));
+                }
                 continue;
             }
 
@@ -728,11 +741,15 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         let raw_id = payload.id();
 
         let deleted = self
-            .delete_by_id_with_options(&raw_id, TitoOptions {
-                event_at: None,
-                event_metadata: None,
-                operation: TitoOperation::Delete,
-            }, tx)
+            .delete_by_id_with_options(
+                &raw_id,
+                TitoOptions {
+                    event_at: None,
+                    event_metadata: None,
+                    operation: TitoOperation::Delete,
+                },
+                tx,
+            )
             .await;
 
         self.build_with_options(payload, options, tx).await?;
@@ -863,12 +880,16 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     }
 
     pub async fn delete_by_id(&self, raw_id: &str, tx: &E::Transaction) -> Result<bool, TitoError> {
-        self.delete_by_id_with_options(raw_id, TitoOptions {
-            event_at: Some(Utc::now().timestamp()),
-            event_metadata: None,
-            operation: TitoOperation::Delete,
-        }, tx)
-            .await
+        self.delete_by_id_with_options(
+            raw_id,
+            TitoOptions {
+                event_at: Some(Utc::now().timestamp()),
+                event_metadata: None,
+                operation: TitoOperation::Delete,
+            },
+            tx,
+        )
+        .await
     }
 
     // References graph API
@@ -932,7 +953,11 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         Ok(out)
     }
 
-    async fn clear_references(&self, source_id: &str, tx: &E::Transaction) -> Result<(), TitoError> {
+    async fn clear_references(
+        &self,
+        source_id: &str,
+        tx: &E::Transaction,
+    ) -> Result<(), TitoError> {
         let prefix = format!("reference:o:source:{}:", source_id);
         let end = next_string_lexicographically(prefix.clone());
         let items = tx
@@ -943,7 +968,9 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             if let Ok(s) = String::from_utf8(k.clone()) {
                 if let Some(dst) = s.split("target:").nth(1) {
                     // delete forward
-                    tx.delete(k.clone()).await.map_err(|e| TitoError::DeleteFailed(e.to_string()))?;
+                    tx.delete(k.clone())
+                        .await
+                        .map_err(|e| TitoError::DeleteFailed(e.to_string()))?;
                     // delete reverse
                     let rev = format!("reference:i:target:{}:source:{}", dst, source_id);
                     let _ = tx.delete(rev).await; // ignore missing
@@ -966,10 +993,15 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         let unique: HashSet<String> = targets.into_iter().filter(|t| !t.is_empty()).collect();
         for dst in unique.into_iter() {
             let fwd = format!("reference:o:source:{}:target:{}", source_id, dst);
-            let marker = serde_json::to_vec(&1).map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
-            tx.put(&fwd, marker.clone()).await.map_err(|e| TitoError::CreateFailed(e.to_string()))?;
+            let marker = serde_json::to_vec(&1)
+                .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
+            tx.put(&fwd, marker.clone())
+                .await
+                .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
             let rev = format!("reference:i:target:{}:source:{}", dst, source_id);
-            tx.put(&rev, marker.clone()).await.map_err(|e| TitoError::CreateFailed(e.to_string()))?;
+            tx.put(&rev, marker.clone())
+                .await
+                .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
         }
         Ok(())
     }
@@ -1030,12 +1062,16 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                             TitoError::TransactionFailed(String::from("Failed migration, model"))
                         })?;
 
-                    self.update_with_options(model_instance, TitoOptions {
-                        event_at: Some(Utc::now().timestamp()),
-                        event_metadata: None,
-                        operation: TitoOperation::Update,
-                    }, &tx)
-                        .await?;
+                    self.update_with_options(
+                        model_instance,
+                        TitoOptions {
+                            event_at: Some(Utc::now().timestamp()),
+                            event_metadata: None,
+                            operation: TitoOperation::Update,
+                        },
+                        &tx,
+                    )
+                    .await?;
 
                     cursor = next_string_lexicographically(key);
                 }
@@ -1081,12 +1117,16 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                                 ))
                             })?;
 
-                        self.update_with_options(model_instance, TitoOptions {
-                        event_at: Some(Utc::now().timestamp()),
-                        event_metadata: None,
-                        operation: TitoOperation::Update,
-                    }, &tx)
-                            .await?;
+                        self.update_with_options(
+                            model_instance,
+                            TitoOptions {
+                                event_at: Some(Utc::now().timestamp()),
+                                event_metadata: None,
+                                operation: TitoOperation::Update,
+                            },
+                            &tx,
+                        )
+                        .await?;
                     }
 
                     cursor = next_string_lexicographically(key);
