@@ -12,63 +12,60 @@ use crate::TitoError;
 #[derive(Clone)]
 pub struct TitoQueue<E: TitoEngine> {
     pub engine: E,
-    pub table: String,
 }
 
 impl<E: TitoEngine> TitoQueue<E> {
-    pub async fn push(
+
+    pub async fn pull_partition_range(
         &self,
-        _message: String,
-        _date: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> Result<(), TitoError> {
-        Ok(())
-    }
+        start_partition: u32,
+        end_partition: u32,
+        limit: u32,
+        reverse: bool,
+    ) -> Result<Vec<TitoEvent>, TitoError> {
+        use crate::utils::next_string_lexicographically;
+        use crate::types::{PARTITION_DIGITS};
 
-    pub async fn pull(&self, limit: u32, _offset: u32) -> Result<Vec<TitoEvent>, TitoError> {
-        let mut jobs: Vec<TitoEvent> = Vec::new();
+        let start_key = format!("event:{:0width$}:PENDING:", start_partition, width = PARTITION_DIGITS);
+        let end_key = format!("event:{:0width$}:PENDING:", end_partition, width = PARTITION_DIGITS);
+        let end_key = next_string_lexicographically(end_key);
 
-        let start_bound = format!("event:{}:PENDING", self.table);
-
-        let current_time = Utc::now().timestamp();
-        let end_bound = format!("event:{}:PENDING:{}", self.table, current_time);
-
-        let jobs = self
-            .engine
+        self.engine
             .transaction(|tx| async move {
-                let scan_stream = tx
-                    .scan(start_bound.as_bytes()..end_bound.as_bytes(), limit)
-                    .await
-                    .map_err(|e| TitoError::QueryFailed(format!("Scan failed: {}", e)))?;
+                let scan_stream = if reverse {
+                    tx.scan_reverse(start_key.as_bytes()..end_key.as_bytes(), limit)
+                        .await
+                        .map_err(|e| TitoError::QueryFailed(format!("Scan failed: {}", e)))?
+                } else {
+                    tx.scan(start_key.as_bytes()..end_key.as_bytes(), limit)
+                        .await
+                        .map_err(|e| TitoError::QueryFailed(format!("Scan failed: {}", e)))?
+                };
+
+                let mut jobs = Vec::new();
 
                 for item in scan_stream {
-                    if let Ok(job) = serde_json::from_slice::<TitoEvent>(&item.1) {
-                        jobs.push(job);
-                    }
-                }
+                    if let Ok(mut job) = serde_json::from_slice::<TitoEvent>(&item.1) {
+                        // Atomically move PENDING -> PROGRESS
+                        tx.delete(job.key.as_bytes())
+                            .await
+                            .map_err(|e| TitoError::DeleteFailed(format!("Delete failed: {}", e)))?;
 
-                for job in jobs.iter_mut() {
-                    tx.delete(job.key.as_bytes())
-                        .await
-                        .map_err(|e| TitoError::DeleteFailed(format!("Delete failed: {}", e)))?;
+                        job.status = String::from("PROGRESS");
+                        let new_key = job.key.replace("PENDING", "PROGRESS");
+                        job.key = new_key.clone();
 
-                    job.status = String::from("PROGRESS");
-                    let new_key = job.key.replace("PENDING", "PROGRESS");
-                    job.key = new_key.clone();
-
-                    let json_job = serde_json::to_value(job.clone());
-
-                    if let Ok(value) = json_job {
-                        tx.put(new_key.as_bytes(), serde_json::to_vec(&value).unwrap())
+                        tx.put(new_key.as_bytes(), serde_json::to_vec(&job).unwrap())
                             .await
                             .map_err(|e| TitoError::UpdateFailed(format!("Put failed: {}", e)))?;
+
+                        jobs.push(job);
                     }
                 }
 
                 Ok::<_, TitoError>(jobs)
             })
-            .await?;
-
-        Ok(jobs.into_iter().map(|job| job.into()).collect())
+            .await
     }
 
     pub async fn success_job(&self, job_id: String) -> Result<(), TitoError> {
@@ -172,6 +169,7 @@ impl<E: TitoEngine> TitoQueue<E> {
 pub async fn run_worker<E: TitoEngine + 'static, H>(
     queue: Arc<TitoQueue<E>>,
     handler: H,
+    partition_config: crate::types::PartitionConfig,
     is_leader: Arc<AtomicBool>,
     concurrency: u32,
     mut shutdown: broadcast::Receiver<()>,
@@ -192,8 +190,14 @@ where
                 _ = async {
                     let is_leader_val = is_leader.load(Ordering::SeqCst);
                     if is_leader_val {
-                        // Attempt to pull jobs from the queue
-                        match queue.pull(20, 0).await {
+                        // Pull jobs from assigned partition range
+                        // Use reverse=true for LIFO (newest first)
+                        match queue.pull_partition_range(
+                            partition_config.start,
+                            partition_config.end,
+                            20,
+                            true
+                        ).await {
                             Ok(jobs) => {
                                 stream::iter(jobs.into_iter().map(|job| {
                                     let queue = Arc::clone(&queue);

@@ -456,10 +456,30 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
                 let (status, key) = match event_config.event_type {
                     TitoEventType::Queue => {
+                        use std::collections::hash_map::DefaultHasher;
+                        use std::hash::{Hash, Hasher};
+                        use crate::types::{TOTAL_PARTITIONS, PARTITION_DIGITS, SEQUENCE_DIGITS};
+
                         let status = String::from("PENDING");
+
+                        let partition_key = self.model.partition_key();
+                        let mut hasher = DefaultHasher::new();
+                        partition_key.hash(&mut hasher);
+                        let partition = (hasher.finish() as u32) % TOTAL_PARTITIONS;
+
+                        log::debug!("partition_key='{}' table='{}' -> partition={}", partition_key, self.model.table(), partition);
+
+                        // Generate sequence from microsecond timestamp
+                        let sequence = Utc::now().timestamp_micros() as u64;
+
+                        // Format key with zero-padding: event:{partition:04}:{status}:{sequence:020}
                         let key = format!(
-                            "event:{}:{}:{}:{}",
-                            event_config.name, status, scheduled_for, uuid_str
+                            "event:{:0pwidth$}:{}:{:0swidth$}",
+                            partition,
+                            status,
+                            sequence,
+                            pwidth = PARTITION_DIGITS,
+                            swidth = SEQUENCE_DIGITS
                         );
                         (status, key)
                     }

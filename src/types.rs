@@ -183,6 +183,8 @@ pub trait TitoModelTrait {
         vec![]
     }
 
+    fn partition_key(&self) -> String;
+
     fn indexes(&self) -> Vec<TitoIndexConfig>;
     fn table(&self) -> String;
     fn events(&self) -> Vec<TitoEventConfig>;
@@ -358,3 +360,24 @@ pub struct TitoOptions {
 }
 
 impl TitoOptions {}
+
+// Partition configuration for distributed event processing
+#[derive(Debug, Clone)]
+pub struct PartitionConfig {
+    pub start: u32,
+    pub end: u32,
+}
+
+impl Default for PartitionConfig {
+    fn default() -> Self {
+        Self {
+            start: 0,
+            end: TOTAL_PARTITIONS,
+        }
+    }
+}
+
+// Fixed partition count - NEVER change this after initial deployment
+pub const TOTAL_PARTITIONS: u32 = 1024;
+pub const PARTITION_DIGITS: usize = 4; // for 1024 partitions (0000-1023)
+pub const SEQUENCE_DIGITS: usize = 20; // for microsecond timestamps
