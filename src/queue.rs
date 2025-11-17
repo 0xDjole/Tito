@@ -26,21 +26,15 @@ impl<E: TitoEngine> TitoQueue<E> {
         use crate::utils::next_string_lexicographically;
         use crate::types::{PARTITION_DIGITS};
 
-        let start_key = format!("event:{:0width$}:PENDING:", start_partition, width = PARTITION_DIGITS);
-        let end_key = format!("event:{:0width$}:PENDING:", end_partition, width = PARTITION_DIGITS);
+        let start_key = format!("event:PENDING:{:0width$}:", start_partition, width = PARTITION_DIGITS);
+        let end_key = format!("event:PENDING:{:0width$}:", end_partition, width = PARTITION_DIGITS);
         let end_key = next_string_lexicographically(end_key);
 
         self.engine
             .transaction(|tx| async move {
-                let scan_stream = if reverse {
-                    tx.scan_reverse(start_key.as_bytes()..end_key.as_bytes(), limit)
-                        .await
-                        .map_err(|e| TitoError::QueryFailed(format!("Scan failed: {}", e)))?
-                } else {
-                    tx.scan(start_key.as_bytes()..end_key.as_bytes(), limit)
-                        .await
-                        .map_err(|e| TitoError::QueryFailed(format!("Scan failed: {}", e)))?
-                };
+                let scan_stream = tx.scan_reverse(start_key.as_bytes()..end_key.as_bytes(), limit)
+                    .await
+                    .map_err(|e| TitoError::QueryFailed(format!("Scan failed: {}", e)))?;
 
                 let mut jobs = Vec::new();
 
