@@ -426,6 +426,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                 event_at: options.event_at,
                 metadata,
             },
+            &payload,
             tx,
         )
         .await?;
@@ -441,10 +442,11 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     async fn generate_event(
         &self,
         payload: TitoGenerateEventPayload,
+        model: &T,
         tx: &E::Transaction,
     ) -> Result<bool, TitoError> {
         if let Some(event_at) = payload.event_at.clone() {
-            for event_config in self.model.events().iter() {
+            for event_config in model.events().iter() {
                 self.lock_keys(vec![payload.key.clone()], tx).await?;
                 let created_at = Utc::now().timestamp();
 
@@ -456,23 +458,19 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
                 let (status, key) = match event_config.event_type {
                     TitoEventType::Queue => {
+                        use crate::types::{PARTITION_DIGITS, SEQUENCE_DIGITS, TOTAL_PARTITIONS};
                         use std::collections::hash_map::DefaultHasher;
                         use std::hash::{Hash, Hasher};
-                        use crate::types::{TOTAL_PARTITIONS, PARTITION_DIGITS, SEQUENCE_DIGITS};
 
                         let status = String::from("PENDING");
 
-                        let partition_key = self.model.partition_key();
+                        let partition_key = model.partition_key();
                         let mut hasher = DefaultHasher::new();
                         partition_key.hash(&mut hasher);
                         let partition = (hasher.finish() as u32) % TOTAL_PARTITIONS;
 
-                        log::debug!("partition_key='{}' table='{}' -> partition={}", partition_key, self.model.table(), partition);
-
-                        // Generate sequence from microsecond timestamp
                         let sequence = Utc::now().timestamp_micros() as u64;
 
-                        // Format key with zero-padding: event:{partition:04}:{status}:{sequence:020}
                         let key = format!(
                             "event:{:0pwidth$}:{}:{:0swidth$}",
                             partition,
@@ -852,14 +850,27 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         let source_typed = format!("{}:{}", self.model.table(), raw_id);
         self.clear_references(&source_typed, tx).await?;
 
-        let mut metadata = match tx.get(&id).await {
+        let (mut metadata, model) = match tx.get(&id).await {
             Ok(Some(entity_data)) => {
-                match serde_json::from_slice::<serde_json::Value>(&entity_data) {
+                let metadata = match serde_json::from_slice::<serde_json::Value>(&entity_data) {
                     Ok(entity_json) => entity_json,
                     Err(_) => serde_json::json!({}),
-                }
+                };
+                let model = serde_json::from_slice::<T>(&entity_data).map_err(|e| {
+                    TitoError::DeserializationFailed(format!(
+                        "Failed to deserialize model for delete event: {}",
+                        e
+                    ))
+                })?;
+                (metadata, model)
             }
-            _ => serde_json::json!({}),
+            Ok(None) => return Err(TitoError::NotFound(format!("Entity not found: {}", id))),
+            Err(e) => {
+                return Err(TitoError::QueryFailed(format!(
+                    "Failed to fetch entity: {}",
+                    e
+                )))
+            }
         };
 
         if let Some(custom_metadata) = options.event_metadata {
@@ -892,6 +903,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                 event_at: options.event_at,
                 metadata,
             },
+            &model,
             tx,
         )
         .await?;
