@@ -107,32 +107,21 @@ impl<E: TitoEngine> TitoQueue<E> {
                     })?;
 
                     if job.retries < job.max_retries {
-                        let additional_seconds = (job.retries * job.retries * 60) as i64;
-                        job.scheduled_for = job.scheduled_for + additional_seconds;
-
                         let new_key = job_id.replace("PROGRESS", "PENDING");
 
-                        let mut parts: Vec<&str> = new_key.split(':').collect();
-                        if parts.len() >= 5 {
-                            // Replace the timestamp (fourth element) with the new timestamp, keep status intact
-                            let schedule_part = job.scheduled_for.to_string();
-                            parts[3] = &schedule_part;
-                            let new_key = parts.join(":");
+                        job.key = new_key.clone();
+                        job.retries += 1;
+                        job.status = "PENDING".to_string();
 
-                            job.key = new_key.clone();
-                            job.retries += 1;
-                            job.status = "PENDING".to_string();
+                        tx.delete(job_id.as_bytes()).await.map_err(|e| {
+                            TitoError::DeleteFailed(format!("Delete failed: {}", e))
+                        })?;
 
-                            tx.delete(job_id.as_bytes()).await.map_err(|e| {
-                                TitoError::DeleteFailed(format!("Delete failed: {}", e))
+                        tx.put(new_key.as_bytes(), serde_json::to_vec(&job).unwrap())
+                            .await
+                            .map_err(|e| {
+                                TitoError::UpdateFailed(format!("Put failed: {}", e))
                             })?;
-
-                            tx.put(new_key.as_bytes(), serde_json::to_vec(&job).unwrap())
-                                .await
-                                .map_err(|e| {
-                                    TitoError::UpdateFailed(format!("Put failed: {}", e))
-                                })?;
-                        }
                     } else {
                         let new_key = job_id.replace("PROGRESS", "FAILED");
                         job.key = new_key.clone();

@@ -450,8 +450,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                 self.lock_keys(vec![payload.key.clone()], tx).await?;
                 let created_at = Utc::now().timestamp();
 
-                let scheduled_for = event_at;
-
                 let message = event_config.name.to_string();
 
                 let uuid_str = DBUuid::new_v4().to_string();
@@ -498,7 +496,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                     message,
                     retries: 0,
                     max_retries: 5,
-                    scheduled_for,
                     created_at: created_at,
                     updated_at: created_at,
                     metadata: payload.metadata.clone(),
