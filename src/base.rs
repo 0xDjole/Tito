@@ -5,7 +5,7 @@ use crate::{
     query::IndexQueryBuilder,
     types::{
         DBUuid, FieldValue, ReverseIndex, TitoCursor, TitoEmbeddedRelationshipConfig, TitoEngine,
-        TitoEvent, TitoEventType, TitoFindPayload, TitoGenerateEventPayload, TitoKvPair,
+        TitoEvent, TitoFindPayload, TitoGenerateEventPayload, TitoKvPair,
         TitoModelTrait, TitoOperation, TitoOptions, TitoPaginated, TitoRelationshipConfig,
         TitoScanPayload, TitoTransaction,
     },
@@ -454,38 +454,27 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
                 let uuid_str = DBUuid::new_v4().to_string();
 
-                let (status, key) = match event_config.event_type {
-                    TitoEventType::Queue => {
-                        use crate::types::{PARTITION_DIGITS, SEQUENCE_DIGITS, TOTAL_PARTITIONS};
-                        use std::collections::hash_map::DefaultHasher;
-                        use std::hash::{Hash, Hasher};
+                use crate::types::{PARTITION_DIGITS, SEQUENCE_DIGITS, TOTAL_PARTITIONS};
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
 
-                        let status = String::from("PENDING");
+                let status = String::from("PENDING");
 
-                        let partition_key = model.partition_key();
-                        let mut hasher = DefaultHasher::new();
-                        partition_key.hash(&mut hasher);
-                        let partition = (hasher.finish() as u32) % TOTAL_PARTITIONS;
+                let partition_key = model.partition_key();
+                let mut hasher = DefaultHasher::new();
+                partition_key.hash(&mut hasher);
+                let partition = (hasher.finish() as u32) % TOTAL_PARTITIONS;
 
-                        let sequence = Utc::now().timestamp_micros() as u64;
+                let sequence = Utc::now().timestamp_micros() as u64;
 
-                        let key = format!(
-                            "event:{}:{:0pwidth$}:{:0swidth$}",
-                            status,
-                            partition,
-                            sequence,
-                            pwidth = PARTITION_DIGITS,
-                            swidth = SEQUENCE_DIGITS
-                        );
-                        (status, key)
-                    }
-                    TitoEventType::Audit => {
-                        let status = String::from("ARCHIVED");
-                        let key =
-                            format!("audit:{}:{}:{}", created_at, event_config.name, uuid_str);
-                        (status, key)
-                    }
-                };
+                let key = format!(
+                    "event:{}:{:0pwidth$}:{:0swidth$}",
+                    status,
+                    partition,
+                    sequence,
+                    pwidth = PARTITION_DIGITS,
+                    swidth = SEQUENCE_DIGITS
+                );
 
                 let event = TitoEvent {
                     id: uuid_str,

@@ -325,13 +325,6 @@ pub type DBUuid = Uuid;
 #[derive(Debug, Clone)]
 pub struct TitoEventConfig {
     pub name: String,
-    pub event_type: TitoEventType,
-}
-
-#[derive(Debug, Clone)]
-pub enum TitoEventType {
-    Queue,
-    Audit,
 }
 
 #[derive(Debug, Clone, PartialEq)]
