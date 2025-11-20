@@ -118,8 +118,7 @@ pub struct TitoUtilsConnectInput {
 pub struct TitoGenerateEventPayload {
     pub key: String,
     pub operation: TitoOperation,
-    pub event_at: Option<i64>,
-    pub metadata: serde_json::Value,
+    pub event: EventConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -345,13 +344,40 @@ impl fmt::Display for TitoOperation {
 }
 
 #[derive(Debug, Clone)]
+pub enum EventConfig {
+    None,
+    Generate,
+    GenerateWithMetadata(serde_json::Value),
+}
+
+#[derive(Debug, Clone)]
 pub struct TitoOptions {
-    pub event_at: Option<i64>,
-    pub event_metadata: Option<serde_json::Value>,
+    pub event: EventConfig,
     pub operation: TitoOperation,
 }
 
-impl TitoOptions {}
+impl TitoOptions {
+    pub fn skip_events(operation: TitoOperation) -> Self {
+        Self {
+            event: EventConfig::None,
+            operation,
+        }
+    }
+
+    pub fn with_events(operation: TitoOperation) -> Self {
+        Self {
+            event: EventConfig::Generate,
+            operation,
+        }
+    }
+
+    pub fn with_metadata(operation: TitoOperation, metadata: serde_json::Value) -> Self {
+        Self {
+            event: EventConfig::GenerateWithMetadata(metadata),
+            operation,
+        }
+    }
+}
 
 // Partition configuration for distributed event processing
 #[derive(Debug, Clone)]

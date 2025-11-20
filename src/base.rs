@@ -364,11 +364,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         T: serde::de::DeserializeOwned,
     {
         let metadata = serde_json::to_value(&payload).unwrap_or_default();
-        let options = TitoOptions {
-            event_at: Some(Utc::now().timestamp()),
-            event_metadata: Some(metadata),
-            operation: TitoOperation::Insert,
-        };
+        let options = TitoOptions::with_metadata(TitoOperation::Insert, metadata);
         self.build_with_options(payload, options, tx).await
     }
 
@@ -406,25 +402,11 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
         self.put(reverse_key.clone(), index_json_key, tx).await?;
 
-        let mut metadata = serde_json::to_value(&payload).unwrap_or_default();
-        if let Some(custom_metadata) = options.event_metadata {
-            if let (Some(base_obj), Some(custom_obj)) =
-                (metadata.as_object_mut(), custom_metadata.as_object())
-            {
-                for (key, value) in custom_obj {
-                    base_obj.insert(key.clone(), value.clone());
-                }
-            } else if custom_metadata.is_object() {
-                metadata = custom_metadata;
-            }
-        }
-
         self.generate_event(
             TitoGenerateEventPayload {
                 key: id.clone(),
                 operation: options.operation,
-                event_at: options.event_at,
-                metadata,
+                event: options.event.clone(),
             },
             &payload,
             tx,
@@ -445,53 +427,63 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         model: &T,
         tx: &E::Transaction,
     ) -> Result<bool, TitoError> {
-        if let Some(event_at) = payload.event_at.clone() {
-            for event_config in model.events().iter() {
-                self.lock_keys(vec![payload.key.clone()], tx).await?;
-                let created_at = Utc::now().timestamp();
+        use crate::types::EventConfig;
 
-                let message = event_config.name.to_string();
+        if matches!(payload.event, EventConfig::None) {
+            return Ok(true);
+        }
 
-                let uuid_str = DBUuid::new_v4().to_string();
+        let metadata = match payload.event {
+            EventConfig::None => unreachable!(),
+            EventConfig::Generate => serde_json::Value::Null,
+            EventConfig::GenerateWithMetadata(custom_meta) => custom_meta,
+        };
 
-                use crate::types::{PARTITION_DIGITS, SEQUENCE_DIGITS, TOTAL_PARTITIONS};
-                use std::collections::hash_map::DefaultHasher;
-                use std::hash::{Hash, Hasher};
+        for event_config in model.events().iter() {
+            self.lock_keys(vec![payload.key.clone()], tx).await?;
+            let created_at = Utc::now().timestamp();
 
-                let status = String::from("PENDING");
+            let message = event_config.name.to_string();
 
-                let partition_key = model.partition_key();
-                let mut hasher = DefaultHasher::new();
-                partition_key.hash(&mut hasher);
-                let partition = (hasher.finish() as u32) % TOTAL_PARTITIONS;
+            let uuid_str = DBUuid::new_v4().to_string();
 
-                let sequence = Utc::now().timestamp_micros() as u64;
+            use crate::types::{PARTITION_DIGITS, SEQUENCE_DIGITS, TOTAL_PARTITIONS};
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
 
-                let key = format!(
-                    "event:{}:{:0pwidth$}:{:0swidth$}",
-                    status,
-                    partition,
-                    sequence,
-                    pwidth = PARTITION_DIGITS,
-                    swidth = SEQUENCE_DIGITS
-                );
+            let status = String::from("PENDING");
 
-                let event = TitoEvent {
-                    id: uuid_str,
-                    key: key.clone(),
-                    entity: payload.key.clone(),
-                    action: payload.operation.to_string(),
-                    status,
-                    message,
-                    retries: 0,
-                    max_retries: 5,
-                    created_at: created_at,
-                    updated_at: created_at,
-                    metadata: payload.metadata.clone(),
-                };
+            let partition_key = model.partition_key();
+            let mut hasher = DefaultHasher::new();
+            partition_key.hash(&mut hasher);
+            let partition = (hasher.finish() as u32) % TOTAL_PARTITIONS;
 
-                self.put(key.clone(), &event, tx).await?;
-            }
+            let sequence = Utc::now().timestamp_micros() as u64;
+
+            let key = format!(
+                "event:{}:{:0pwidth$}:{:0swidth$}",
+                status,
+                partition,
+                sequence,
+                pwidth = PARTITION_DIGITS,
+                swidth = SEQUENCE_DIGITS
+            );
+
+            let event = TitoEvent {
+                id: uuid_str,
+                key: key.clone(),
+                entity: payload.key.clone(),
+                action: payload.operation.to_string(),
+                status,
+                message,
+                retries: 0,
+                max_retries: 5,
+                created_at: created_at,
+                updated_at: created_at,
+                metadata: metadata.clone(),
+            };
+
+            self.put(key.clone(), &event, tx).await?;
         }
 
         Ok(true)
@@ -720,11 +712,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         T: serde::de::DeserializeOwned,
     {
         let metadata = serde_json::to_value(&payload).unwrap_or_default();
-        let options = TitoOptions {
-            event_at: Some(Utc::now().timestamp()),
-            event_metadata: Some(metadata),
-            operation: TitoOperation::Update,
-        };
+        let options = TitoOptions::with_metadata(TitoOperation::Update, metadata);
         self.update_with_options(payload, options, tx).await
     }
 
@@ -747,11 +735,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         let deleted = self
             .delete_by_id_with_options(
                 &raw_id,
-                TitoOptions {
-                    event_at: None,
-                    event_metadata: None,
-                    operation: TitoOperation::Delete,
-                },
+                TitoOptions::skip_events(TitoOperation::Delete),
                 tx,
             )
             .await;
@@ -859,18 +843,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             }
         };
 
-        if let Some(custom_metadata) = options.event_metadata {
-            if let (Some(base_obj), Some(custom_obj)) =
-                (metadata.as_object_mut(), custom_metadata.as_object())
-            {
-                for (key, value) in custom_obj {
-                    base_obj.insert(key.clone(), value.clone());
-                }
-            } else if custom_metadata.is_object() {
-                metadata = custom_metadata;
-            }
-        }
-
         let reverse_index = self.get_reverse_index(&reverse_index_key, tx).await?;
         let mut keys = reverse_index.value;
 
@@ -886,8 +858,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             TitoGenerateEventPayload {
                 key: id.to_string(),
                 operation: options.operation,
-                event_at: options.event_at,
-                metadata,
+                event: options.event.clone(),
             },
             &model,
             tx,
@@ -900,11 +871,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     pub async fn delete_by_id(&self, raw_id: &str, tx: &E::Transaction) -> Result<bool, TitoError> {
         self.delete_by_id_with_options(
             raw_id,
-            TitoOptions {
-                event_at: Some(Utc::now().timestamp()),
-                event_metadata: None,
-                operation: TitoOperation::Delete,
-            },
+            TitoOptions::with_events(TitoOperation::Delete),
             tx,
         )
         .await
@@ -1082,11 +1049,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
                     self.update_with_options(
                         model_instance,
-                        TitoOptions {
-                            event_at: Some(Utc::now().timestamp()),
-                            event_metadata: None,
-                            operation: TitoOperation::Update,
-                        },
+                        TitoOptions::with_events(TitoOperation::Update),
                         &tx,
                     )
                     .await?;
@@ -1137,11 +1100,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
                         self.update_with_options(
                             model_instance,
-                            TitoOptions {
-                                event_at: Some(Utc::now().timestamp()),
-                                event_metadata: None,
-                                operation: TitoOperation::Update,
-                            },
+                            TitoOptions::with_events(TitoOperation::Update),
                             &tx,
                         )
                         .await?;

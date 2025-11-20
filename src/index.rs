@@ -374,11 +374,7 @@ impl<
 
                     self.update_with_options(
                         model_instance,
-                        TitoOptions {
-                            event_at: Some(Utc::now().timestamp()),
-                            event_metadata: None,
-                            operation: TitoOperation::Update,
-                        },
+                        TitoOptions::with_events(TitoOperation::Update),
                         &tx,
                     )
                     .await?;
