@@ -458,8 +458,11 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
             let sequence = Utc::now().timestamp_micros() as u64;
 
+            let event_type = &event_config.name;
+
             let key = format!(
-                "event:{:0pwidth$}:{:0swidth$}",
+                "event:{}:{:0pwidth$}:{:0swidth$}",
+                event_type,
                 partition,
                 sequence,
                 pwidth = PARTITION_DIGITS,

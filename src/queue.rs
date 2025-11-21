@@ -17,6 +17,7 @@ impl<E: TitoEngine> TitoQueue<E> {
 
     pub async fn pull_partition_range(
         &self,
+        event_type: String,
         start_partition: u32,
         end_partition: u32,
         limit: u32,
@@ -36,7 +37,7 @@ impl<E: TitoEngine> TitoQueue<E> {
                         break;
                     }
 
-                    let checkpoint_key = format!("queue_checkpoint:{:0width$}", partition, width = PARTITION_DIGITS);
+                    let checkpoint_key = format!("queue_checkpoint:{}:{:0width$}", event_type, partition, width = PARTITION_DIGITS);
 
                     // Read checkpoint for this partition
                     let last_sequence = match tx.get(checkpoint_key.as_bytes()).await
@@ -51,14 +52,16 @@ impl<E: TitoEngine> TitoQueue<E> {
 
                     // Scan events in this partition from checkpoint onwards (FIFO)
                     let event_start_key = format!(
-                        "event:{:0pwidth$}:{:0swidth$}",
+                        "event:{}:{:0pwidth$}:{:0swidth$}",
+                        event_type,
                         partition,
                         last_sequence + 1,
                         pwidth = PARTITION_DIGITS,
                         swidth = SEQUENCE_DIGITS
                     );
                     let event_end_key = format!(
-                        "event:{:0pwidth$}:",
+                        "event:{}:{:0pwidth$}:",
+                        event_type,
                         partition + 1,
                         pwidth = PARTITION_DIGITS
                     );
@@ -74,16 +77,17 @@ impl<E: TitoEngine> TitoQueue<E> {
                         if let Ok(event) = serde_json::from_slice::<TitoEvent>(&event_bytes) {
                             let event_key_str = String::from_utf8_lossy(&event_key);
 
-                            // Extract sequence from event key
+                            // Extract partition and sequence from event key: event:{event_type}:{partition}:{sequence}
                             let parts: Vec<&str> = event_key_str.split(':').collect();
-                            if parts.len() < 3 {
+                            if parts.len() < 4 {
                                 continue;
                             }
-                            let sequence = parts[2];
+                            let partition_str = parts[2];
+                            let sequence = parts[3];
 
                             // Check if already completed or in progress
-                            let completed_key = format!("queue:COMPLETED:{:0pwidth$}:{}", partition, sequence, pwidth = PARTITION_DIGITS);
-                            let progress_key = format!("queue:PROGRESS:{:0pwidth$}:{}", partition, sequence, pwidth = PARTITION_DIGITS);
+                            let completed_key = format!("queue:{}:COMPLETED:{}:{}", event_type, partition_str, sequence);
+                            let progress_key = format!("queue:{}:PROGRESS:{}:{}", event_type, partition_str, sequence);
 
                             let is_completed = tx.get(completed_key.as_bytes()).await
                                 .map_err(|e| TitoError::QueryFailed(format!("Completed check failed: {}", e)))?
@@ -125,25 +129,26 @@ impl<E: TitoEngine> TitoQueue<E> {
 
         self.engine
             .transaction(|tx| async move {
-                // job_id is the event key: event:{partition}:{sequence}
-                // Extract partition and sequence
+                // job_id is the event key: event:{event_type}:{partition}:{sequence}
+                // Extract event_type, partition and sequence
                 let parts: Vec<&str> = job_id.split(':').collect();
-                if parts.len() < 3 {
+                if parts.len() < 4 {
                     return Err(TitoError::InvalidInput("Invalid event key format".to_string()));
                 }
-                let partition_str = parts[1];
-                let sequence_str = parts[2];
+                let event_type = parts[1];
+                let partition_str = parts[2];
+                let sequence_str = parts[3];
                 let sequence: i64 = sequence_str.parse()
                     .map_err(|_| TitoError::InvalidInput("Invalid sequence".to_string()))?;
 
                 // Delete PROGRESS entry
-                let progress_key = format!("queue:PROGRESS:{}:{}", partition_str, sequence_str);
+                let progress_key = format!("queue:{}:PROGRESS:{}:{}", event_type, partition_str, sequence_str);
                 tx.delete(progress_key.as_bytes())
                     .await
                     .map_err(|e| TitoError::DeleteFailed(format!("Delete progress failed: {}", e)))?;
 
                 // Create COMPLETED entry
-                let completed_key = format!("queue:COMPLETED:{}:{}", partition_str, sequence_str);
+                let completed_key = format!("queue:{}:COMPLETED:{}:{}", event_type, partition_str, sequence_str);
                 let completed = QueueCompleted {
                     updated_at: Utc::now().timestamp(),
                 };
@@ -152,7 +157,7 @@ impl<E: TitoEngine> TitoQueue<E> {
                     .map_err(|e| TitoError::UpdateFailed(format!("Put completed failed: {}", e)))?;
 
                 // Update checkpoint if this is higher than current
-                let checkpoint_key = format!("queue_checkpoint:{}", partition_str);
+                let checkpoint_key = format!("queue_checkpoint:{}:{}", event_type, partition_str);
                 let current_checkpoint = match tx.get(checkpoint_key.as_bytes()).await
                     .map_err(|e| TitoError::QueryFailed(format!("Checkpoint read failed: {}", e)))? {
                     Some(bytes) => {
@@ -185,17 +190,18 @@ impl<E: TitoEngine> TitoQueue<E> {
 
         self.engine
             .transaction(|tx| async move {
-                // job_id is the event key: event:{partition}:{sequence}
-                // Extract partition and sequence
+                // job_id is the event key: event:{event_type}:{partition}:{sequence}
+                // Extract event_type, partition and sequence
                 let parts: Vec<&str> = job_id.split(':').collect();
-                if parts.len() < 3 {
+                if parts.len() < 4 {
                     return Err(TitoError::InvalidInput("Invalid event key format".to_string()));
                 }
-                let partition_str = parts[1];
-                let sequence_str = parts[2];
+                let event_type = parts[1];
+                let partition_str = parts[2];
+                let sequence_str = parts[3];
 
                 // Read PROGRESS entry to get retry count
-                let progress_key = format!("queue:PROGRESS:{}:{}", partition_str, sequence_str);
+                let progress_key = format!("queue:{}:PROGRESS:{}:{}", event_type, partition_str, sequence_str);
                 let progress_data = tx.get(progress_key.as_bytes())
                     .await
                     .map_err(|e| TitoError::QueryFailed(format!("Get progress failed: {}", e)))?;
@@ -220,7 +226,7 @@ impl<E: TitoEngine> TitoQueue<E> {
                             .await
                             .map_err(|e| TitoError::DeleteFailed(format!("Delete progress failed: {}", e)))?;
 
-                        let failed_key = format!("queue:FAILED:{}:{}", partition_str, sequence_str);
+                        let failed_key = format!("queue:{}:FAILED:{}:{}", event_type, partition_str, sequence_str);
                         let failed = QueueFailed {
                             retries: progress.retries,
                             updated_at: Utc::now().timestamp(),
@@ -247,6 +253,7 @@ impl<E: TitoEngine> TitoQueue<E> {
 
 pub async fn run_worker<E: TitoEngine + 'static, H>(
     queue: Arc<TitoQueue<E>>,
+    event_type: String,
     handler: H,
     partition_config: crate::types::PartitionConfig,
     is_leader: Arc<AtomicBool>,
@@ -269,9 +276,9 @@ where
                 _ = async {
                     let is_leader_val = is_leader.load(Ordering::SeqCst);
                     if is_leader_val {
-                        // Pull jobs from assigned partition range
-                        // Use reverse=true for LIFO (newest first)
+                        // Pull jobs from assigned partition range for this event type
                         match queue.pull_partition_range(
+                            event_type.clone(),
                             partition_config.start,
                             partition_config.end,
                             20,
