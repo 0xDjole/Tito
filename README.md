@@ -20,7 +20,7 @@ Add Tito to your project:
 
 ```toml
 [dependencies]
-tito = "0.1.42"
+tito = "0.1.43"
 ```
 
 ## Quick Start
@@ -50,11 +50,19 @@ struct User {
 }
 
 impl TitoModelTrait for User {
-    fn get_embedded_relationships(&self) -> Vec<tito::types::TitoEmbeddedRelationshipConfig> {
+    fn relationships(&self) -> Vec<tito::types::TitoRelationshipConfig> {
         vec![] // No relationships for this simple model
     }
 
-    fn get_indexes(&self) -> Vec<TitoIndexConfig> {
+    fn references(&self) -> Vec<String> {
+        vec![] // No references to other entities
+    }
+
+    fn partition_key(&self) -> String {
+        self.id.clone() // Partition by user ID
+    }
+
+    fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![TitoIndexConfig {
             condition: true,
             name: "by_email".to_string(),
@@ -62,19 +70,18 @@ impl TitoModelTrait for User {
                 name: "email".to_string(),
                 r#type: TitoIndexBlockType::String,
             }],
-            custom_generator: None,
         }]
     }
 
-    fn get_table_name(&self) -> String {
+    fn table(&self) -> String {
         "users".to_string()
     }
 
-    fn get_events(&self) -> Vec<TitoEventConfig> {
-        vec![]
+    fn events(&self) -> Vec<TitoEventConfig> {
+        vec![] // No events for this model
     }
 
-    fn get_id(&self) -> String {
+    fn id(&self) -> String {
         self.id.clone()
     }
 }
@@ -240,7 +247,6 @@ TitoIndexConfig {
         name: "status".to_string(),
         r#type: TitoIndexBlockType::String,
     }],
-    custom_generator: None,
 }
 ```
 
@@ -262,16 +268,24 @@ struct Post {
 }
 
 impl TitoModelTrait for Post {
-    fn get_embedded_relationships(&self) -> Vec<TitoEmbeddedRelationshipConfig> {
+    fn relationships(&self) -> Vec<TitoRelationshipConfig> {
         // Define the relationship between posts and tags
-        vec![TitoEmbeddedRelationshipConfig {
+        vec![TitoRelationshipConfig {
             source_field_name: "tag_ids".to_string(),
             destination_field_name: "tags".to_string(),
             model: "tag".to_string(),
         }]
     }
 
-    // ... other implementation details
+    fn references(&self) -> Vec<String> {
+        self.tag_ids.clone() // References to tag IDs
+    }
+
+    fn partition_key(&self) -> String {
+        self.id.clone()
+    }
+
+    // ... other implementation details (indexes, table, events, id)
 }
 
 // Fetch a post with related tags using query builder
@@ -302,7 +316,6 @@ TitoIndexConfig {
             r#type: TitoIndexBlockType::Number,
         },
     ],
-    custom_generator: None,
 }
 
 // Query using composite index
@@ -467,13 +480,238 @@ Each event type acts as an independent queue (similar to Kafka topics), allowing
 - Isolate failures to specific event types
 - Configure different concurrency levels per event type
 
-## Examples
+## Running the Examples
 
-For more detailed examples, check out the examples directory:
+Tito comes with comprehensive examples demonstrating all major features. To run them, you'll need a TiKV server running locally.
 
-- `crud.rs` - Basic CRUD operations
-- `blog.rs` - More complex example with relationships and query builder
-- `queue_fifo.rs` - Event queue with FIFO processing
+### Setting up TiKV
+
+The quickest way to get started is using Docker:
+
+```bash
+# Start a local TiKV cluster
+docker run -d --name tikv \
+  -p 2379:2379 \
+  pingcap/pd:latest \
+  --name "pd" \
+  --data-dir "/data/pd" \
+  --client-urls "http://0.0.0.0:2379"
+
+docker run -d --name tikv \
+  -p 20160:20160 \
+  --link pd \
+  pingcap/tikv:latest \
+  --pd "pd:2379" \
+  --data-dir "/data/tikv"
+```
+
+Or use TiUP for a production-like setup:
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://tiup-mirrors.pingcap.com/install.sh | sh
+tiup playground --mode tikv-slim
+```
+
+### Example 1: Basic CRUD (`crud.rs`)
+
+Demonstrates fundamental database operations:
+
+```bash
+cargo run --example crud
+```
+
+**What it does:**
+- Connects to TiKV
+- Creates a user with email indexing
+- Finds the user by ID
+- Updates user information
+- Deletes the user
+
+**Expected output:**
+```
+Created user: User { id: "...", name: "John Doe", email: "john@example.com" }
+Found user: User { id: "...", name: "John Doe", email: "john@example.com" }
+User updated successfully
+User deleted successfully
+```
+
+### Example 2: Relationships and Queries (`blog.rs`)
+
+Shows how to work with related data using the powerful relationship system:
+
+```bash
+cargo run --example blog
+```
+
+**What it does:**
+- Creates tags (Technology, Travel, Rust, Databases)
+- Creates blog posts with multiple tags
+- Demonstrates relationship hydration
+- Queries posts by tag
+- Queries posts by author
+
+**Expected output:**
+```
+Created tags:
+- Technology: <uuid>
+- Travel: <uuid>
+...
+
+Created posts:
+1. Introduction to TiKV (by Alice)
+2. Best cities to visit in Europe (by Bob)
+3. Using Rust with TiKV (by Alice)
+
+Post with tags:
+Title: Introduction to TiKV
+Tags:
+- Technology
+- Databases
+
+Technology posts:
+- Using Rust with TiKV (by Alice)
+  Tags: Technology, Rust, Databases
+...
+```
+
+**Key concepts demonstrated:**
+- One-to-many relationships (Post → Tags)
+- Relationship hydration with `.relationship("tags")`
+- Composite indexes for efficient querying
+- Query builder pattern
+
+### Example 3: Event Queue System (`queue_fifo.rs`)
+
+Demonstrates the event-driven queue with FIFO processing:
+
+```bash
+cargo run --example queue_fifo
+```
+
+**What it does:**
+- Creates 5 users with events enabled
+- Starts a worker to process events
+- Shows FIFO ordering (oldest events first)
+- Demonstrates partition-based parallelism
+- Graceful shutdown
+
+**Expected output:**
+```
+🚀 Testing FIFO Queue with Checkpoints
+
+📝 Creating 5 users to generate events...
+✓ Created: User 1 (user1@example.com)
+✓ Created: User 2 (user2@example.com)
+...
+
+📊 Setting up queue worker...
+⚙️  Worker started! Processing events in FIFO order...
+
+  [1] Processing event: INSERT - table:user:xxx (sequence: 00001...)
+  [2] Processing event: INSERT - table:user:xxx (sequence: 00001...)
+  ...
+
+✅ Complete! Processed 5 events in FIFO order
+   (Oldest events processed first!)
+```
+
+**Key concepts demonstrated:**
+- Event generation with `TitoOptions::with_events()`
+- Event worker setup with `run_worker()`
+- Event type isolation ("user" events)
+- FIFO ordering within partitions
+- Checkpoint-based progress tracking
+- Graceful shutdown handling
+
+### How the Queue System Works
+
+The event queue is perfect for:
+- **Async processing**: Offload heavy work from request handlers
+- **Event sourcing**: Track all changes to your data
+- **Multi-tenant processing**: Partition by tenant ID for isolation
+- **Saga patterns**: Coordinate distributed transactions
+
+**Architecture:**
+
+```
+Model Change (INSERT/UPDATE/DELETE)
+         ↓
+Event Generated (if events() enabled)
+         ↓
+Stored in TiKV: event:{event_type}:{partition}:{sequence}
+         ↓
+Worker polls: queue:{event_type}:PENDING:{partition}:{sequence}
+         ↓
+Process Event (your handler logic)
+         ↓
+Mark Complete: queue:{event_type}:COMPLETED:{partition}:{sequence}
+         ↓
+Update Checkpoint: queue_checkpoint:{event_type}:{partition}
+```
+
+**Practical Example - Email Notifications:**
+
+```rust
+// 1. Define event in your User model
+impl TitoModelTrait for User {
+    fn events(&self) -> Vec<TitoEventConfig> {
+        vec![TitoEventConfig {
+            name: "user".to_string(),
+        }]
+    }
+
+    fn partition_key(&self) -> String {
+        // Partition by user_id for ordered processing per user
+        self.id.clone()
+    }
+}
+
+// 2. Create user with event
+tito_db.transaction(|tx| {
+    let user_model = user_model.clone();
+    async move {
+        user_model.build_with_options(
+            new_user,
+            TitoOptions::with_events(TitoOperation::Insert),
+            &tx,
+        ).await?;
+        Ok::<_, TitoError>(())
+    }
+}).await?;
+
+// 3. Worker processes event asynchronously
+let handler = move |event: TitoEvent| {
+    Box::pin(async move {
+        if event.action == "INSERT" {
+            // Send welcome email
+            send_welcome_email(&event.entity_id()).await?;
+        }
+        Ok::<_, TitoError>(())
+    }) as BoxFuture<'static, Result<(), TitoError>>
+};
+
+let worker = run_worker(
+    queue.clone(),
+    String::from("user"), // Only process "user" events
+    handler,
+    partition_config,
+    is_leader,
+    5, // Process 5 events concurrently
+    shutdown_rx,
+).await;
+```
+
+**Scaling Pattern:**
+
+```rust
+// Server 1: Partitions 0-511
+let partition_config = PartitionConfig { start: 0, end: 512 };
+
+// Server 2: Partitions 512-1023
+let partition_config = PartitionConfig { start: 512, end: 1024 };
+
+// Both process same event type, different partitions
+// = Horizontal scalability + load balancing
+```
 
 ## Requirements
 
