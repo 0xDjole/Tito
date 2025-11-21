@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tito::{
     types::{
-        DBUuid, TitoEmbeddedRelationshipConfig, TitoEngine, TitoEventConfig, TitoIndexBlockType,
+        DBUuid, TitoEngine, TitoEventConfig, TitoIndexBlockType,
         TitoIndexConfig, TitoIndexField, TitoModelTrait,
     },
     TiKV, TitoError, TitoModel,
@@ -33,12 +33,19 @@ struct Post {
 
 // Implement TitoModelTrait for Tag
 impl TitoModelTrait for Tag {
-    fn get_embedded_relationships(&self) -> Vec<TitoEmbeddedRelationshipConfig> {
-        // Tags don't embed anything
+    fn relationships(&self) -> Vec<tito::types::TitoRelationshipConfig> {
         vec![]
     }
 
-    fn get_indexes(&self) -> Vec<TitoIndexConfig> {
+    fn references(&self) -> Vec<String> {
+        vec![]
+    }
+
+    fn partition_key(&self) -> String {
+        self.id.clone()
+    }
+
+    fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![TitoIndexConfig {
             condition: true,
             name: "tag-by-name".to_string(),
@@ -46,35 +53,42 @@ impl TitoModelTrait for Tag {
                 name: "name".to_string(),
                 r#type: TitoIndexBlockType::String,
             }],
-            custom_generator: None,
         }]
     }
 
-    fn get_table_name(&self) -> String {
+    fn table(&self) -> String {
         "tag".to_string()
     }
 
-    fn get_events(&self) -> Vec<TitoEventConfig> {
+    fn events(&self) -> Vec<TitoEventConfig> {
         vec![]
     }
 
-    fn get_id(&self) -> String {
+    fn id(&self) -> String {
         self.id.clone()
     }
 }
 
 // Implement TitoModelTrait for Post
 impl TitoModelTrait for Post {
-    fn get_embedded_relationships(&self) -> Vec<TitoEmbeddedRelationshipConfig> {
+    fn relationships(&self) -> Vec<tito::types::TitoRelationshipConfig> {
         // Posts embed multiple tags
-        vec![TitoEmbeddedRelationshipConfig {
+        vec![tito::types::TitoRelationshipConfig {
             source_field_name: "tag_ids".to_string(),
             destination_field_name: "tags".to_string(),
             model: "tag".to_string(),
         }]
     }
 
-    fn get_indexes(&self) -> Vec<TitoIndexConfig> {
+    fn references(&self) -> Vec<String> {
+        self.tag_ids.clone()
+    }
+
+    fn partition_key(&self) -> String {
+        self.id.clone()
+    }
+
+    fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![
             TitoIndexConfig {
                 condition: true,
@@ -83,7 +97,6 @@ impl TitoModelTrait for Post {
                     name: "author".to_string(),
                     r#type: TitoIndexBlockType::String,
                 }],
-                custom_generator: None,
             },
             TitoIndexConfig {
                 condition: true,
@@ -92,7 +105,6 @@ impl TitoModelTrait for Post {
                     name: "title".to_string(),
                     r#type: TitoIndexBlockType::String,
                 }],
-                custom_generator: None,
             },
             TitoIndexConfig {
                 condition: true,
@@ -101,20 +113,19 @@ impl TitoModelTrait for Post {
                     name: "tag_ids".to_string(),
                     r#type: TitoIndexBlockType::String,
                 }],
-                custom_generator: None,
             },
         ]
     }
 
-    fn get_table_name(&self) -> String {
+    fn table(&self) -> String {
         "post".to_string()
     }
 
-    fn get_events(&self) -> Vec<TitoEventConfig> {
+    fn events(&self) -> Vec<TitoEventConfig> {
         vec![]
     }
 
-    fn get_id(&self) -> String {
+    fn id(&self) -> String {
         self.id.clone()
     }
 }

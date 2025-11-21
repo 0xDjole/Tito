@@ -16,11 +16,19 @@ struct User {
 }
 
 impl TitoModelTrait for User {
-    fn get_embedded_relationships(&self) -> Vec<tito::types::TitoEmbeddedRelationshipConfig> {
+    fn relationships(&self) -> Vec<tito::types::TitoRelationshipConfig> {
         vec![]
     }
 
-    fn get_indexes(&self) -> Vec<TitoIndexConfig> {
+    fn references(&self) -> Vec<String> {
+        vec![]
+    }
+
+    fn partition_key(&self) -> String {
+        self.id.clone()
+    }
+
+    fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![TitoIndexConfig {
             condition: true,
             name: "by_email".to_string(),
@@ -28,19 +36,18 @@ impl TitoModelTrait for User {
                 name: "email".to_string(),
                 r#type: TitoIndexBlockType::String,
             }],
-            custom_generator: None,
         }]
     }
 
-    fn get_table_name(&self) -> String {
+    fn table(&self) -> String {
         "users".to_string()
     }
 
-    fn get_events(&self) -> Vec<TitoEventConfig> {
+    fn events(&self) -> Vec<TitoEventConfig> {
         vec![]
     }
 
-    fn get_id(&self) -> String {
+    fn id(&self) -> String {
         self.id.clone()
     }
 }

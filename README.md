@@ -9,8 +9,8 @@ Tito is a powerful, flexible database layer built on top of TiKV, providing robu
 - **Powerful Indexing Strategies**: Define custom indexes with conditional logic for efficient querying
 - **Relationship Modeling**: Create and manage embedded relationships between data models
 - **Transaction Management**: Full ACID-compliant transaction support
-- **Job Queue**: Built-in persistent job queue with retries and scheduling capabilities
-- **Async Workers**: Tokio-powered workers for concurrent job processing
+- **Event-Driven Queue**: Built-in persistent event queue with FIFO ordering and partition-based parallelism
+- **Async Workers**: Tokio-powered workers for concurrent event processing with per-event-type isolation
 - **Type Safety**: Leverages Rust's type system for safety and performance
 - **Flexible Query API**: Query data using intuitive builder pattern
 
@@ -20,7 +20,7 @@ Add Tito to your project:
 
 ```toml
 [dependencies]
-tito = "0.1.9"
+tito = "0.2.0"
 ```
 
 ## Quick Start
@@ -315,12 +315,165 @@ let articles = query
     .await?;
 ```
 
+## Event Queue System
+
+Tito includes a built-in event-driven queue system for asynchronous processing with FIFO ordering and partition-based parallelism.
+
+### Defining Events
+
+Define events in your model by implementing the `events()` method:
+
+```rust
+impl TitoModelTrait for User {
+    fn events(&self) -> Vec<TitoEventConfig> {
+        vec![TitoEventConfig {
+            name: "user".to_string(), // Event type name
+        }]
+    }
+
+    // Other trait methods...
+}
+```
+
+### Creating Events
+
+Events are automatically created when you perform operations with event options:
+
+```rust
+use tito::{TitoOptions, TitoOperation};
+
+// Create a user and generate an INSERT event
+tito_db.transaction(|tx| {
+    let user_model = user_model.clone();
+    async move {
+        user_model
+            .build_with_options(
+                user,
+                TitoOptions::with_events(TitoOperation::Insert),
+                &tx,
+            )
+            .await?;
+        Ok::<_, TitoError>(())
+    }
+}).await?;
+
+// Update a user and generate an UPDATE event
+tito_db.transaction(|tx| {
+    let user_model = user_model.clone();
+    async move {
+        user_model
+            .update_with_options(
+                user,
+                TitoOptions::with_events(TitoOperation::Update),
+                &tx,
+            )
+            .await?;
+        Ok::<_, TitoError>(())
+    }
+}).await?;
+```
+
+### Setting Up Workers
+
+Create workers to process events by event type:
+
+```rust
+use tito::queue::{TitoQueue, run_worker};
+use tito::types::PartitionConfig;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use tokio::sync::broadcast;
+
+// Create queue
+let queue = Arc::new(TitoQueue {
+    engine: tito_db.clone(),
+});
+
+// Worker configuration
+let is_leader = Arc::new(AtomicBool::new(true));
+let partition_config = PartitionConfig {
+    start: 0,
+    end: 1024, // Process all 1024 partitions
+};
+
+// Create shutdown channel
+let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+
+// Define event handler
+let handler = move |event: tito::TitoEvent| {
+    Box::pin(async move {
+        println!("Processing: {} - {}", event.action, event.entity);
+        // Your event processing logic here
+        Ok::<_, TitoError>(())
+    }) as BoxFuture<'static, Result<(), TitoError>>
+};
+
+// Start worker for "user" events
+let worker_handle = run_worker(
+    queue.clone(),
+    String::from("user"), // Event type to process
+    handler,
+    partition_config,
+    is_leader.clone(),
+    5, // Concurrency level
+    shutdown_rx,
+)
+.await;
+
+// Gracefully shutdown when done
+let _ = shutdown_tx.send(());
+let _ = worker_handle.await;
+```
+
+### Key Concepts
+
+- **Event Types**: Each model can define multiple event types. Workers process one event type at a time, enabling independent scaling and failure isolation.
+- **FIFO Ordering**: Events are processed oldest-first within each partition, ensuring correct ordering.
+- **Partitions**: The system uses 1024 fixed partitions for parallel processing. Partitioning is determined by the model's `partition_key()` method.
+- **Checkpoints**: Each event type maintains independent checkpoints per partition, tracking processing progress.
+- **Leader Election**: Use the `is_leader` flag to ensure only one worker processes events in distributed setups.
+- **Graceful Shutdown**: Workers respect shutdown signals for clean termination.
+
+### Multiple Workers
+
+You can run multiple workers for different event types:
+
+```rust
+// Worker for user events
+let user_worker = run_worker(
+    queue.clone(),
+    String::from("user"),
+    user_handler,
+    partition_config.clone(),
+    is_leader.clone(),
+    5,
+    shutdown_rx.resubscribe(),
+).await;
+
+// Worker for order events
+let order_worker = run_worker(
+    queue.clone(),
+    String::from("order"),
+    order_handler,
+    partition_config.clone(),
+    is_leader.clone(),
+    10, // Different concurrency
+    shutdown_rx.resubscribe(),
+).await;
+```
+
+Each event type acts as an independent queue (similar to Kafka topics), allowing you to:
+- Scale workers independently based on load
+- Isolate failures to specific event types
+- Configure different concurrency levels per event type
+
 ## Examples
 
 For more detailed examples, check out the examples directory:
 
 - `crud.rs` - Basic CRUD operations
 - `blog.rs` - More complex example with relationships and query builder
+- `queue_fifo.rs` - Event queue with FIFO processing
 
 ## Requirements
 

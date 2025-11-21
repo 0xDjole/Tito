@@ -145,6 +145,7 @@ async fn main() -> Result<(), TitoError> {
     // Start worker
     let worker_handle = run_worker(
         queue.clone(),
+        String::from("user.changed"), // event_type - matches the event config
         handler,
         partition_config,
         is_leader.clone(),
