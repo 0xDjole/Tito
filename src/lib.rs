@@ -23,6 +23,10 @@ pub mod index;
 pub mod relationship;
 
 pub use error::TitoError;
-pub use types::{TitoEvent, TitoOperation, TitoOptions, EventConfig, PartitionConfig, TOTAL_PARTITIONS, PARTITION_DIGITS, SEQUENCE_DIGITS};
+pub use types::{
+    TitoEvent, TitoOperation, TitoOptions, EventConfig, PartitionConfig,
+    QueueCheckpoint, QueueProgress, QueueCompleted, QueueFailed,
+    TOTAL_PARTITIONS, PARTITION_DIGITS, SEQUENCE_DIGITS
+};
 
 pub mod backup;

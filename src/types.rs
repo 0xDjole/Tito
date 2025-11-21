@@ -220,6 +220,29 @@ impl TitoEvent {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub struct QueueCheckpoint {
+    pub last_sequence: i64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct QueueProgress {
+    pub retries: u32,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct QueueCompleted {
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct QueueFailed {
+    pub retries: u32,
+    pub updated_at: i64,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TitoId {
     id: String,

@@ -451,8 +451,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             use std::collections::hash_map::DefaultHasher;
             use std::hash::{Hash, Hasher};
 
-            let status = String::from("PENDING");
-
             let partition_key = model.partition_key();
             let mut hasher = DefaultHasher::new();
             partition_key.hash(&mut hasher);
@@ -461,8 +459,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             let sequence = Utc::now().timestamp_micros() as u64;
 
             let key = format!(
-                "event:{}:{:0pwidth$}:{:0swidth$}",
-                status,
+                "event:{:0pwidth$}:{:0swidth$}",
                 partition,
                 sequence,
                 pwidth = PARTITION_DIGITS,
@@ -474,7 +471,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                 key: key.clone(),
                 entity: payload.key.clone(),
                 action: payload.operation.to_string(),
-                status,
+                status: String::from(""), // No longer used in key
                 message,
                 retries: 0,
                 max_retries: 5,
