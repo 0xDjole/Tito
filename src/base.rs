@@ -447,26 +447,25 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
             let uuid_str = DBUuid::new_v4().to_string();
 
-            use crate::types::{PARTITION_DIGITS, SEQUENCE_DIGITS, TOTAL_PARTITIONS};
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
+            use crate::types::PARTITION_DIGITS;
 
-            let partition_key = model.partition_key();
-            let mut hasher = DefaultHasher::new();
-            partition_key.hash(&mut hasher);
-            let partition = (hasher.finish() as u32) % TOTAL_PARTITIONS;
+            // Partition is determined by timestamp % total_partitions at scan time
+            // For now, use partition 0 - workers will filter by their assigned partition
+            let partition = 0u32;
 
-            let sequence = Utc::now().timestamp_micros() as u64;
+            // Use the timestamp from event_config (model defines when to process)
+            let timestamp = event_config.timestamp;
 
             let event_type = &event_config.name;
 
+            // New key format: event:{type}:{partition}:{timestamp}:{uuid}
             let key = format!(
-                "event:{}:{:0pwidth$}:{:0swidth$}",
+                "event:{}:{:0pwidth$}:{}:{}",
                 event_type,
                 partition,
-                sequence,
+                timestamp,
+                uuid_str,
                 pwidth = PARTITION_DIGITS,
-                swidth = SEQUENCE_DIGITS
             );
 
             let event = TitoEvent {
@@ -474,11 +473,12 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                 key: key.clone(),
                 entity: payload.key.clone(),
                 action: payload.operation.to_string(),
-                status: String::from(""), // No longer used in key
+                status: String::from(""),
                 message,
                 retries: 0,
                 max_retries: 5,
-                created_at: created_at,
+                timestamp,
+                created_at,
                 updated_at: created_at,
                 metadata: metadata.clone(),
             };

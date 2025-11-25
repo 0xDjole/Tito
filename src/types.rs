@@ -182,8 +182,6 @@ pub trait TitoModelTrait {
         vec![]
     }
 
-    fn partition_key(&self) -> String;
-
     fn indexes(&self) -> Vec<TitoIndexConfig>;
     fn table(&self) -> String;
     fn events(&self) -> Vec<TitoEventConfig>;
@@ -205,6 +203,7 @@ pub struct TitoEvent {
     pub status: String,
     pub retries: u32,
     pub max_retries: u32,
+    pub timestamp: i64, // Required: when this event should be processed (unix timestamp seconds)
     pub created_at: i64,
     pub updated_at: i64,
     pub metadata: serde_json::Value,
@@ -222,7 +221,8 @@ impl TitoEvent {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct QueueCheckpoint {
-    pub last_sequence: i64,
+    pub timestamp: i64,
+    pub uuid: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -344,9 +344,14 @@ impl<T> TitoPaginated<T> {
 
 pub type DBUuid = Uuid;
 
+/// Event configuration - each model MUST define events with timestamp
+/// The timestamp determines when the event should be processed:
+/// - Use `Utc::now().timestamp()` for immediate processing
+/// - Use a future timestamp for scheduled processing
 #[derive(Debug, Clone)]
 pub struct TitoEventConfig {
     pub name: String,
+    pub timestamp: i64, // Required: unix timestamp in seconds
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -403,22 +408,29 @@ impl TitoOptions {
 }
 
 // Partition configuration for distributed event processing
+// Each worker specifies total partitions and which partition it owns
 #[derive(Debug, Clone)]
 pub struct PartitionConfig {
-    pub start: u32,
-    pub end: u32,
+    pub total_partitions: u32,
+    pub assigned_partition: u32,
 }
 
 impl Default for PartitionConfig {
     fn default() -> Self {
         Self {
-            start: 0,
-            end: TOTAL_PARTITIONS,
+            total_partitions: 2,
+            assigned_partition: 0,
         }
     }
 }
 
-// Fixed partition count - NEVER change this after initial deployment
-pub const TOTAL_PARTITIONS: u32 = 1024;
-pub const PARTITION_DIGITS: usize = 4; // for 1024 partitions (0000-1023)
-pub const SEQUENCE_DIGITS: usize = 20; // for microsecond timestamps
+impl PartitionConfig {
+    pub fn new(total_partitions: u32, assigned_partition: u32) -> Self {
+        Self {
+            total_partitions,
+            assigned_partition,
+        }
+    }
+}
+
+pub const PARTITION_DIGITS: usize = 4; // for partition numbers (0000-9999)

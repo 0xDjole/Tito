@@ -26,7 +26,7 @@ pub use error::TitoError;
 pub use types::{
     TitoEvent, TitoOperation, TitoOptions, EventConfig, PartitionConfig,
     QueueCheckpoint, QueueProgress, QueueCompleted, QueueFailed,
-    TOTAL_PARTITIONS, PARTITION_DIGITS, SEQUENCE_DIGITS
+    PARTITION_DIGITS
 };
 
 pub mod backup;
