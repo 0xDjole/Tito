@@ -128,7 +128,6 @@ pub struct TitoEmbeddedRelationshipConfig {
     pub model: String,
 }
 
-// Transitional alias toward a simpler name
 pub type TitoRelationshipConfig = TitoEmbeddedRelationshipConfig;
 
 #[derive(Debug, Clone)]
@@ -172,12 +171,10 @@ pub struct TitoRelIndexConfig {
 }
 
 pub trait TitoModelTrait {
-    // Hydration relationships
     fn relationships(&self) -> Vec<TitoRelationshipConfig> {
         vec![]
     }
 
-    // Reference graph: declare outbound reference targets (globally-unique IDs)
     fn references(&self) -> Vec<String> {
         vec![]
     }
@@ -203,7 +200,7 @@ pub struct TitoEvent {
     pub status: String,
     pub retries: u32,
     pub max_retries: u32,
-    pub timestamp: i64, // Required: when this event should be processed (unix timestamp seconds)
+    pub timestamp: i64,
     pub created_at: i64,
     pub updated_at: i64,
     pub metadata: serde_json::Value,
@@ -344,14 +341,10 @@ impl<T> TitoPaginated<T> {
 
 pub type DBUuid = Uuid;
 
-/// Event configuration - each model MUST define events with timestamp
-/// The timestamp determines when the event should be processed:
-/// - Use `Utc::now().timestamp()` for immediate processing
-/// - Use a future timestamp for scheduled processing
 #[derive(Debug, Clone)]
 pub struct TitoEventConfig {
     pub name: String,
-    pub timestamp: i64, // Required: unix timestamp in seconds
+    pub timestamp: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -407,8 +400,6 @@ impl TitoOptions {
     }
 }
 
-// Partition configuration for distributed event processing
-// Each worker specifies total partitions and which partition it owns
 #[derive(Debug, Clone)]
 pub struct PartitionConfig {
     pub total_partitions: u32,
@@ -433,4 +424,4 @@ impl PartitionConfig {
     }
 }
 
-pub const PARTITION_DIGITS: usize = 4; // for partition numbers (0000-9999)
+pub const PARTITION_DIGITS: usize = 4;

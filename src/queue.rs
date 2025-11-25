@@ -13,8 +13,6 @@ pub struct TitoQueue<E: TitoEngine> {
 }
 
 impl<E: TitoEngine> TitoQueue<E> {
-    /// Pull events from a single assigned partition
-    /// Scans events by timestamp range: from checkpoint to now
     pub async fn pull_partition(
         &self,
         event_type: String,
@@ -35,16 +33,12 @@ impl<E: TitoEngine> TitoQueue<E> {
                     width = PARTITION_DIGITS
                 );
 
-                // Read checkpoint for this partition (last processed timestamp:uuid)
                 let checkpoint = tx.get(checkpoint_key.as_bytes()).await
                     .map_err(|e| TitoError::QueryFailed(format!("Checkpoint read failed: {}", e)))?
                     .and_then(|bytes| serde_json::from_slice::<QueueCheckpoint>(&bytes).ok());
 
                 let now = Utc::now().timestamp();
 
-                // Scan events in this partition from checkpoint onwards up to now
-                // Key format: event:{type}:{partition}:{timestamp}:{uuid}
-                // Start AFTER the last processed event (timestamp:uuid + \0)
                 let event_start_key = match &checkpoint {
                     Some(ckpt) => format!(
                         "event:{}:{:0pwidth$}:{}:{}\0",
@@ -65,7 +59,7 @@ impl<E: TitoEngine> TitoQueue<E> {
                     "event:{}:{:0pwidth$}:{}",
                     event_type,
                     partition,
-                    now + 1, // Include events up to now
+                    now + 1,
                     pwidth = PARTITION_DIGITS,
                 );
 
@@ -78,14 +72,11 @@ impl<E: TitoEngine> TitoQueue<E> {
 
                 for (event_key, event_bytes) in events {
                     if let Ok(event) = serde_json::from_slice::<TitoEvent>(&event_bytes) {
-                        // Skip if event timestamp is in the future
                         if event.timestamp > now {
                             continue;
                         }
 
                         let event_key_str = String::from_utf8_lossy(&event_key);
-
-                        // Extract partition, timestamp, uuid from key: event:{type}:{partition}:{timestamp}:{uuid}
                         let parts: Vec<&str> = event_key_str.split(':').collect();
                         if parts.len() < 5 {
                             continue;
@@ -94,8 +85,6 @@ impl<E: TitoEngine> TitoQueue<E> {
                         let timestamp_str = parts[3];
                         let uuid_str = parts[4];
 
-                        // Check if already completed or in progress
-                        // Queue key format: queue:{type}:COMPLETED:{partition}:{timestamp}:{uuid}
                         let completed_key = format!(
                             "queue:{}:COMPLETED:{}:{}:{}",
                             event_type, partition_str, timestamp_str, uuid_str
@@ -114,7 +103,6 @@ impl<E: TitoEngine> TitoQueue<E> {
                             .is_some();
 
                         if !is_completed && !is_in_progress {
-                            // Create PROGRESS entry
                             let progress = QueueProgress {
                                 retries: event.retries,
                                 updated_at: Utc::now().timestamp(),
@@ -143,7 +131,6 @@ impl<E: TitoEngine> TitoQueue<E> {
 
         self.engine
             .transaction(|tx| async move {
-                // job_id is the event key: event:{type}:{partition}:{timestamp}:{uuid}
                 let parts: Vec<&str> = job_id.split(':').collect();
                 if parts.len() < 5 {
                     return Err(TitoError::InvalidInput("Invalid event key format".to_string()));
@@ -155,7 +142,6 @@ impl<E: TitoEngine> TitoQueue<E> {
                 let timestamp: i64 = timestamp_str.parse()
                     .map_err(|_| TitoError::InvalidInput("Invalid timestamp".to_string()))?;
 
-                // Delete PROGRESS entry
                 let progress_key = format!(
                     "queue:{}:PROGRESS:{}:{}:{}",
                     event_type, partition_str, timestamp_str, uuid_str
@@ -164,7 +150,6 @@ impl<E: TitoEngine> TitoQueue<E> {
                     .await
                     .map_err(|e| TitoError::DeleteFailed(format!("Delete progress failed: {}", e)))?;
 
-                // Create COMPLETED entry
                 let completed_key = format!(
                     "queue:{}:COMPLETED:{}:{}:{}",
                     event_type, partition_str, timestamp_str, uuid_str
@@ -176,14 +161,11 @@ impl<E: TitoEngine> TitoQueue<E> {
                     .await
                     .map_err(|e| TitoError::UpdateFailed(format!("Put completed failed: {}", e)))?;
 
-                // Update checkpoint with timestamp:uuid to enable precise resume
-                // Only advance checkpoint if this event is >= current checkpoint position
                 let checkpoint_key = format!("queue_checkpoint:{}:{}", event_type, partition_str);
                 let current_checkpoint = tx.get(checkpoint_key.as_bytes()).await
                     .map_err(|e| TitoError::QueryFailed(format!("Checkpoint read failed: {}", e)))?
                     .and_then(|bytes| serde_json::from_slice::<QueueCheckpoint>(&bytes).ok());
 
-                // Compare (timestamp, uuid) lexicographically to determine if we should advance
                 let should_advance = match &current_checkpoint {
                     Some(ckpt) => {
                         (timestamp, uuid_str) > (ckpt.timestamp, ckpt.uuid.as_str())
@@ -214,7 +196,6 @@ impl<E: TitoEngine> TitoQueue<E> {
 
         self.engine
             .transaction(|tx| async move {
-                // job_id is the event key: event:{type}:{partition}:{timestamp}:{uuid}
                 let parts: Vec<&str> = job_id.split(':').collect();
                 if parts.len() < 5 {
                     return Err(TitoError::InvalidInput("Invalid event key format".to_string()));
@@ -224,7 +205,6 @@ impl<E: TitoEngine> TitoQueue<E> {
                 let timestamp_str = parts[3];
                 let uuid_str = parts[4];
 
-                // Read PROGRESS entry to get retry count
                 let progress_key = format!(
                     "queue:{}:PROGRESS:{}:{}:{}",
                     event_type, partition_str, timestamp_str, uuid_str
@@ -240,7 +220,6 @@ impl<E: TitoEngine> TitoQueue<E> {
                     const MAX_RETRIES: u32 = 5;
 
                     if progress.retries < MAX_RETRIES {
-                        // Increment retries and update PROGRESS entry
                         progress.retries += 1;
                         progress.updated_at = Utc::now().timestamp();
 
@@ -248,7 +227,6 @@ impl<E: TitoEngine> TitoQueue<E> {
                             .await
                             .map_err(|e| TitoError::UpdateFailed(format!("Update progress failed: {}", e)))?;
                     } else {
-                        // Max retries reached - delete PROGRESS and create FAILED
                         tx.delete(progress_key.as_bytes())
                             .await
                             .map_err(|e| TitoError::DeleteFailed(format!("Delete progress failed: {}", e)))?;
@@ -281,7 +259,6 @@ impl<E: TitoEngine> TitoQueue<E> {
     }
 }
 
-/// Run worker for a single partition - NO concurrency, processes one event at a time
 pub async fn run_worker<E: TitoEngine + 'static, H>(
     queue: Arc<TitoQueue<E>>,
     event_type: String,
@@ -306,14 +283,12 @@ where
                 _ = async {
                     let is_leader_val = is_leader.load(Ordering::SeqCst);
                     if is_leader_val {
-                        // Pull jobs from assigned partition for this event type
                         match queue.pull_partition(
                             event_type.clone(),
                             partition_config.assigned_partition,
-                            1, // Process one at a time
+                            1,
                         ).await {
                             Ok(jobs) => {
-                                // Process events one by one (no concurrency)
                                 for job in jobs {
                                     let result = handler(job.clone()).await;
                                     let _ = match result {

@@ -1,8 +1,8 @@
 [package]
 name = "tito"
-version = "0.1.43"
+version = "0.2.2"
 edition = "2021"
-description = "A flexible database layer with powerful indexing strategies and relationship modeling, supporting multiple backends"
+description = "Database layer on TiKV with indexing, relationships, transactions, and built-in transactional outbox with partitioned scheduled pub/sub"
 license = "Apache-2.0"
 authors = ["0xDjole 0xdjole@gmail.com"]
 
