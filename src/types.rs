@@ -14,6 +14,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct TitoConfigs {
     pub is_read_only: Arc<AtomicBool>,
+    pub total_partitions: u32,
 }
 
 pub trait TitoModelConstraints:
@@ -402,25 +403,12 @@ impl TitoOptions {
 
 #[derive(Debug, Clone)]
 pub struct PartitionConfig {
-    pub total_partitions: u32,
-    pub assigned_partition: u32,
-}
-
-impl Default for PartitionConfig {
-    fn default() -> Self {
-        Self {
-            total_partitions: 2,
-            assigned_partition: 0,
-        }
-    }
+    pub partition: u32,
 }
 
 impl PartitionConfig {
-    pub fn new(total_partitions: u32, assigned_partition: u32) -> Self {
-        Self {
-            total_partitions,
-            assigned_partition,
-        }
+    pub fn new(partition: u32) -> Self {
+        Self { partition }
     }
 }
 

@@ -285,7 +285,7 @@ where
                     if is_leader_val {
                         match queue.pull_partition(
                             event_type.clone(),
-                            partition_config.assigned_partition,
+                            partition_config.partition,
                             1,
                         ).await {
                             Ok(jobs) => {

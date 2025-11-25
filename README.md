@@ -9,9 +9,19 @@ A database layer on TiKV with indexing, relationships, transactions, and a built
 - **Relationships**: Embedded relationship hydration
 - **Transactions**: Full ACID transactions
 - **Query Builder**: Fluent API for querying by index
-- **Transactional Outbox**: Events written atomically with data - no dual-write problem
+- **Transactional Outbox**: Events written atomically with data
 - **Partitioned Pub/Sub**: Horizontal scaling via partitions
 - **Scheduled Events**: Set timestamp for when events should fire
+
+## Connection
+
+```rust
+use tito::backend::tikv::TiKV;
+
+let db = TiKV::connect(vec!["127.0.0.1:2379"]).await?;
+
+let db = TiKV::connect_with_partitions(vec!["127.0.0.1:2379"], 1024).await?;
+```
 
 ## Model Definition
 
@@ -21,7 +31,6 @@ struct User {
     id: String,
     name: String,
     email: String,
-    business_id: String,
 }
 
 impl TitoModelTrait for User {
@@ -34,24 +43,14 @@ impl TitoModelTrait for User {
     }
 
     fn indexes(&self) -> Vec<TitoIndexConfig> {
-        vec![
-            TitoIndexConfig {
-                condition: true,
-                name: "by_email".to_string(),
-                fields: vec![TitoIndexField {
-                    name: "email".to_string(),
-                    r#type: TitoIndexBlockType::String,
-                }],
-            },
-            TitoIndexConfig {
-                condition: true,
-                name: "by_business".to_string(),
-                fields: vec![TitoIndexField {
-                    name: "business_id".to_string(),
-                    r#type: TitoIndexBlockType::String,
-                }],
-            },
-        ]
+        vec![TitoIndexConfig {
+            condition: true,
+            name: "by_email".to_string(),
+            fields: vec![TitoIndexField {
+                name: "email".to_string(),
+                r#type: TitoIndexBlockType::String,
+            }],
+        }]
     }
 
     fn events(&self) -> Vec<TitoEventConfig> {
@@ -67,30 +66,16 @@ impl TitoModelTrait for User {
 ## CRUD Operations
 
 ```rust
-let db = TiKVBackend::connect(vec!["127.0.0.1:2379"]).await?;
 let users = db.clone().model::<User>();
 
-// Create
 db.transaction(|tx| async move {
     users.build_with_options(user, TitoOptions::with_events(TitoOperation::Insert), &tx).await
 }).await?;
 
-// Read
 let user = users.find_by_id(&id, vec![]).await?;
 
-// Query by index
-let mut query = users.query_by_index("by_business");
-let results = query.value(&business_id).limit(Some(10)).execute().await?;
-
-// Update
-db.transaction(|tx| async move {
-    users.update_with_options(user, TitoOptions::with_events(TitoOperation::Update), &tx).await
-}).await?;
-
-// Delete
-db.transaction(|tx| async move {
-    users.delete_by_id_with_options(&id, TitoOptions::with_events(TitoOperation::Delete), &tx).await
-}).await?;
+let mut query = users.query_by_index("by_email");
+let results = query.value(&email).limit(Some(10)).execute().await?;
 ```
 
 ## Relationships
@@ -117,11 +102,8 @@ impl TitoModelTrait for Post {
     fn references(&self) -> Vec<String> {
         self.tag_ids.clone()
     }
-
-    // ... other methods
 }
 
-// Query with relationship hydration
 let mut query = posts.query_by_index("by_author");
 let results = query.value(&author_id).relationship("tags").execute().await?;
 ```
@@ -132,20 +114,19 @@ Events are written in the same transaction as data. Workers process them later.
 
 ```rust
 let queue = Arc::new(TitoQueue { engine: db });
-let partition_config = PartitionConfig::new(4, 0); // 4 partitions, this worker owns partition 0
 
 run_worker(
     queue,
     "user".to_string(),
     |event| async move {
         match event.action.as_str() {
-            "INSERT" => send_welcome_email(&event.entity_id()).await,
-            "UPDATE" => sync_to_search_index(&event.entity_id()).await,
-            "DELETE" => cleanup_related_data(&event.entity_id()).await,
+            "INSERT" => handle_create(&event.entity_id()).await,
+            "UPDATE" => handle_update(&event.entity_id()).await,
+            "DELETE" => handle_delete(&event.entity_id()).await,
             _ => Ok(()),
         }
     }.boxed(),
-    partition_config,
+    PartitionConfig::new(0),
     is_leader,
     shutdown_rx,
 ).await;
@@ -154,19 +135,10 @@ run_worker(
 ## Scaling
 
 ```rust
-// Worker 1: partition 0
-PartitionConfig::new(4, 0)
-
-// Worker 2: partition 1
-PartitionConfig::new(4, 1)
-
-// Worker 3: partition 2
-PartitionConfig::new(4, 2)
-
-// Worker 4: partition 3
-PartitionConfig::new(4, 3)
-
-// Need more throughput? Add more partitions and workers.
+PartitionConfig::new(0)
+PartitionConfig::new(1)
+PartitionConfig::new(2)
+PartitionConfig::new(3)
 ```
 
 ## Scheduled Events
@@ -186,11 +158,6 @@ fn events(&self) -> Vec<TitoEventConfig> {
 ```
 event:{type}:{partition}:{timestamp}:{uuid}
 ```
-
-## Requirements
-
-- Rust 2021+
-- TiKV cluster
 
 ## License
 

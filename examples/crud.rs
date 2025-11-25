@@ -1,11 +1,10 @@
-// examples/basic_crud.rs
 use serde::{Deserialize, Serialize};
 use tito::{
     types::{
         DBUuid, TitoEngine, TitoEventConfig, TitoIndexBlockType, TitoIndexConfig, TitoIndexField,
         TitoModelTrait,
     },
-    TiKV, TitoError, TitoModel,
+    TiKV, TitoError,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -16,18 +15,6 @@ struct User {
 }
 
 impl TitoModelTrait for User {
-    fn relationships(&self) -> Vec<tito::types::TitoRelationshipConfig> {
-        vec![]
-    }
-
-    fn references(&self) -> Vec<String> {
-        vec![]
-    }
-
-    fn partition_key(&self) -> String {
-        self.id.clone()
-    }
-
     fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![TitoIndexConfig {
             condition: true,
@@ -54,13 +41,9 @@ impl TitoModelTrait for User {
 
 #[tokio::main]
 async fn main() -> Result<(), TitoError> {
-    // Connect to TiKV
     let tito_db = TiKV::connect(vec!["127.0.0.1:2379"]).await?;
-
-    // Create model with dynamic backend
     let user_model = tito_db.clone().model::<User>();
 
-    // Create a user
     let user_id = DBUuid::new_v4().to_string();
     let user = User {
         id: user_id.clone(),
@@ -68,7 +51,6 @@ async fn main() -> Result<(), TitoError> {
         email: "john@example.com".to_string(),
     };
 
-    // Create user with transaction
     let saved_user = tito_db
         .transaction(|tx| {
             let user_model = user_model.clone();
@@ -78,11 +60,9 @@ async fn main() -> Result<(), TitoError> {
 
     println!("Created user: {:?}", saved_user);
 
-    // Find user (find_by_id already uses transaction internally)
     let found_user = user_model.find_by_id(&user_id, vec![]).await?;
     println!("Found user: {:?}", found_user);
 
-    // Update user
     let updated_user = User {
         id: user_id.clone(),
         name: "John Updated".to_string(),
@@ -96,9 +76,8 @@ async fn main() -> Result<(), TitoError> {
         })
         .await?;
 
-    println!("User updated successfully");
+    println!("User updated");
 
-    // Delete user
     tito_db
         .transaction(|tx| {
             let user_model = user_model.clone();
@@ -106,7 +85,7 @@ async fn main() -> Result<(), TitoError> {
         })
         .await?;
 
-    println!("User deleted successfully");
+    println!("User deleted");
 
     Ok(())
 }

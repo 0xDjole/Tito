@@ -1,6 +1,6 @@
 [package]
 name = "tito"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Database layer on TiKV with indexing, relationships, transactions, and built-in transactional outbox with partitioned scheduled pub/sub"
 license = "Apache-2.0"

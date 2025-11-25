@@ -448,17 +448,18 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             let uuid_str = DBUuid::new_v4().to_string();
 
             use crate::types::PARTITION_DIGITS;
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
 
-            // Partition is determined by timestamp % total_partitions at scan time
-            // For now, use partition 0 - workers will filter by their assigned partition
-            let partition = 0u32;
+            let total_partitions = self.engine.configs().total_partitions;
+            let mut hasher = DefaultHasher::new();
+            payload.key.hash(&mut hasher);
+            let partition = (hasher.finish() % total_partitions as u64) as u32;
 
-            // Use the timestamp from event_config (model defines when to process)
             let timestamp = event_config.timestamp;
 
             let event_type = &event_config.name;
 
-            // New key format: event:{type}:{partition}:{timestamp}:{uuid}
             let key = format!(
                 "event:{}:{:0pwidth$}:{}:{}",
                 event_type,

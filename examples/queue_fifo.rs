@@ -9,10 +9,9 @@ use tito::{
         DBUuid, TitoEngine, TitoEventConfig, TitoIndexBlockType, TitoIndexConfig, TitoIndexField,
         TitoModelTrait, PartitionConfig,
     },
-    EventConfig, TiKV, TitoError, TitoModel, TitoOperation, TitoOptions,
+    TiKV, TitoError, TitoOperation, TitoOptions,
 };
 
-// Simple User model with events enabled
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 struct User {
     id: String,
@@ -21,19 +20,6 @@ struct User {
 }
 
 impl TitoModelTrait for User {
-    fn relationships(&self) -> Vec<tito::types::TitoRelationshipConfig> {
-        vec![]
-    }
-
-    fn references(&self) -> Vec<String> {
-        vec![]
-    }
-
-    fn partition_key(&self) -> String {
-        // Partition by user ID for per-user ordering
-        self.id.clone()
-    }
-
     fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![TitoIndexConfig {
             condition: true,
@@ -50,8 +36,10 @@ impl TitoModelTrait for User {
     }
 
     fn events(&self) -> Vec<TitoEventConfig> {
+        let now = chrono::Utc::now().timestamp();
         vec![TitoEventConfig {
-            name: "user.changed".to_string(),
+            name: "user".to_string(),
+            timestamp: now,
         }]
     }
 
@@ -62,15 +50,13 @@ impl TitoModelTrait for User {
 
 #[tokio::main]
 async fn main() -> Result<(), TitoError> {
-    println!("🚀 Testing FIFO Queue with Checkpoints\n");
+    println!("Testing FIFO Queue\n");
 
-    // Connect to TiKV
     let tito_db = TiKV::connect(vec!["127.0.0.1:2379"]).await?;
     let user_model = tito_db.clone().model::<User>();
 
-    println!("📝 Creating 5 users to generate events...\n");
+    println!("Creating 5 users...\n");
 
-    // Create users with events enabled
     for i in 1..=5 {
         let user = User {
             id: DBUuid::new_v4().to_string(),
@@ -95,78 +81,55 @@ async fn main() -> Result<(), TitoError> {
             })
             .await?;
 
-        println!("✓ Created: {} ({})", user.name, user.email);
-
-        // Small delay to ensure different timestamps
+        println!("Created: {} ({})", user.name, user.email);
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     }
 
-    println!("\n📊 Setting up queue worker...\n");
+    println!("\nStarting worker...\n");
 
-    // Create queue
     let queue = Arc::new(TitoQueue {
         engine: tito_db.clone(),
     });
 
-    // Worker configuration
     let is_leader = Arc::new(AtomicBool::new(true));
-    let partition_config = PartitionConfig {
-        start: 0,
-        end: 1024, // Process all partitions
-    };
-
-    // Event counter
     let events_processed = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let events_processed_clone = events_processed.clone();
 
-    // Create shutdown channel
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
-    // Event handler
     let handler = move |event: tito::TitoEvent| {
         let counter = events_processed_clone.clone();
         Box::pin(async move {
             let count = counter.fetch_add(1, Ordering::SeqCst) + 1;
             println!(
-                "  [{}] Processing event: {} - {} (sequence: {})",
+                "[{}] {} - {}",
                 count,
                 event.action,
                 event.entity,
-                event.key.split(':').last().unwrap_or("unknown")
             );
-
-            // Simulate some processing
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
             Ok::<_, TitoError>(())
         }) as BoxFuture<'static, Result<(), TitoError>>
     };
 
-    // Start worker
     let worker_handle = run_worker(
         queue.clone(),
-        String::from("user.changed"), // event_type - matches the event config
+        String::from("user"),
         handler,
-        partition_config,
+        PartitionConfig::new(0),
         is_leader.clone(),
-        5, // concurrency
         shutdown_rx,
     )
     .await;
 
-    println!("⚙️  Worker started! Processing events in FIFO order...\n");
-
-    // Wait for events to be processed
     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
-    // Shutdown worker
-    println!("\n🛑 Shutting down worker...");
+    println!("\nShutting down...");
     let _ = shutdown_tx.send(());
     let _ = worker_handle.await;
 
     let total = events_processed.load(Ordering::SeqCst);
-    println!("\n✅ Complete! Processed {} events in FIFO order", total);
-    println!("   (Oldest events processed first!)");
+    println!("\nProcessed {} events", total);
 
     Ok(())
 }
