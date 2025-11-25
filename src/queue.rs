@@ -191,7 +191,7 @@ impl<E: TitoEngine> TitoQueue<E> {
     }
 
     pub async fn fail_job(&self, job_id: String) -> Result<(), TitoError> {
-        use crate::types::{QueueProgress, QueueFailed};
+        use crate::types::{QueueFailed, TitoEvent};
         use chrono::Utc;
 
         self.engine
@@ -209,34 +209,52 @@ impl<E: TitoEngine> TitoQueue<E> {
                     "queue:{}:PROGRESS:{}:{}:{}",
                     event_type, partition_str, timestamp_str, uuid_str
                 );
-                let progress_data = tx.get(progress_key.as_bytes())
-                    .await
-                    .map_err(|e| TitoError::QueryFailed(format!("Get progress failed: {}", e)))?;
 
-                if let Some(progress_bytes) = progress_data {
-                    let mut progress: QueueProgress = serde_json::from_slice(&progress_bytes)
-                        .map_err(|_| TitoError::DeserializationFailed(String::from("Failed to deserialize progress")))?;
+                tx.delete(progress_key.as_bytes())
+                    .await
+                    .map_err(|e| TitoError::DeleteFailed(format!("Delete progress failed: {}", e)))?;
+
+                let event_bytes = tx.get(job_id.as_bytes())
+                    .await
+                    .map_err(|e| TitoError::QueryFailed(format!("Get event failed: {}", e)))?;
+
+                if let Some(bytes) = event_bytes {
+                    let mut event: TitoEvent = serde_json::from_slice(&bytes)
+                        .map_err(|_| TitoError::DeserializationFailed(String::from("Failed to deserialize event")))?;
 
                     const MAX_RETRIES: u32 = 5;
 
-                    if progress.retries < MAX_RETRIES {
-                        progress.retries += 1;
-                        progress.updated_at = Utc::now().timestamp();
+                    if event.retries < MAX_RETRIES {
+                        event.retries += 1;
+                        let backoff_seconds = 2_i64.pow(event.retries);
+                        let new_timestamp = Utc::now().timestamp() + backoff_seconds;
+                        event.timestamp = new_timestamp;
+                        event.updated_at = Utc::now().timestamp();
 
-                        tx.put(progress_key.as_bytes(), serde_json::to_vec(&progress).unwrap())
+                        let new_key = format!(
+                            "event:{}:{}:{}:{}",
+                            event_type, partition_str, new_timestamp, uuid_str
+                        );
+                        event.key = new_key.clone();
+
+                        tx.delete(job_id.as_bytes())
                             .await
-                            .map_err(|e| TitoError::UpdateFailed(format!("Update progress failed: {}", e)))?;
+                            .map_err(|e| TitoError::DeleteFailed(format!("Delete old event failed: {}", e)))?;
+
+                        tx.put(new_key.as_bytes(), serde_json::to_vec(&event).unwrap())
+                            .await
+                            .map_err(|e| TitoError::UpdateFailed(format!("Put new event failed: {}", e)))?;
                     } else {
-                        tx.delete(progress_key.as_bytes())
+                        tx.delete(job_id.as_bytes())
                             .await
-                            .map_err(|e| TitoError::DeleteFailed(format!("Delete progress failed: {}", e)))?;
+                            .map_err(|e| TitoError::DeleteFailed(format!("Delete event failed: {}", e)))?;
 
                         let failed_key = format!(
                             "queue:{}:FAILED:{}:{}:{}",
                             event_type, partition_str, timestamp_str, uuid_str
                         );
                         let failed = QueueFailed {
-                            retries: progress.retries,
+                            retries: event.retries,
                             updated_at: Utc::now().timestamp(),
                             error: Some("Max retries exceeded".to_string()),
                         };
