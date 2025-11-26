@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -15,6 +14,7 @@ pub struct TitoQueue<E: TitoEngine> {
 impl<E: TitoEngine> TitoQueue<E> {
     pub async fn pull_partition(
         &self,
+        consumer: String,
         event_type: String,
         partition: u32,
         limit: u32,
@@ -27,7 +27,8 @@ impl<E: TitoEngine> TitoQueue<E> {
                 let mut jobs = Vec::new();
 
                 let checkpoint_key = format!(
-                    "queue_checkpoint:{}:{:0width$}",
+                    "queue_checkpoint:{}:{}:{:0width$}",
+                    consumer,
                     event_type,
                     partition,
                     width = PARTITION_DIGITS
@@ -86,12 +87,12 @@ impl<E: TitoEngine> TitoQueue<E> {
                         let uuid_str = parts[4];
 
                         let completed_key = format!(
-                            "queue:{}:COMPLETED:{}:{}:{}",
-                            event_type, partition_str, timestamp_str, uuid_str
+                            "queue:{}:{}:completed:{}:{}:{}",
+                            consumer, event_type, partition_str, timestamp_str, uuid_str
                         );
                         let progress_key = format!(
-                            "queue:{}:PROGRESS:{}:{}:{}",
-                            event_type, partition_str, timestamp_str, uuid_str
+                            "queue:{}:{}:progress:{}:{}:{}",
+                            consumer, event_type, partition_str, timestamp_str, uuid_str
                         );
 
                         let is_completed = tx.get(completed_key.as_bytes()).await
@@ -125,7 +126,7 @@ impl<E: TitoEngine> TitoQueue<E> {
             .await
     }
 
-    pub async fn success_job(&self, job_id: String) -> Result<(), TitoError> {
+    pub async fn success_job(&self, consumer: String, job_id: String) -> Result<(), TitoError> {
         use crate::types::{QueueCompleted, QueueCheckpoint};
         use chrono::Utc;
 
@@ -143,16 +144,16 @@ impl<E: TitoEngine> TitoQueue<E> {
                     .map_err(|_| TitoError::InvalidInput("Invalid timestamp".to_string()))?;
 
                 let progress_key = format!(
-                    "queue:{}:PROGRESS:{}:{}:{}",
-                    event_type, partition_str, timestamp_str, uuid_str
+                    "queue:{}:{}:progress:{}:{}:{}",
+                    consumer, event_type, partition_str, timestamp_str, uuid_str
                 );
                 tx.delete(progress_key.as_bytes())
                     .await
                     .map_err(|e| TitoError::DeleteFailed(format!("Delete progress failed: {}", e)))?;
 
                 let completed_key = format!(
-                    "queue:{}:COMPLETED:{}:{}:{}",
-                    event_type, partition_str, timestamp_str, uuid_str
+                    "queue:{}:{}:completed:{}:{}:{}",
+                    consumer, event_type, partition_str, timestamp_str, uuid_str
                 );
                 let completed = QueueCompleted {
                     updated_at: Utc::now().timestamp(),
@@ -161,7 +162,7 @@ impl<E: TitoEngine> TitoQueue<E> {
                     .await
                     .map_err(|e| TitoError::UpdateFailed(format!("Put completed failed: {}", e)))?;
 
-                let checkpoint_key = format!("queue_checkpoint:{}:{}", event_type, partition_str);
+                let checkpoint_key = format!("queue_checkpoint:{}:{}:{}", consumer, event_type, partition_str);
                 let current_checkpoint = tx.get(checkpoint_key.as_bytes()).await
                     .map_err(|e| TitoError::QueryFailed(format!("Checkpoint read failed: {}", e)))?
                     .and_then(|bytes| serde_json::from_slice::<QueueCheckpoint>(&bytes).ok());
@@ -190,7 +191,7 @@ impl<E: TitoEngine> TitoQueue<E> {
         Ok(())
     }
 
-    pub async fn fail_job(&self, job_id: String) -> Result<(), TitoError> {
+    pub async fn fail_job(&self, consumer: String, job_id: String) -> Result<(), TitoError> {
         use crate::types::{QueueFailed, TitoEvent};
         use chrono::Utc;
 
@@ -206,8 +207,8 @@ impl<E: TitoEngine> TitoQueue<E> {
                 let uuid_str = parts[4];
 
                 let progress_key = format!(
-                    "queue:{}:PROGRESS:{}:{}:{}",
-                    event_type, partition_str, timestamp_str, uuid_str
+                    "queue:{}:{}:progress:{}:{}:{}",
+                    consumer, event_type, partition_str, timestamp_str, uuid_str
                 );
 
                 tx.delete(progress_key.as_bytes())
@@ -250,8 +251,8 @@ impl<E: TitoEngine> TitoQueue<E> {
                             .map_err(|e| TitoError::DeleteFailed(format!("Delete event failed: {}", e)))?;
 
                         let failed_key = format!(
-                            "queue:{}:FAILED:{}:{}:{}",
-                            event_type, partition_str, timestamp_str, uuid_str
+                            "queue:{}:{}:failed:{}:{}:{}",
+                            consumer, event_type, partition_str, timestamp_str, uuid_str
                         );
                         let failed = QueueFailed {
                             retries: event.retries,
@@ -279,10 +280,8 @@ impl<E: TitoEngine> TitoQueue<E> {
 
 pub async fn run_worker<E: TitoEngine + 'static, H>(
     queue: Arc<TitoQueue<E>>,
-    event_type: String,
+    config: crate::types::WorkerConfig,
     handler: H,
-    partition_config: crate::types::PartitionConfig,
-    is_leader: Arc<AtomicBool>,
     mut shutdown: broadcast::Receiver<()>,
 ) -> tokio::task::JoinHandle<()>
 where
@@ -299,25 +298,23 @@ where
                     break;
                 }
                 _ = async {
-                    let is_leader_val = is_leader.load(Ordering::SeqCst);
-                    if is_leader_val {
-                        match queue.pull_partition(
-                            event_type.clone(),
-                            partition_config.partition,
-                            1,
-                        ).await {
-                            Ok(jobs) => {
-                                for job in jobs {
-                                    let result = handler(job.clone()).await;
-                                    let _ = match result {
-                                        Ok(_) => queue.success_job(job.key).await,
-                                        Err(_) => queue.fail_job(job.key).await,
-                                    };
-                                }
+                    match queue.pull_partition(
+                        config.consumer.clone(),
+                        config.event_type.clone(),
+                        config.partition,
+                        1,
+                    ).await {
+                        Ok(jobs) => {
+                            for job in jobs {
+                                let result = handler(job.clone()).await;
+                                let _ = match result {
+                                    Ok(_) => queue.success_job(config.consumer.clone(), job.key).await,
+                                    Err(_) => queue.fail_job(config.consumer.clone(), job.key).await,
+                                };
                             }
-                            Err(_) => {
-                                sleep(Duration::from_millis(500)).await;
-                            }
+                        }
+                        Err(_) => {
+                            sleep(Duration::from_millis(500)).await;
                         }
                     }
                     sleep(Duration::from_millis(125)).await;

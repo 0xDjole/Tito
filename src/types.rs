@@ -412,4 +412,11 @@ impl PartitionConfig {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct WorkerConfig {
+    pub event_type: String,
+    pub consumer: String,
+    pub partition: u32,
+}
+
 pub const PARTITION_DIGITS: usize = 4;
