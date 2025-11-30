@@ -40,6 +40,7 @@ impl TitoModelTrait for User {
         vec![TitoEventConfig {
             name: "user".to_string(),
             timestamp: now,
+            partitions: 1,
         }]
     }
 

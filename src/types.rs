@@ -13,7 +13,6 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct TitoConfigs {
     pub is_read_only: Arc<AtomicBool>,
-    pub total_partitions: u32,
 }
 
 pub trait TitoModelConstraints:
@@ -336,6 +335,7 @@ pub type DBUuid = Uuid;
 pub struct TitoEventConfig {
     pub name: String,
     pub timestamp: i64,
+    pub partitions: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]

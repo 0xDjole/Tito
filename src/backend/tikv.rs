@@ -277,13 +277,6 @@ pub struct TiKV;
 impl TiKV {
     /// Connect to TiKV with PD endpoints
     pub async fn connect<S: AsRef<str>>(endpoints: Vec<S>) -> Result<TiKVBackend, TitoError> {
-        Self::connect_with_partitions(endpoints, 1024).await
-    }
-
-    pub async fn connect_with_partitions<S: AsRef<str>>(
-        endpoints: Vec<S>,
-        total_partitions: u32,
-    ) -> Result<TiKVBackend, TitoError> {
         let endpoint_strings: Vec<String> =
             endpoints.iter().map(|s| s.as_ref().to_string()).collect();
         let client = TransactionClient::new(endpoint_strings)
@@ -296,7 +289,6 @@ impl TiKV {
             client: Arc::new(client),
             configs: TitoConfigs {
                 is_read_only: Arc::new(AtomicBool::new(false)),
-                total_partitions,
             },
             active_transactions: Arc::new(Mutex::new(HashMap::new())),
         })

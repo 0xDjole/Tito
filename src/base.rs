@@ -392,10 +392,9 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             use std::collections::hash_map::DefaultHasher;
             use std::hash::{Hash, Hasher};
 
-            let total_partitions = self.engine.configs().total_partitions;
             let mut hasher = DefaultHasher::new();
             payload.key.hash(&mut hasher);
-            let partition = (hasher.finish() % total_partitions as u64) as u32;
+            let partition = (hasher.finish() % event_config.partitions as u64) as u32;
 
             let timestamp = event_config.timestamp;
 
