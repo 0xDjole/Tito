@@ -65,10 +65,6 @@ pub trait TitoTransaction: Send + Sync {
     type Error: std::error::Error + Send + Sync + 'static;
 
     async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<TitoValue>, Self::Error>;
-    async fn get_for_update<K: AsRef<[u8]> + Send>(
-        &self,
-        key: K,
-    ) -> Result<Option<TitoValue>, Self::Error>;
     async fn put<K: AsRef<[u8]> + Send, V: AsRef<[u8]> + Send>(
         &self,
         key: K,
@@ -88,11 +84,6 @@ pub trait TitoTransaction: Send + Sync {
     ) -> Result<Vec<TitoKvPair>, Self::Error>;
 
     async fn batch_get<K: AsRef<[u8]> + Send>(
-        &self,
-        keys: Vec<K>,
-    ) -> Result<Vec<TitoKvPair>, Self::Error>;
-
-    async fn batch_get_for_update<K: AsRef<[u8]> + Send>(
         &self,
         keys: Vec<K>,
     ) -> Result<Vec<TitoKvPair>, Self::Error>;

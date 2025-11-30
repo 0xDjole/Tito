@@ -2,6 +2,7 @@ use crate::error::TitoError;
 use crate::types::{DBUuid, TitoConfigs, TitoEngine, TitoKvPair, TitoTransaction, TitoValue};
 use async_trait::async_trait;
 use futures::lock::Mutex;
+use rand::Rng;
 use std::collections::HashMap;
 use std::future::Future;
 use std::ops::Range;
@@ -43,9 +44,9 @@ impl TitoEngine for TiKVBackend {
         T: Send,
         E: From<TitoError> + Send,
     {
-        const MAX_RETRIES: u32 = 5;
+        const MAX_RETRIES: u32 = 10;
         let mut retries = 0;
-        let mut delay_ms = 10u64;
+        let mut base_delay_ms = 50u64;
 
         loop {
             let f_clone = f.clone();
@@ -82,15 +83,13 @@ impl TitoEngine for TiKVBackend {
                                 active_transactions.remove(&tx_id);
                             }
 
-                            let err_str = format!("{:?}", e);
-                            let is_conflict = err_str.contains("WriteConflict")
-                                || err_str.contains("Conflict")
-                                || err_str.contains("retry");
-
-                            if is_conflict && retries < MAX_RETRIES {
+                            if Self::is_retryable_error(&e) && retries < MAX_RETRIES {
                                 retries += 1;
-                                sleep(Duration::from_millis(delay_ms)).await;
-                                delay_ms *= 2;
+                                // Exponential backoff with jitter to prevent thundering herd
+                                let jitter = rand::thread_rng().gen_range(0..base_delay_ms / 2);
+                                let delay = base_delay_ms + jitter;
+                                sleep(Duration::from_millis(delay)).await;
+                                base_delay_ms = (base_delay_ms * 2).min(2000); // Cap at 2 seconds
                                 continue;
                             }
                             return Err(E::from(e));
@@ -152,20 +151,6 @@ impl TitoTransaction for TiKVTransaction {
             .get(tikv_key)
             .await
             .map_err(|e| TitoError::QueryFailed(format!("Get operation failed: {}", e)))
-    }
-
-    async fn get_for_update<K: AsRef<[u8]> + Send>(
-        &self,
-        key: K,
-    ) -> Result<Option<TitoValue>, Self::Error> {
-        let tikv_key: tikv_client::Key = key.as_ref().to_vec().into();
-
-        self.inner
-            .lock()
-            .await
-            .get_for_update(tikv_key)
-            .await
-            .map_err(|e| TitoError::QueryFailed(format!("Get for update failed: {}", e)))
     }
 
     async fn put<K: AsRef<[u8]> + Send, V: AsRef<[u8]> + Send>(
@@ -253,24 +238,6 @@ impl TitoTransaction for TiKVTransaction {
         Ok(result.map(|kv| (kv.0.into(), kv.1)).collect())
     }
 
-    async fn batch_get_for_update<K: AsRef<[u8]> + Send>(
-        &self,
-        keys: Vec<K>,
-    ) -> Result<Vec<TitoKvPair>, Self::Error> {
-        let tikv_keys: Vec<tikv_client::Key> =
-            keys.iter().map(|k| k.as_ref().to_vec().into()).collect();
-
-        let result = self
-            .inner
-            .lock()
-            .await
-            .batch_get_for_update(tikv_keys)
-            .await
-            .map_err(|e| TitoError::QueryFailed(format!("Batch get for update failed: {}", e)))?;
-
-        Ok(result.into_iter().map(|kv| (kv.0.into(), kv.1)).collect())
-    }
-
     async fn commit(self) -> Result<(), Self::Error> {
         self.inner
             .lock()
@@ -285,6 +252,22 @@ impl TitoTransaction for TiKVTransaction {
         self.inner.lock().await.rollback().await.map_err(|e| {
             TitoError::TransactionFailed(format!("Transaction rollback failed: {}", e))
         })
+    }
+}
+
+impl TiKVBackend {
+    fn is_retryable_error(err: &TitoError) -> bool {
+        let err_str = format!("{:?}", err);
+        let err_lower = err_str.to_lowercase();
+        err_lower.contains("writeconflict")
+            || err_lower.contains("write conflict")
+            || err_lower.contains("conflict")
+            || err_lower.contains("txnlocknotfound")
+            || err_lower.contains("keyislocked")
+            || err_lower.contains("retryable")
+            || err_lower.contains("region")
+            || err_lower.contains("not leader")
+            || err_lower.contains("stale")
     }
 }
 

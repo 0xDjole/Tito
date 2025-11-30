@@ -431,7 +431,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         Ok(true)
     }
 
-    pub async fn find_by_id_tx(
+    async fn find_by_id_with_tx(
         &self,
         id: &str,
         rels: Vec<String>,
@@ -479,17 +479,28 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             )))
         }
     }
-    pub async fn find_by_id(&self, id: &str, rels: Vec<String>) -> Result<T, TitoError>
+
+    pub async fn find_by_id(
+        &self,
+        id: &str,
+        rels: Vec<String>,
+        tx: Option<&E::Transaction>,
+    ) -> Result<T, TitoError>
     where
         T: serde::de::DeserializeOwned,
     {
-        let id = id.to_string();
-        self.tx(|tx| {
-            let id = id.clone();
-            let rels = rels.clone();
-            async move { self.find_by_id_tx(&id, rels, &tx).await }
-        })
-        .await
+        match tx {
+            Some(tx) => self.find_by_id_with_tx(id, rels, tx).await,
+            None => {
+                let id = id.to_string();
+                self.tx(|tx| {
+                    let id = id.clone();
+                    let rels = rels.clone();
+                    async move { self.find_by_id_with_tx(&id, rels, &tx).await }
+                })
+                .await
+            }
+        }
     }
 
     pub async fn scan(
@@ -541,7 +552,27 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         Ok((items, has_more))
     }
 
-    pub async fn find_by_ids_tx(
+    pub async fn find_by_ids_raw(
+        &self,
+        ids: Vec<String>,
+        rels: Vec<String>,
+        tx: &E::Transaction,
+    ) -> Result<Vec<(String, Value)>, TitoError>
+    where
+        T: DeserializeOwned,
+    {
+        let ids = ids
+            .into_iter()
+            .map(|id| format!("{}:{}", self.get_table(), id))
+            .collect();
+
+        let items = self.batch_get(ids, tx).await?;
+        let items = self.fetch_and_stitch_relationships(items, rels, tx).await?;
+
+        Ok(items)
+    }
+
+    async fn find_by_ids_with_tx(
         &self,
         ids: Vec<String>,
         rels: Vec<String>,
@@ -563,49 +594,26 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         Ok(result)
     }
 
-    pub async fn find_by_ids_raw(
-        &self,
-        ids: Vec<String>,
-        rels: Vec<String>,
-        tx: &E::Transaction,
-    ) -> Result<Vec<(String, Value)>, TitoError>
-    where
-        T: DeserializeOwned,
-    {
-        let ids = ids
-            .into_iter()
-            .map(|id| format!("{}:{}", self.get_table(), id))
-            .collect();
-
-        let items = self.batch_get(ids, tx).await?;
-        let items = self.fetch_and_stitch_relationships(items, rels, tx).await?;
-
-        Ok(items)
-    }
-
     pub async fn find_by_ids(
         &self,
         ids: Vec<String>,
         rels: Vec<String>,
+        tx: Option<&E::Transaction>,
     ) -> Result<Vec<T>, TitoError>
     where
         T: DeserializeOwned,
     {
-        self.tx(|tx| {
-            let ids = ids.clone();
-            let rels = rels.clone();
-            async move {
-                let items = self.find_by_ids_raw(ids, rels, &tx).await?;
-                let mut result = vec![];
-                for value in items.into_iter() {
-                    if let Ok(item) = serde_json::from_value::<T>(value.1) {
-                        result.push(item);
-                    }
-                }
-                Ok(result)
+        match tx {
+            Some(tx) => self.find_by_ids_with_tx(ids, rels, tx).await,
+            None => {
+                self.tx(|tx| {
+                    let ids = ids.clone();
+                    let rels = rels.clone();
+                    async move { self.find_by_ids_with_tx(ids, rels, &tx).await }
+                })
+                .await
             }
-        })
-        .await
+        }
     }
 
     pub async fn scan_reverse(

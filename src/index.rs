@@ -229,7 +229,7 @@ impl<
         Ok((items, has_more))
     }
 
-    pub async fn find_by_index_tx(
+    async fn find_by_index_with_tx(
         &self,
         payload: TitoFindByIndexPayload,
         tx: &E::Transaction,
@@ -260,18 +260,24 @@ impl<
     pub async fn find_by_index(
         &self,
         payload: TitoFindByIndexPayload,
+        tx: Option<&E::Transaction>,
     ) -> Result<TitoPaginated<T>, TitoError>
     where
         T: serde::de::DeserializeOwned,
     {
-        self.tx(|tx| {
-            let payload = payload.clone();
-            async move { self.find_by_index_tx(payload, &tx).await }
-        })
-        .await
+        match tx {
+            Some(tx) => self.find_by_index_with_tx(payload, tx).await,
+            None => {
+                self.tx(|tx| {
+                    let payload = payload.clone();
+                    async move { self.find_by_index_with_tx(payload, &tx).await }
+                })
+                .await
+            }
+        }
     }
 
-    pub async fn find_by_index_reverse_tx(
+    async fn find_by_index_reverse_with_tx(
         &self,
         payload: TitoFindByIndexPayload,
         tx: &E::Transaction,
@@ -279,7 +285,6 @@ impl<
     where
         T: serde::de::DeserializeOwned,
     {
-        let cursor = payload.cursor.clone();
         let (items, has_more) = self.find_by_index_reverse_raw(payload, tx).await?;
 
         let results = self.to_paginated_items(items, has_more)?;
@@ -290,18 +295,24 @@ impl<
     pub async fn find_by_index_reverse(
         &self,
         payload: TitoFindByIndexPayload,
+        tx: Option<&E::Transaction>,
     ) -> Result<TitoPaginated<T>, TitoError>
     where
         T: serde::de::DeserializeOwned,
     {
-        self.tx(|tx| {
-            let payload = payload.clone();
-            async move { self.find_by_index_reverse_tx(payload, &tx).await }
-        })
-        .await
+        match tx {
+            Some(tx) => self.find_by_index_reverse_with_tx(payload, tx).await,
+            None => {
+                self.tx(|tx| {
+                    let payload = payload.clone();
+                    async move { self.find_by_index_reverse_with_tx(payload, &tx).await }
+                })
+                .await
+            }
+        }
     }
 
-    pub async fn find_one_by_index_tx(
+    async fn find_one_by_index_with_tx(
         &self,
         payload: TitoFindOneByIndexPayload,
         tx: &E::Transaction,
@@ -343,15 +354,21 @@ impl<
     pub async fn find_one_by_index(
         &self,
         payload: TitoFindOneByIndexPayload,
+        tx: Option<&E::Transaction>,
     ) -> Result<T, TitoError>
     where
         T: serde::de::DeserializeOwned,
     {
-        self.tx(|tx| {
-            let payload = payload.clone();
-            async move { self.find_one_by_index_tx(payload, &tx).await }
-        })
-        .await
+        match tx {
+            Some(tx) => self.find_one_by_index_with_tx(payload, tx).await,
+            None => {
+                self.tx(|tx| {
+                    let payload = payload.clone();
+                    async move { self.find_one_by_index_with_tx(payload, &tx).await }
+                })
+                .await
+            }
+        }
     }
 
     pub async fn reindex(&self) -> Result<(), TitoError> {
