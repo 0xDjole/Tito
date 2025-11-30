@@ -57,23 +57,31 @@ impl TitoEngine for TiKVBackend {
                 })
                 .map_err(E::from)?;
 
+            let tx_id = tx.id.clone();
+
             {
                 let mut active_transactions = self.active_transactions.lock().await;
-                active_transactions.insert(tx.id.clone(), tx.clone());
+                active_transactions.insert(tx_id.clone(), tx.clone());
             }
 
             let result = f_clone(tx.clone()).await;
 
-            let tx = {
-                let mut active_transactions = self.active_transactions.lock().await;
-                active_transactions.remove(&tx.id).unwrap_or(tx)
-            };
-
             match result {
                 Ok(value) => {
                     match tx.commit().await {
-                        Ok(_) => return Ok(value),
+                        Ok(_) => {
+                            // Remove from tracking AFTER successful commit
+                            let mut active_transactions = self.active_transactions.lock().await;
+                            active_transactions.remove(&tx_id);
+                            return Ok(value);
+                        }
                         Err(e) => {
+                            // Remove from tracking on commit failure before retry
+                            {
+                                let mut active_transactions = self.active_transactions.lock().await;
+                                active_transactions.remove(&tx_id);
+                            }
+
                             let err_str = format!("{:?}", e);
                             let is_conflict = err_str.contains("WriteConflict")
                                 || err_str.contains("Conflict")
@@ -91,6 +99,9 @@ impl TitoEngine for TiKVBackend {
                 }
                 Err(e) => {
                     let _ = tx.rollback().await;
+                    // Remove from tracking AFTER rollback
+                    let mut active_transactions = self.active_transactions.lock().await;
+                    active_transactions.remove(&tx_id);
                     return Err(e);
                 }
             }
