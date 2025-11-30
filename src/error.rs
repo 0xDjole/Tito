@@ -11,9 +11,6 @@ pub enum TitoError {
     #[error("Transaction failed: {0}")]
     TransactionFailed(String),
 
-    #[error("Operation failed in read-only mode")]
-    ReadOnlyMode,
-
     #[error("Failed to create resource: {0}")]
     CreateFailed(String),
 

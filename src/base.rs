@@ -1,4 +1,4 @@
-use std::{future::Future, sync::atomic::Ordering};
+use std::future::Future;
 
 use crate::{
     error::TitoError,
@@ -142,10 +142,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     where
         P: Serialize + Unpin + std::marker::Send + Sync,
     {
-        if self.engine.configs().is_read_only.load(Ordering::SeqCst) {
-            return Err(TitoError::ReadOnlyMode);
-        }
-
         let mut value = serde_json::to_value(&payload)
             .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
 
@@ -170,10 +166,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     }
 
     pub async fn delete(&self, key: String, tx: &E::Transaction) -> Result<bool, TitoError> {
-        if self.engine.configs().is_read_only.load(Ordering::SeqCst) {
-            return Err(TitoError::ReadOnlyMode);
-        }
-
         tx.delete(key)
             .await
             .map_err(|e| TitoError::DeleteFailed(e.to_string()))?;

@@ -6,14 +6,7 @@ use serde::Serialize;
 use std::fmt;
 use std::future::Future;
 use std::ops::Range;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 use uuid::Uuid;
-
-#[derive(Clone)]
-pub struct TitoConfigs {
-    pub is_read_only: Arc<AtomicBool>,
-}
 
 pub trait TitoModelConstraints:
     Default + Clone + Serialize + DeserializeOwned + Unpin + std::marker::Send + Sync + TitoModelTrait
@@ -42,8 +35,6 @@ pub trait TitoEngine: Send + Sync + Clone {
     type Error: std::error::Error + Send + Sync + 'static;
 
     async fn begin_transaction(&self) -> Result<Self::Transaction, Self::Error>;
-
-    fn configs(&self) -> TitoConfigs;
 
     async fn transaction<F, Fut, T, E>(&self, f: F) -> Result<T, E>
     where

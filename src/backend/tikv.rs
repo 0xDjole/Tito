@@ -1,12 +1,11 @@
 use crate::error::TitoError;
-use crate::types::{DBUuid, TitoConfigs, TitoEngine, TitoKvPair, TitoTransaction, TitoValue};
+use crate::types::{DBUuid, TitoEngine, TitoKvPair, TitoTransaction, TitoValue};
 use async_trait::async_trait;
 use futures::lock::Mutex;
 use rand::Rng;
 use std::collections::HashMap;
 use std::future::Future;
 use std::ops::Range;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tikv_client::{Transaction, TransactionClient};
 use tokio::time::{sleep, Duration};
@@ -14,7 +13,6 @@ use tokio::time::{sleep, Duration};
 #[derive(Clone)]
 pub struct TiKVBackend {
     pub client: Arc<TransactionClient>,
-    pub configs: TitoConfigs,
     pub active_transactions: Arc<Mutex<HashMap<String, TiKVTransaction>>>,
 }
 
@@ -31,10 +29,6 @@ impl TitoEngine for TiKVBackend {
             id: DBUuid::new_v4().to_string(),
             inner: Arc::new(tokio::sync::Mutex::new(tx)),
         })
-    }
-
-    fn configs(&self) -> TitoConfigs {
-        self.configs.clone()
     }
 
     async fn transaction<F, Fut, T, E>(&self, f: F) -> Result<T, E>
@@ -287,9 +281,6 @@ impl TiKV {
 
         Ok(TiKVBackend {
             client: Arc::new(client),
-            configs: TitoConfigs {
-                is_read_only: Arc::new(AtomicBool::new(false)),
-            },
             active_transactions: Arc::new(Mutex::new(HashMap::new())),
         })
     }
