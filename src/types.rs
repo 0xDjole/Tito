@@ -1,6 +1,5 @@
 use crate::{TitoError, TitoModel};
 use async_trait::async_trait;
-use chrono::Utc;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde::Serialize;
@@ -49,7 +48,7 @@ pub trait TitoEngine: Send + Sync + Clone {
 
     async fn transaction<F, Fut, T, E>(&self, f: F) -> Result<T, E>
     where
-        F: FnOnce(Self::Transaction) -> Fut + Send,
+        F: FnOnce(Self::Transaction) -> Fut + Clone + Send,
         Fut: Future<Output = Result<T, E>> + Send,
         T: Send,
         E: From<TitoError> + Send;
@@ -268,7 +267,7 @@ pub struct TitoScanPayload {
     pub cursor: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct TitoFindPayload {
     pub start: String,
     pub end: Option<String>,
@@ -304,7 +303,7 @@ pub struct TitoFindByMultipleIndexQuery {
     pub end: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct TitoFindOneByIndexPayload {
     pub index: String,
     pub values: Vec<String>,

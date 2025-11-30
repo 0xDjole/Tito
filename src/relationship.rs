@@ -179,7 +179,7 @@ impl<
         let rel_keys: Vec<String> = relationship_data.into_iter().map(|item| item.1).collect();
 
         // Fetch all related items in a batch.
-        let rel_items = self.batch_get(rel_keys, 10, 2, tx).await?;
+        let rel_items = self.batch_get(rel_keys, tx).await?;
 
         let mut rel_map: HashMap<String, Value> = HashMap::new();
         for kv in rel_items {

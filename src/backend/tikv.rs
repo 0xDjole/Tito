@@ -8,6 +8,7 @@ use std::ops::Range;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tikv_client::{Transaction, TransactionClient};
+use tokio::time::{sleep, Duration};
 
 #[derive(Clone)]
 pub struct TiKVBackend {
@@ -22,7 +23,7 @@ impl TitoEngine for TiKVBackend {
     type Error = TitoError;
 
     async fn begin_transaction(&self) -> Result<Self::Transaction, Self::Error> {
-        let tx = self.client.begin_pessimistic().await.map_err(|e| {
+        let tx = self.client.begin_optimistic().await.map_err(|e| {
             TitoError::TransactionFailed(format!("Failed to begin transaction: {}", e))
         })?;
         Ok(TiKVTransaction {
@@ -37,44 +38,63 @@ impl TitoEngine for TiKVBackend {
 
     async fn transaction<F, Fut, T, E>(&self, f: F) -> Result<T, E>
     where
-        F: FnOnce(Self::Transaction) -> Fut + Send,
+        F: FnOnce(Self::Transaction) -> Fut + Clone + Send,
         Fut: Future<Output = Result<T, E>> + Send,
         T: Send,
         E: From<TitoError> + Send,
     {
-        let tx = self
-            .begin_transaction()
-            .await
-            .map_err(|e| {
-                TitoError::TransactionFailed(format!("Failed to begin transaction: {}", e))
-            })
-            .map_err(E::from)?;
+        const MAX_RETRIES: u32 = 5;
+        let mut retries = 0;
+        let mut delay_ms = 10u64;
 
-        // Store in active transactions for cleanup
-        {
-            let mut active_transactions = self.active_transactions.lock().await;
-            active_transactions.insert(tx.id.clone(), tx.clone());
+        loop {
+            let f_clone = f.clone();
+            let tx = self
+                .begin_transaction()
+                .await
+                .map_err(|e| {
+                    TitoError::TransactionFailed(format!("Failed to begin transaction: {}", e))
+                })
+                .map_err(E::from)?;
+
+            {
+                let mut active_transactions = self.active_transactions.lock().await;
+                active_transactions.insert(tx.id.clone(), tx.clone());
+            }
+
+            let result = f_clone(tx.clone()).await;
+
+            let tx = {
+                let mut active_transactions = self.active_transactions.lock().await;
+                active_transactions.remove(&tx.id).unwrap_or(tx)
+            };
+
+            match result {
+                Ok(value) => {
+                    match tx.commit().await {
+                        Ok(_) => return Ok(value),
+                        Err(e) => {
+                            let err_str = format!("{:?}", e);
+                            let is_conflict = err_str.contains("WriteConflict")
+                                || err_str.contains("Conflict")
+                                || err_str.contains("retry");
+
+                            if is_conflict && retries < MAX_RETRIES {
+                                retries += 1;
+                                sleep(Duration::from_millis(delay_ms)).await;
+                                delay_ms *= 2;
+                                continue;
+                            }
+                            return Err(E::from(e));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.rollback().await;
+                    return Err(e);
+                }
+            }
         }
-
-        let result = f(tx.clone()).await;
-
-        // Remove from active transactions and get the transaction
-        let tx = {
-            let mut active_transactions = self.active_transactions.lock().await;
-            active_transactions.remove(&tx.id).unwrap_or(tx)
-        };
-
-        // Always ensure transaction is properly finalized
-        let finalize_result = match &result {
-            Ok(_) => tx.commit().await,
-            Err(_) => tx.rollback().await,
-        };
-
-        if let Err(e) = finalize_result {
-            eprintln!("Warning: Transaction finalization failed: {:?}", e);
-        }
-
-        result
     }
 
     async fn clear_active_transactions(&self) -> Result<(), TitoError> {

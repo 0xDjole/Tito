@@ -23,7 +23,10 @@ impl<E: TitoEngine> TitoQueue<E> {
         use chrono::Utc;
 
         self.engine
-            .transaction(|tx| async move {
+            .transaction(|tx| {
+                let consumer = consumer.clone();
+                let event_type = event_type.clone();
+                async move {
                 let mut jobs = Vec::new();
 
                 let checkpoint_key = format!(
@@ -122,7 +125,7 @@ impl<E: TitoEngine> TitoQueue<E> {
                 }
 
                 Ok::<_, TitoError>(jobs)
-            })
+            }})
             .await
     }
 
@@ -131,7 +134,10 @@ impl<E: TitoEngine> TitoQueue<E> {
         use chrono::Utc;
 
         self.engine
-            .transaction(|tx| async move {
+            .transaction(|tx| {
+                let consumer = consumer.clone();
+                let job_id = job_id.clone();
+                async move {
                 let parts: Vec<&str> = job_id.split(':').collect();
                 if parts.len() < 5 {
                     return Err(TitoError::InvalidInput("Invalid event key format".to_string()));
@@ -185,7 +191,7 @@ impl<E: TitoEngine> TitoQueue<E> {
                 }
 
                 Ok::<_, TitoError>(())
-            })
+            }})
             .await?;
 
         Ok(())
@@ -196,7 +202,10 @@ impl<E: TitoEngine> TitoQueue<E> {
         use chrono::Utc;
 
         self.engine
-            .transaction(|tx| async move {
+            .transaction(|tx| {
+                let consumer = consumer.clone();
+                let job_id = job_id.clone();
+                async move {
                 let parts: Vec<&str> = job_id.split(':').collect();
                 if parts.len() < 5 {
                     return Err(TitoError::InvalidInput("Invalid event key format".to_string()));
@@ -267,7 +276,7 @@ impl<E: TitoEngine> TitoQueue<E> {
                 }
 
                 Ok::<_, TitoError>(())
-            })
+            }})
             .await?;
 
         Ok(())

@@ -4,7 +4,7 @@ use crate::{
     error::TitoError,
     query::IndexQueryBuilder,
     types::{
-        DBUuid, FieldValue, ReverseIndex, TitoCursor, TitoEmbeddedRelationshipConfig, TitoEngine,
+        DBUuid, FieldValue, ReverseIndex, TitoCursor, TitoEngine,
         TitoEvent, TitoFindPayload, TitoGenerateEventPayload, TitoKvPair,
         TitoModelTrait, TitoOperation, TitoOptions, TitoPaginated, TitoRelationshipConfig,
         TitoScanPayload, TitoTransaction,
@@ -15,7 +15,6 @@ use base64::{decode, encode};
 use chrono::Utc;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
-use tokio::time::{sleep, Duration};
 
 #[derive(Clone)]
 pub struct TitoModel<E: TitoEngine, T> {
@@ -73,9 +72,9 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
     pub async fn tx<F, Fut, R, Err>(&self, f: F) -> Result<R, Err>
     where
-        F: FnOnce(E::Transaction) -> Fut + Send,
+        F: FnOnce(E::Transaction) -> Fut + Clone + Send,
         Fut: Future<Output = Result<R, Err>> + Send,
-        Err: From<TitoError> + Send + Sync + std::fmt::Debug, // Added Sync trait bound
+        Err: From<TitoError> + Send + Sync + std::fmt::Debug,
         R: Send,
     {
         self.engine.transaction(f).await
@@ -105,43 +104,26 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     async fn get(
         &self,
         key: &str,
-        max_retries: usize,
-        initial_delay_ms: u64,
         tx: &E::Transaction,
     ) -> Result<(String, Value), TitoError> {
-        let mut retries = 0;
-        let mut delay = initial_delay_ms;
         let key = key.to_string();
 
-        loop {
-            match tx.get_for_update(key.clone()).await {
-                Ok(Some(value)) => match serde_json::from_slice::<Value>(&value) {
-                    Ok(value) => return Ok((key, value)),
-                    Err(e) => {
-                        return Err(TitoError::NotFound(format!(
-                            "Failed to deserialize value for key '{}': {}",
-                            key, e
-                        )))
-                    }
-                },
-                Ok(None) => {
-                    return Err(TitoError::NotFound(format!(
-                        "Key '{}' not found in database",
-                        key
-                    )))
-                }
-                Err(e) => {
-                    if retries >= max_retries {
-                        return Err(TitoError::NotFound(format!(
-                            "Failed to get key '{}' after {} retries: {}",
-                            key, max_retries, e
-                        )));
-                    }
-                    sleep(Duration::from_millis(delay)).await;
-                    retries += 1;
-                    delay *= 2;
-                }
-            }
+        match tx.get(key.clone()).await {
+            Ok(Some(value)) => match serde_json::from_slice::<Value>(&value) {
+                Ok(value) => Ok((key, value)),
+                Err(e) => Err(TitoError::NotFound(format!(
+                    "Failed to deserialize value for key '{}': {}",
+                    key, e
+                ))),
+            },
+            Ok(None) => Err(TitoError::NotFound(format!(
+                "Key '{}' not found in database",
+                key
+            ))),
+            Err(e) => Err(TitoError::NotFound(format!(
+                "Failed to get key '{}': {}",
+                key, e
+            ))),
         }
     }
     pub async fn get_key(&self, key: &str, tx: &E::Transaction) -> Result<Value, TitoError> {
@@ -160,9 +142,9 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     where
         P: Serialize + Unpin + std::marker::Send + Sync,
     {
-        let mut retries = 0;
-        let mut delay = 10;
-        let max_retries = 10;
+        if self.engine.configs().is_read_only.load(Ordering::SeqCst) {
+            return Err(TitoError::ReadOnlyMode);
+        }
 
         let mut value = serde_json::to_value(&payload)
             .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
@@ -177,66 +159,26 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             map.insert("updated_at".to_string(), serde_json::json!(now));
         }
 
-        loop {
-            if self.engine.configs().is_read_only.load(Ordering::SeqCst) {
-                if retries >= max_retries {
-                    return Err(TitoError::ReadOnlyMode);
-                }
+        let bytes = serde_json::to_vec(&value)
+            .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
 
-                sleep(Duration::from_millis(delay)).await;
-                retries += 1;
-                delay *= 2;
-            }
+        tx.put(key, bytes)
+            .await
+            .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
 
-            let bytes = serde_json::to_vec(&value)
-                .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
-
-            match tx.put(key.clone(), bytes).await {
-                Ok(()) => return Ok(true),
-                Err(e) => {
-                    if retries >= max_retries {
-                        return Err(TitoError::CreateFailed(e.to_string()));
-                    }
-
-                    sleep(Duration::from_millis(delay)).await;
-                    retries += 1;
-                    delay *= 2;
-                }
-            }
-        }
+        Ok(true)
     }
 
     pub async fn delete(&self, key: String, tx: &E::Transaction) -> Result<bool, TitoError> {
-        let mut retries = 0;
-        let mut delay = 10;
-        let max_retries = 10;
-
-        loop {
-            if self.engine.configs().is_read_only.load(Ordering::SeqCst) {
-                if retries >= max_retries {
-                    return Err(TitoError::ReadOnlyMode);
-                }
-
-                sleep(Duration::from_millis(delay)).await;
-                retries += 1;
-                delay *= 2;
-            }
-
-            match tx.delete(key.clone()).await {
-                Ok(()) => {
-                    return Ok(true);
-                }
-                Err(e) => {
-                    if retries >= max_retries {
-                        return Err(TitoError::DeleteFailed(e.to_string()));
-                    }
-
-                    sleep(Duration::from_millis(delay)).await;
-                    retries += 1;
-                    delay *= 2;
-                }
-            }
+        if self.engine.configs().is_read_only.load(Ordering::SeqCst) {
+            return Err(TitoError::ReadOnlyMode);
         }
+
+        tx.delete(key)
+            .await
+            .map_err(|e| TitoError::DeleteFailed(e.to_string()))?;
+
+        Ok(true)
     }
 
     pub fn to_paginated_items_with_cursor(
@@ -440,7 +382,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         };
 
         for event_config in model.events().iter() {
-            self.lock_keys(vec![payload.key.clone()], tx).await?;
             let created_at = Utc::now().timestamp();
 
             let message = event_config.name.to_string();
@@ -501,7 +442,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     {
         let id = format!("{}:{}", self.get_table(), id);
 
-        let value = match self.get(&id, 10, 10, tx).await {
+        let value = match self.get(&id, tx).await {
             Ok(value) => value,
             Err(e) => {
                 return Err(TitoError::NotFound(format!(
@@ -542,8 +483,13 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     where
         T: serde::de::DeserializeOwned,
     {
-        self.tx(|tx| async move { self.find_by_id_tx(id, rels, &tx).await })
-            .await
+        let id = id.to_string();
+        self.tx(|tx| {
+            let id = id.clone();
+            let rels = rels.clone();
+            async move { self.find_by_id_tx(&id, rels, &tx).await }
+        })
+        .await
     }
 
     pub async fn scan(
@@ -631,7 +577,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             .map(|id| format!("{}:{}", self.get_table(), id))
             .collect();
 
-        let items = self.batch_get(ids, 10, 10, tx).await?;
+        let items = self.batch_get(ids, tx).await?;
         let items = self.fetch_and_stitch_relationships(items, rels, tx).await?;
 
         Ok(items)
@@ -645,15 +591,19 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     where
         T: DeserializeOwned,
     {
-        self.tx(|tx| async move {
-            let items = self.find_by_ids_raw(ids, rels, &tx).await?;
-            let mut result = vec![];
-            for value in items.into_iter() {
-                if let Ok(item) = serde_json::from_value::<T>(value.1) {
-                    result.push(item);
+        self.tx(|tx| {
+            let ids = ids.clone();
+            let rels = rels.clone();
+            async move {
+                let items = self.find_by_ids_raw(ids, rels, &tx).await?;
+                let mut result = vec![];
+                for value in items.into_iter() {
+                    if let Ok(item) = serde_json::from_value::<T>(value.1) {
+                        result.push(item);
+                    }
                 }
+                Ok(result)
             }
-            Ok(result)
         })
         .await
     }
@@ -746,65 +696,17 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         Ok(true)
     }
 
-    pub async fn lock_keys(
-        &self,
-        keys: Vec<String>,
-        tx: &E::Transaction,
-    ) -> Result<bool, TitoError> {
-        let keys: Vec<_> = keys
-            .into_iter()
-            .map(|key| format!("lock:{}", key).into_bytes())
-            .collect();
-
-        let mut retries = 0;
-        let mut delay = 10;
-        let max_retries = 10;
-
-        loop {
-            match tx.batch_get_for_update(keys.clone()).await {
-                Ok(_) => return Ok(true),
-
-                Err(_) => {
-                    if retries >= max_retries {
-                        return Err(TitoError::NotFound("Not found relationship".to_string()));
-                    }
-
-                    sleep(Duration::from_millis(delay)).await;
-                    retries += 1;
-                    delay *= 2;
-                    continue;
-                }
-            }
-        }
-    }
-
     pub async fn batch_get(
         &self,
         keys: Vec<String>,
-        max_retries: usize,
-        initial_delay_ms: u64,
         tx: &E::Transaction,
     ) -> Result<Vec<(String, Value)>, TitoError> {
-        let mut retries = 0;
-        let mut delay = initial_delay_ms;
-
-        loop {
-            match tx.batch_get_for_update(keys.clone()).await {
-                Ok(res) => {
-                    return self.to_results(res.into_iter());
-                }
-                Err(e) => {
-                    if retries >= max_retries {
-                        return Err(TitoError::NotFound(format!(
-                            "Failed to batch get keys {:?} after {} retries: {}",
-                            keys, max_retries, e
-                        )));
-                    }
-                    sleep(Duration::from_millis(delay)).await;
-                    retries += 1;
-                    delay *= 2;
-                }
-            }
+        match tx.batch_get(keys.clone()).await {
+            Ok(res) => self.to_results(res.into_iter()),
+            Err(e) => Err(TitoError::NotFound(format!(
+                "Failed to batch get keys {:?}: {}",
+                keys, e
+            ))),
         }
     }
 
@@ -998,24 +900,28 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     {
         let start_bound = format!("{}:{}", self.get_table(), payload.start);
 
-        self.tx(|tx| async move {
-            let (scan_stream, has_more) = self
-                .scan(
-                    TitoScanPayload {
-                        start: start_bound,
-                        end: None,
-                        limit: payload.limit,
-                        cursor: payload.cursor.clone(),
-                    },
-                    &tx,
-                )
-                .await?;
+        self.tx(|tx| {
+            let start_bound = start_bound.clone();
+            let payload = payload.clone();
+            async move {
+                let (scan_stream, has_more) = self
+                    .scan(
+                        TitoScanPayload {
+                            start: start_bound,
+                            end: None,
+                            limit: payload.limit,
+                            cursor: payload.cursor.clone(),
+                        },
+                        &tx,
+                    )
+                    .await?;
 
-            let items = self
-                .fetch_and_stitch_relationships(scan_stream, payload.rels, &tx)
-                .await?;
+                let items = self
+                    .fetch_and_stitch_relationships(scan_stream, payload.rels, &tx)
+                    .await?;
 
-            self.to_paginated_items(items, has_more)
+                self.to_paginated_items(items, has_more)
+            }
         })
         .await
     }
@@ -1025,78 +931,31 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
         let start_key = format!("{}:", table);
         let end_key = next_string_lexicographically(start_key.clone());
+        let field_name = field_name.to_string();
 
-        let mut cursor = start_key.clone();
+        self.tx(|tx| {
+            let end_key = end_key.clone();
+            let field_name = field_name.clone();
+            let field_value = field_value.clone();
+            let mut cursor = start_key.clone();
+            async move {
+                loop {
+                    let scan_range = cursor.clone()..end_key.clone();
+                    let kvs = tx.scan(scan_range, 100).await.map_err(|_| {
+                        TitoError::TransactionFailed(String::from("Failed migration, scan"))
+                    })?;
 
-        self.tx(|tx| async move {
-            loop {
-                let scan_range = cursor.clone()..end_key.clone();
-                let kvs = tx.scan(scan_range, 100).await.map_err(|_| {
-                    TitoError::TransactionFailed(String::from("Failed migration, scan"))
-                })?;
+                    let mut has_kvs = false;
+                    for kv in kvs {
+                        has_kvs = true;
+                        let key = String::from_utf8(kv.0.into()).unwrap();
+                        let mut value: Value = serde_json::from_slice(&kv.1).unwrap();
 
-                let mut has_kvs = false;
-                for kv in kvs {
-                    has_kvs = true;
-                    let key = String::from_utf8(kv.0.into()).unwrap();
-                    let mut value: Value = serde_json::from_slice(&kv.1).unwrap();
+                        value[&field_name] = field_value.clone();
 
-                    value[field_name] = field_value.clone();
-
-                    let model_instance =
-                        serde_json::from_value::<T>(value.clone()).map_err(|_| {
-                            TitoError::TransactionFailed(String::from("Failed migration, model"))
-                        })?;
-
-                    self.update_with_options(
-                        model_instance,
-                        TitoOptions::with_events(TitoOperation::Update),
-                        &tx,
-                    )
-                    .await?;
-
-                    cursor = next_string_lexicographically(key);
-                }
-
-                if !has_kvs {
-                    break;
-                }
-            }
-
-            Ok::<_, TitoError>(true)
-        })
-        .await;
-
-        Ok(())
-    }
-
-    pub async fn remove_field(&self, field_name: &str) -> Result<(), TitoError> {
-        let table = self.get_table();
-        let start_key = format!("{}:", table);
-        let end_key = next_string_lexicographically(start_key.clone());
-
-        let mut cursor = start_key.clone();
-
-        self.tx(|tx| async move {
-            loop {
-                let scan_range = cursor.clone()..end_key.clone();
-                let kvs = tx.scan(scan_range, 100).await.map_err(|_| {
-                    TitoError::TransactionFailed(String::from("Failed migration, scan"))
-                })?;
-
-                let mut has_kvs = false;
-                for kv in kvs {
-                    has_kvs = true;
-                    let key = String::from_utf8(kv.0.into()).unwrap();
-
-                    let mut value: Value = serde_json::from_slice(&kv.1).unwrap();
-
-                    if value.as_object_mut().unwrap().remove(field_name).is_some() {
                         let model_instance =
                             serde_json::from_value::<T>(value.clone()).map_err(|_| {
-                                TitoError::TransactionFailed(String::from(
-                                    "Failed migration, model",
-                                ))
+                                TitoError::TransactionFailed(String::from("Failed migration, model"))
                             })?;
 
                         self.update_with_options(
@@ -1105,17 +964,73 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                             &tx,
                         )
                         .await?;
+
+                        cursor = next_string_lexicographically(key);
                     }
 
-                    cursor = next_string_lexicographically(key);
+                    if !has_kvs {
+                        break;
+                    }
                 }
 
-                if !has_kvs {
-                    break;
-                }
+                Ok::<_, TitoError>(true)
             }
+        })
+        .await?;
 
-            Ok::<_, TitoError>(true)
+        Ok(())
+    }
+
+    pub async fn remove_field(&self, field_name: &str) -> Result<(), TitoError> {
+        let table = self.get_table();
+        let start_key = format!("{}:", table);
+        let end_key = next_string_lexicographically(start_key.clone());
+        let field_name = field_name.to_string();
+
+        self.tx(|tx| {
+            let end_key = end_key.clone();
+            let field_name = field_name.clone();
+            let mut cursor = start_key.clone();
+            async move {
+                loop {
+                    let scan_range = cursor.clone()..end_key.clone();
+                    let kvs = tx.scan(scan_range, 100).await.map_err(|_| {
+                        TitoError::TransactionFailed(String::from("Failed migration, scan"))
+                    })?;
+
+                    let mut has_kvs = false;
+                    for kv in kvs {
+                        has_kvs = true;
+                        let key = String::from_utf8(kv.0.into()).unwrap();
+
+                        let mut value: Value = serde_json::from_slice(&kv.1).unwrap();
+
+                        if value.as_object_mut().unwrap().remove(&field_name).is_some() {
+                            let model_instance =
+                                serde_json::from_value::<T>(value.clone()).map_err(|_| {
+                                    TitoError::TransactionFailed(String::from(
+                                        "Failed migration, model",
+                                    ))
+                                })?;
+
+                            self.update_with_options(
+                                model_instance,
+                                TitoOptions::with_events(TitoOperation::Update),
+                                &tx,
+                            )
+                            .await?;
+                        }
+
+                        cursor = next_string_lexicographically(key);
+                    }
+
+                    if !has_kvs {
+                        break;
+                    }
+                }
+
+                Ok::<_, TitoError>(true)
+            }
         })
         .await?;
 
@@ -1127,29 +1042,33 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         let start_key = format!("{}:", table_name);
         let end_key = next_string_lexicographically(start_key.clone());
 
-        self.tx(|tx| async move {
-            let (items, has_more) = self
-                .scan(
-                    TitoScanPayload {
-                        start: start_key,
-                        end: Some(end_key),
-                        limit: None,
-                        cursor: None,
-                    },
-                    &tx,
-                )
-                .await?;
+        self.tx(|tx| {
+            let start_key = start_key.clone();
+            let end_key = end_key.clone();
+            async move {
+                let (items, _has_more) = self
+                    .scan(
+                        TitoScanPayload {
+                            start: start_key,
+                            end: Some(end_key),
+                            limit: None,
+                            cursor: None,
+                        },
+                        &tx,
+                    )
+                    .await?;
 
-            let results: Vec<T> = items
-                .iter()
-                .map(|(_, value)| {
-                    serde_json::from_value::<T>(value.clone()).map_err(|_| {
-                        TitoError::DeserializationFailed("Failed to deserialize".to_string())
+                let results: Vec<T> = items
+                    .iter()
+                    .map(|(_, value)| {
+                        serde_json::from_value::<T>(value.clone()).map_err(|_| {
+                            TitoError::DeserializationFailed("Failed to deserialize".to_string())
+                        })
                     })
-                })
-                .collect::<Result<_, _>>()?;
+                    .collect::<Result<_, _>>()?;
 
-            Ok(TitoPaginated::new(results, None))
+                Ok(TitoPaginated::new(results, None))
+            }
         })
         .await
     }

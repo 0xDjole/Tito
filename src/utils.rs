@@ -1,5 +1,3 @@
-use uuid::Uuid;
-
 pub fn next_string_lexicographically(payload: String) -> String {
     let mut prefix_end = payload.as_bytes().to_vec();
 

@@ -9,7 +9,6 @@ use crate::{
     utils::next_string_lexicographically,
     TitoModel,
 };
-use chrono::Utc;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 
@@ -265,8 +264,11 @@ impl<
     where
         T: serde::de::DeserializeOwned,
     {
-        self.tx(|tx| async move { self.find_by_index_tx(payload, &tx).await })
-            .await
+        self.tx(|tx| {
+            let payload = payload.clone();
+            async move { self.find_by_index_tx(payload, &tx).await }
+        })
+        .await
     }
 
     pub async fn find_by_index_reverse_tx(
@@ -292,8 +294,11 @@ impl<
     where
         T: serde::de::DeserializeOwned,
     {
-        self.tx(|tx| async move { self.find_by_index_reverse_tx(payload, &tx).await })
-            .await
+        self.tx(|tx| {
+            let payload = payload.clone();
+            async move { self.find_by_index_reverse_tx(payload, &tx).await }
+        })
+        .await
     }
 
     pub async fn find_one_by_index_tx(
@@ -342,8 +347,11 @@ impl<
     where
         T: serde::de::DeserializeOwned,
     {
-        self.tx(|tx| async move { self.find_one_by_index_tx(payload, &tx).await })
-            .await
+        self.tx(|tx| {
+            let payload = payload.clone();
+            async move { self.find_one_by_index_tx(payload, &tx).await }
+        })
+        .await
     }
 
     pub async fn reindex(&self) -> Result<(), TitoError> {
@@ -351,45 +359,47 @@ impl<
         let start_key = format!("{}:", table);
         let end_key = next_string_lexicographically(start_key.clone());
 
-        let mut cursor = start_key.clone();
+        self.tx(|tx| {
+            let end_key = end_key.clone();
+            let mut cursor = start_key.clone();
+            async move {
+                loop {
+                    let scan_range = cursor.clone()..end_key.clone();
+                    let kvs = tx.scan(scan_range, 100).await.map_err(|_| {
+                        TitoError::TransactionFailed(String::from("Failed migration, scan"))
+                    })?;
 
-        self.tx(|tx| async move {
-            loop {
-                let scan_range = cursor.clone()..end_key.clone();
-                let kvs = tx.scan(scan_range, 100).await.map_err(|e| {
-                    TitoError::TransactionFailed(String::from("Failed migration, scan"))
-                })?;
+                    let mut has_kvs = false;
+                    for kv in kvs {
+                        has_kvs = true;
+                        let key = String::from_utf8(kv.0.into()).unwrap();
 
-                let mut has_kvs = false;
-                for kv in kvs {
-                    has_kvs = true;
-                    let key = String::from_utf8(kv.0.into()).unwrap();
+                        let value: Value = serde_json::from_slice(&kv.1).unwrap();
 
-                    let value: Value = serde_json::from_slice(&kv.1).unwrap();
+                        let model_instance =
+                            serde_json::from_value::<T>(value.clone()).map_err(|_| {
+                                TitoError::TransactionFailed(String::from("Failed migration, model"))
+                            })?;
 
-                    let model_instance =
-                        serde_json::from_value::<T>(value.clone()).map_err(|_| {
-                            TitoError::TransactionFailed(String::from("Failed migration, model"))
-                        })?;
+                        self.update_with_options(
+                            model_instance,
+                            TitoOptions::with_events(TitoOperation::Update),
+                            &tx,
+                        )
+                        .await?;
 
-                    self.update_with_options(
-                        model_instance,
-                        TitoOptions::with_events(TitoOperation::Update),
-                        &tx,
-                    )
-                    .await?;
+                        cursor = next_string_lexicographically(key);
+                    }
 
-                    cursor = next_string_lexicographically(key);
+                    if !has_kvs {
+                        break;
+                    }
                 }
 
-                if !has_kvs {
-                    break;
-                }
+                Ok::<_, TitoError>(true)
             }
-
-            Ok::<_, TitoError>(true)
         })
-        .await;
+        .await?;
 
         Ok(())
     }
