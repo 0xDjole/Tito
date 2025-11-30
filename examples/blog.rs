@@ -160,7 +160,7 @@ async fn main() -> Result<(), TitoError> {
     println!("Created post: {}", post.title);
 
     let post_with_tags = post_model
-        .find_by_id(&post.id, vec!["tags".to_string()])
+        .find_by_id(&post.id, vec!["tags".to_string()], None)
         .await?;
 
     println!("Post: {}", post_with_tags.title);
@@ -173,7 +173,7 @@ async fn main() -> Result<(), TitoError> {
     let results = query
         .value("Alice".to_string())
         .relationship("tags")
-        .execute()
+        .execute(None)
         .await?;
 
     println!("\nAlice's posts:");

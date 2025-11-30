@@ -1,13 +1,13 @@
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tito::{
     queue::{run_worker, TitoQueue},
     types::{
         DBUuid, TitoEngine, TitoEventConfig, TitoIndexBlockType, TitoIndexConfig, TitoIndexField,
-        TitoModelTrait, PartitionConfig,
+        TitoModelTrait, WorkerConfig,
     },
     TiKV, TitoError, TitoOperation, TitoOptions,
 };
@@ -91,7 +91,6 @@ async fn main() -> Result<(), TitoError> {
         engine: tito_db.clone(),
     });
 
-    let is_leader = Arc::new(AtomicBool::new(true));
     let events_processed = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let events_processed_clone = events_processed.clone();
 
@@ -114,10 +113,12 @@ async fn main() -> Result<(), TitoError> {
 
     let worker_handle = run_worker(
         queue.clone(),
-        String::from("user"),
+        WorkerConfig {
+            event_type: String::from("user"),
+            consumer: String::from("example-consumer"),
+            partition: 0,
+        },
         handler,
-        PartitionConfig::new(0),
-        is_leader.clone(),
         shutdown_rx,
     )
     .await;

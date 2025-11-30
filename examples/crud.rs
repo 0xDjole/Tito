@@ -60,7 +60,7 @@ async fn main() -> Result<(), TitoError> {
 
     println!("Created user: {:?}", saved_user);
 
-    let found_user = user_model.find_by_id(&user_id, vec![]).await?;
+    let found_user = user_model.find_by_id(&user_id, vec![], None).await?;
     println!("Found user: {:?}", found_user);
 
     let updated_user = User {
