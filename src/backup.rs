@@ -5,7 +5,7 @@ use std::path::Path;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct BackupRecord {
     pub key: String,
     pub value: Value,
