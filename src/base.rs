@@ -4,13 +4,18 @@ use crate::{
     error::TitoError,
     query::IndexQueryBuilder,
     types::{
-        DBUuid, FieldValue, ReverseIndex, TitoCursor, TitoEngine,
+        DBUuid, FieldValue, MigrateStats, ReverseIndex, TitoCursor, TitoEngine,
         TitoEvent, TitoFindPayload, TitoGenerateEventPayload, TitoKvPair,
         TitoModelTrait, TitoOperation, TitoOptions, TitoPaginated, TitoRelationshipConfig,
         TitoScanPayload, TitoTransaction,
     },
     utils::{next_string_lexicographically, previous_string_lexicographically},
 };
+
+enum MigrateResult {
+    Done,
+    Processed { next_cursor: String, modified: bool },
+}
 use base64::{decode, encode};
 use chrono::Utc;
 use serde::{de::DeserializeOwned, Serialize};
@@ -925,115 +930,140 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         .await
     }
 
-    pub async fn add_field(&self, field_name: &str, field_value: Value) -> Result<(), TitoError> {
-        let table = self.get_table();
+    pub async fn migrate<F, Fut>(
+        &self,
+        f: F,
+        checkpoint: &str,
+    ) -> Result<MigrateStats, TitoError>
+    where
+        F: Fn(T) -> Fut + Send + Sync + Clone,
+        Fut: Future<Output = Result<Option<T>, TitoError>> + Send,
+        T: DeserializeOwned,
+    {
+        let table_prefix = format!("{}:", self.get_table());
+        let end_key = next_string_lexicographically(table_prefix.clone());
+        let mut stats = MigrateStats::default();
 
-        let start_key = format!("{}:", table);
-        let end_key = next_string_lexicographically(start_key.clone());
-        let field_name = field_name.to_string();
+        // Load checkpoint or start from beginning
+        let mut cursor = self
+            .load_migrate_checkpoint(checkpoint)
+            .await?
+            .unwrap_or(table_prefix);
 
-        self.tx(|tx| {
-            let end_key = end_key.clone();
-            let field_name = field_name.clone();
-            let field_value = field_value.clone();
-            let mut cursor = start_key.clone();
-            async move {
-                loop {
-                    let scan_range = cursor.clone()..end_key.clone();
-                    let kvs = tx.scan(scan_range, 100).await.map_err(|_| {
-                        TitoError::TransactionFailed(String::from("Failed migration, scan"))
-                    })?;
+        loop {
+            let f = f.clone();
+            let checkpoint_key = checkpoint.to_string();
 
-                    let mut has_kvs = false;
-                    for kv in kvs {
-                        has_kvs = true;
-                        let key = String::from_utf8(kv.0.into()).unwrap();
-                        let mut value: Value = serde_json::from_slice(&kv.1).unwrap();
+            let result = self
+                .engine
+                .transaction(|tx| {
+                    let cursor = cursor.clone();
+                    let end_key = end_key.clone();
+                    let checkpoint_key = checkpoint_key.clone();
 
-                        value[&field_name] = field_value.clone();
+                    async move {
+                        // Scan for next record
+                        let kvs = tx
+                            .scan(cursor.as_bytes()..end_key.as_bytes(), 1)
+                            .await
+                            .map_err(|e| TitoError::QueryFailed(e.to_string()))?;
 
-                        let model_instance =
-                            serde_json::from_value::<T>(value.clone()).map_err(|_| {
-                                TitoError::TransactionFailed(String::from("Failed migration, model"))
-                            })?;
-
-                        self.update_with_options(
-                            model_instance,
-                            TitoOptions::with_events(TitoOperation::Update),
-                            &tx,
-                        )
-                        .await?;
-
-                        cursor = next_string_lexicographically(key);
-                    }
-
-                    if !has_kvs {
-                        break;
-                    }
-                }
-
-                Ok::<_, TitoError>(true)
-            }
-        })
-        .await?;
-
-        Ok(())
-    }
-
-    pub async fn remove_field(&self, field_name: &str) -> Result<(), TitoError> {
-        let table = self.get_table();
-        let start_key = format!("{}:", table);
-        let end_key = next_string_lexicographically(start_key.clone());
-        let field_name = field_name.to_string();
-
-        self.tx(|tx| {
-            let end_key = end_key.clone();
-            let field_name = field_name.clone();
-            let mut cursor = start_key.clone();
-            async move {
-                loop {
-                    let scan_range = cursor.clone()..end_key.clone();
-                    let kvs = tx.scan(scan_range, 100).await.map_err(|_| {
-                        TitoError::TransactionFailed(String::from("Failed migration, scan"))
-                    })?;
-
-                    let mut has_kvs = false;
-                    for kv in kvs {
-                        has_kvs = true;
-                        let key = String::from_utf8(kv.0.into()).unwrap();
-
-                        let mut value: Value = serde_json::from_slice(&kv.1).unwrap();
-
-                        if value.as_object_mut().unwrap().remove(&field_name).is_some() {
-                            let model_instance =
-                                serde_json::from_value::<T>(value.clone()).map_err(|_| {
-                                    TitoError::TransactionFailed(String::from(
-                                        "Failed migration, model",
-                                    ))
-                                })?;
-
-                            self.update_with_options(
-                                model_instance,
-                                TitoOptions::with_events(TitoOperation::Update),
-                                &tx,
-                            )
-                            .await?;
+                        if kvs.is_empty() {
+                            return Ok(MigrateResult::Done);
                         }
 
-                        cursor = next_string_lexicographically(key);
-                    }
+                        let key = String::from_utf8(kvs[0].0.clone())
+                            .map_err(|_| TitoError::DeserializationFailed("Invalid key".into()))?;
 
-                    if !has_kvs {
-                        break;
+                        let record: T = serde_json::from_slice(&kvs[0].1)
+                            .map_err(|e| TitoError::DeserializationFailed(e.to_string()))?;
+
+                        // Call user's async closure
+                        let modified = match f(record).await? {
+                            Some(updated) => {
+                                self.update_with_options(
+                                    updated,
+                                    TitoOptions::skip_events(TitoOperation::Update),
+                                    &tx,
+                                )
+                                .await?;
+                                true
+                            }
+                            None => false,
+                        };
+
+                        // Save checkpoint
+                        let next_cursor = next_string_lexicographically(key.clone());
+                        tx.put(checkpoint_key.as_bytes(), next_cursor.as_bytes())
+                            .await
+                            .map_err(|e| TitoError::UpdateFailed(e.to_string()))?;
+
+                        Ok(MigrateResult::Processed {
+                            next_cursor,
+                            modified,
+                        })
+                    }
+                })
+                .await?;
+
+            match result {
+                MigrateResult::Done => {
+                    self.delete_migrate_checkpoint(checkpoint).await?;
+                    break;
+                }
+                MigrateResult::Processed {
+                    next_cursor,
+                    modified,
+                } => {
+                    stats.processed += 1;
+                    if modified {
+                        stats.modified += 1;
+                    } else {
+                        stats.skipped += 1;
+                    }
+                    cursor = next_cursor;
+
+                    if stats.processed % 100 == 0 {
+                        println!(
+                            "[migrate] processed: {}, modified: {}, skipped: {}",
+                            stats.processed, stats.modified, stats.skipped
+                        );
                     }
                 }
-
-                Ok::<_, TitoError>(true)
             }
-        })
-        .await?;
+        }
 
-        Ok(())
+        Ok(stats)
+    }
+
+    async fn load_migrate_checkpoint(&self, key: &str) -> Result<Option<String>, TitoError> {
+        self.engine
+            .transaction(|tx| {
+                let key = key.to_string();
+                async move {
+                    match tx.get(key.as_bytes()).await {
+                        Ok(Some(v)) => Ok(Some(String::from_utf8(v).map_err(|_| {
+                            TitoError::DeserializationFailed("Invalid checkpoint".into())
+                        })?)),
+                        Ok(None) => Ok(None),
+                        Err(e) => Err(TitoError::QueryFailed(e.to_string())),
+                    }
+                }
+            })
+            .await
+    }
+
+    async fn delete_migrate_checkpoint(&self, key: &str) -> Result<(), TitoError> {
+        self.engine
+            .transaction(|tx| {
+                let key = key.to_string();
+                async move {
+                    tx.delete(key.as_bytes())
+                        .await
+                        .map_err(|e| TitoError::DeleteFailed(e.to_string()))
+                }
+            })
+            .await
     }
 
     pub async fn find_all(&self) -> Result<TitoPaginated<T>, TitoError> {
