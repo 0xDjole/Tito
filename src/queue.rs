@@ -314,13 +314,31 @@ where
                         50,
                     ).await {
                         Ok(jobs) => {
+                            use std::collections::HashMap;
+                            use futures::future::join_all;
+
+                            let mut by_entity: HashMap<String, Vec<TitoEvent>> = HashMap::new();
                             for job in jobs {
-                                let result = handler(job.clone()).await;
-                                let _ = match result {
-                                    Ok(_) => queue.success_job(config.consumer.clone(), job.key).await,
-                                    Err(_) => queue.fail_job(config.consumer.clone(), job.key).await,
-                                };
+                                by_entity.entry(job.entity.clone()).or_default().push(job);
                             }
+
+                            let futures: Vec<_> = by_entity.into_iter().map(|(_entity, events)| {
+                                let h = handler.clone();
+                                let q = queue.clone();
+                                let consumer = config.consumer.clone();
+                                async move {
+                                    for event in events {
+                                        let key = event.key.clone();
+                                        let result = h(event).await;
+                                        let _ = match result {
+                                            Ok(_) => q.success_job(consumer.clone(), key).await,
+                                            Err(_) => q.fail_job(consumer.clone(), key).await,
+                                        };
+                                    }
+                                }
+                            }).collect();
+
+                            join_all(futures).await;
                         }
                         Err(_) => {
                             sleep(Duration::from_millis(500)).await;
