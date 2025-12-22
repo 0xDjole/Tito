@@ -41,7 +41,7 @@ pub trait TitoEngine: Send + Sync + Clone {
         F: FnOnce(Self::Transaction) -> Fut + Clone + Send,
         Fut: Future<Output = Result<T, E>> + Send,
         T: Send,
-        E: From<TitoError> + Send;
+        E: From<TitoError> + Send + std::fmt::Debug;
 
     async fn clear_active_transactions(&self) -> Result<(), TitoError>;
 

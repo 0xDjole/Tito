@@ -36,7 +36,7 @@ impl TitoEngine for TiKVBackend {
         F: FnOnce(Self::Transaction) -> Fut + Clone + Send,
         Fut: Future<Output = Result<T, E>> + Send,
         T: Send,
-        E: From<TitoError> + Send,
+        E: From<TitoError> + Send + std::fmt::Debug,
     {
         const MAX_RETRIES: u32 = 10;
         let mut retries = 0;
@@ -93,8 +93,28 @@ impl TitoEngine for TiKVBackend {
                 Err(e) => {
                     let _ = tx.rollback().await;
                     // Remove from tracking AFTER rollback
-                    let mut active_transactions = self.active_transactions.lock().await;
-                    active_transactions.remove(&tx_id);
+                    {
+                        let mut active_transactions = self.active_transactions.lock().await;
+                        active_transactions.remove(&tx_id);
+                    }
+
+                    // Check if this is a retryable error (e.g., lock conflicts during reads)
+                    let err_str = format!("{:?}", e);
+                    let err_lower = err_str.to_lowercase();
+                    let is_retryable = err_lower.contains("lock")
+                        || err_lower.contains("conflict")
+                        || err_lower.contains("retryable")
+                        || err_lower.contains("region")
+                        || err_lower.contains("stale");
+
+                    if is_retryable && retries < MAX_RETRIES {
+                        retries += 1;
+                        let jitter = rand::thread_rng().gen_range(0..base_delay_ms / 2);
+                        let delay = base_delay_ms + jitter;
+                        sleep(Duration::from_millis(delay)).await;
+                        base_delay_ms = (base_delay_ms * 2).min(2000);
+                        continue;
+                    }
                     return Err(e);
                 }
             }

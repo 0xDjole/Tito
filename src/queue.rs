@@ -311,7 +311,7 @@ where
                         config.consumer.clone(),
                         config.event_type.clone(),
                         config.partition,
-                        1,
+                        50,
                     ).await {
                         Ok(jobs) => {
                             for job in jobs {
