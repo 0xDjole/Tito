@@ -291,7 +291,7 @@ pub async fn run_worker<E: TitoEngine + 'static, H>(
     queue: Arc<TitoQueue<E>>,
     config: crate::types::WorkerConfig,
     handler: H,
-    mut shutdown: broadcast::Receiver<()>,
+    shutdown: broadcast::Receiver<()>,
 ) -> tokio::task::JoinHandle<()>
 where
     H: Fn(TitoEvent) -> futures::future::BoxFuture<'static, Result<(), TitoError>>
@@ -301,52 +301,68 @@ where
         + 'static,
 {
     tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = shutdown.recv() => {
-                    break;
-                }
-                _ = async {
-                    match queue.pull_partition(
-                        config.consumer.clone(),
-                        config.event_type.clone(),
-                        config.partition,
-                        50,
-                    ).await {
-                        Ok(jobs) => {
-                            use std::collections::HashMap;
-                            use futures::future::join_all;
+        use futures::future::join_all;
 
-                            let mut by_entity: HashMap<String, Vec<TitoEvent>> = HashMap::new();
-                            for job in jobs {
-                                by_entity.entry(job.entity.clone()).or_default().push(job);
-                            }
+        let mut handles = Vec::new();
+        for partition in config.partition_range.clone() {
+            let q = queue.clone();
+            let h = handler.clone();
+            let consumer = config.consumer.clone();
+            let event_type = config.event_type.clone();
+            let mut rx = shutdown.resubscribe();
 
-                            let futures: Vec<_> = by_entity.into_iter().map(|(_entity, events)| {
-                                let h = handler.clone();
-                                let q = queue.clone();
-                                let consumer = config.consumer.clone();
-                                async move {
-                                    for event in events {
-                                        let key = event.key.clone();
-                                        let result = h(event).await;
-                                        let _ = match result {
-                                            Ok(_) => q.success_job(consumer.clone(), key).await,
-                                            Err(_) => q.fail_job(consumer.clone(), key).await,
-                                        };
+            handles.push(tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = rx.recv() => {
+                            break;
+                        }
+                        _ = async {
+                            match q.pull_partition(
+                                consumer.clone(),
+                                event_type.clone(),
+                                partition,
+                                50,
+                            ).await {
+                                Ok(jobs) => {
+                                    use std::collections::HashMap;
+
+                                    let mut by_entity: HashMap<String, Vec<TitoEvent>> = HashMap::new();
+                                    for job in jobs {
+                                        by_entity.entry(job.entity.clone()).or_default().push(job);
                                     }
-                                }
-                            }).collect();
 
-                            join_all(futures).await;
-                        }
-                        Err(_) => {
-                            sleep(Duration::from_millis(500)).await;
-                        }
+                                    let futures: Vec<_> = by_entity.into_iter().map(|(_entity, events)| {
+                                        let h = h.clone();
+                                        let q = q.clone();
+                                        let consumer = consumer.clone();
+                                        async move {
+                                            for event in events {
+                                                let key = event.key.clone();
+                                                let result = h(event).await;
+                                                let _ = match result {
+                                                    Ok(_) => q.success_job(consumer.clone(), key).await,
+                                                    Err(_) => q.fail_job(consumer.clone(), key).await,
+                                                };
+                                            }
+                                        }
+                                    }).collect();
+
+                                    join_all(futures).await;
+                                }
+                                Err(_) => {
+                                    sleep(Duration::from_millis(500)).await;
+                                }
+                            }
+                            sleep(Duration::from_millis(125)).await;
+                        } => {}
                     }
-                    sleep(Duration::from_millis(125)).await;
-                } => {}
-            }
+                }
+            }));
+        }
+
+        for handle in handles {
+            let _ = handle.await;
         }
     })
 }
