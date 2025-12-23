@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::ops::Range;
 use std::sync::Arc;
-use tikv_client::{RawClient, Transaction, TransactionClient};
+use tikv_client::{ColumnFamily, RawClient, Transaction, TransactionClient};
 use tokio::time::{sleep, Duration};
 
 #[derive(Clone)]
@@ -130,13 +130,19 @@ impl TitoEngine for TiKVBackend {
         // Wait for and rollback each transaction - we CANNOT skip them
         // because skipping means they get dropped without commit/rollback
         for (tx_id, tx) in transactions {
-            eprintln!("Waiting for transaction {} to become available for cleanup...", tx_id);
+            eprintln!(
+                "Waiting for transaction {} to become available for cleanup...",
+                tx_id
+            );
 
             // Use .lock().await to WAIT for the transaction to become available
             // This blocks until the transaction is no longer being used
             match tx.inner.lock().await.rollback().await {
                 Ok(_) => {
-                    eprintln!("Successfully rolled back transaction {} during cleanup", tx_id);
+                    eprintln!(
+                        "Successfully rolled back transaction {} during cleanup",
+                        tx_id
+                    );
                 }
                 Err(e) => {
                     eprintln!("Warning: Failed to rollback transaction {}: {:?}", tx_id, e);
@@ -148,10 +154,32 @@ impl TitoEngine for TiKVBackend {
 
     async fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<(), TitoError> {
         let range: tikv_client::BoundRange = (start.to_vec()..end.to_vec()).into();
+
         self.raw_client
+            .with_cf(ColumnFamily::Default)
+            .delete_range(range.clone())
+            .await
+            .map_err(|e| {
+                TitoError::DeleteFailed(format!("Delete range (Default CF) failed: {}", e))
+            })?;
+
+        self.raw_client
+            .with_cf(ColumnFamily::Write)
+            .delete_range(range.clone())
+            .await
+            .map_err(|e| {
+                TitoError::DeleteFailed(format!("Delete range (Write CF) failed: {}", e))
+            })?;
+
+        self.raw_client
+            .with_cf(ColumnFamily::Lock)
             .delete_range(range)
             .await
-            .map_err(|e| TitoError::DeleteFailed(format!("Delete range failed: {}", e)))
+            .map_err(|e| {
+                TitoError::DeleteFailed(format!("Delete range (Lock CF) failed: {}", e))
+            })?;
+
+        Ok(())
     }
 }
 
@@ -308,11 +336,9 @@ impl TiKV {
                 TitoError::ConnectionFailed(format!("Failed to connect to TiKV: {}", e))
             })?;
 
-        let raw_client = RawClient::new(endpoint_strings)
-            .await
-            .map_err(|e| {
-                TitoError::ConnectionFailed(format!("Failed to connect RawClient to TiKV: {}", e))
-            })?;
+        let raw_client = RawClient::new(endpoint_strings).await.map_err(|e| {
+            TitoError::ConnectionFailed(format!("Failed to connect RawClient to TiKV: {}", e))
+        })?;
 
         Ok(TiKVBackend {
             client: Arc::new(client),
