@@ -45,6 +45,8 @@ pub trait TitoEngine: Send + Sync + Clone {
 
     async fn clear_active_transactions(&self) -> Result<(), TitoError>;
 
+    async fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<(), TitoError>;
+
     fn model<T: TitoModelConstraints>(self) -> TitoModel<Self, T> {
         TitoModel::new(self)
     }

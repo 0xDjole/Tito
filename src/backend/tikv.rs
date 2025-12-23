@@ -7,12 +7,13 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::ops::Range;
 use std::sync::Arc;
-use tikv_client::{Transaction, TransactionClient};
+use tikv_client::{RawClient, Transaction, TransactionClient};
 use tokio::time::{sleep, Duration};
 
 #[derive(Clone)]
 pub struct TiKVBackend {
     pub client: Arc<TransactionClient>,
+    pub raw_client: Arc<RawClient>,
     pub active_transactions: Arc<Mutex<HashMap<String, TiKVTransaction>>>,
 }
 
@@ -130,7 +131,7 @@ impl TitoEngine for TiKVBackend {
         // because skipping means they get dropped without commit/rollback
         for (tx_id, tx) in transactions {
             eprintln!("Waiting for transaction {} to become available for cleanup...", tx_id);
-            
+
             // Use .lock().await to WAIT for the transaction to become available
             // This blocks until the transaction is no longer being used
             match tx.inner.lock().await.rollback().await {
@@ -143,6 +144,14 @@ impl TitoEngine for TiKVBackend {
             }
         }
         Ok(())
+    }
+
+    async fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<(), TitoError> {
+        let range: tikv_client::BoundRange = (start.to_vec()..end.to_vec()).into();
+        self.raw_client
+            .delete_range(range)
+            .await
+            .map_err(|e| TitoError::DeleteFailed(format!("Delete range failed: {}", e)))
     }
 }
 
@@ -293,14 +302,21 @@ impl TiKV {
     pub async fn connect<S: AsRef<str>>(endpoints: Vec<S>) -> Result<TiKVBackend, TitoError> {
         let endpoint_strings: Vec<String> =
             endpoints.iter().map(|s| s.as_ref().to_string()).collect();
-        let client = TransactionClient::new(endpoint_strings)
+        let client = TransactionClient::new(endpoint_strings.clone())
             .await
             .map_err(|e| {
                 TitoError::ConnectionFailed(format!("Failed to connect to TiKV: {}", e))
             })?;
 
+        let raw_client = RawClient::new(endpoint_strings)
+            .await
+            .map_err(|e| {
+                TitoError::ConnectionFailed(format!("Failed to connect RawClient to TiKV: {}", e))
+            })?;
+
         Ok(TiKVBackend {
             client: Arc::new(client),
+            raw_client: Arc::new(raw_client),
             active_transactions: Arc::new(Mutex::new(HashMap::new())),
         })
     }
