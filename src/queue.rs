@@ -325,7 +325,7 @@ where
                                 50,
                             ).await {
                                 Ok(jobs) if jobs.is_empty() => {
-                                    sleep(Duration::from_millis(100)).await;
+                                    sleep(Duration::from_millis(1000)).await;
                                 }
                                 Ok(jobs) => {
                                     use std::collections::HashMap;
