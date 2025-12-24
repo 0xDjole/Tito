@@ -19,7 +19,7 @@ impl<E: TitoEngine> TitoQueue<E> {
         partition: u32,
         limit: u32,
     ) -> Result<Vec<TitoEvent>, TitoError> {
-        use crate::types::{PARTITION_DIGITS, QueueCheckpoint, QueueProgress};
+        use crate::types::{PARTITION_DIGITS, QueueCheckpoint};
         use chrono::Utc;
 
         self.engine
@@ -27,101 +27,85 @@ impl<E: TitoEngine> TitoQueue<E> {
                 let consumer = consumer.clone();
                 let event_type = event_type.clone();
                 async move {
-                let mut jobs = Vec::new();
+                let now = Utc::now().timestamp();
 
+                // Get checkpoint
                 let checkpoint_key = format!(
                     "queue_checkpoint:{}:{}:{:0width$}",
-                    consumer,
-                    event_type,
-                    partition,
+                    consumer, event_type, partition,
                     width = PARTITION_DIGITS
                 );
-
                 let checkpoint = tx.get(checkpoint_key.as_bytes()).await
                     .map_err(|e| TitoError::QueryFailed(format!("Checkpoint read failed: {}", e)))?
                     .and_then(|bytes| serde_json::from_slice::<QueueCheckpoint>(&bytes).ok());
 
-                let now = Utc::now().timestamp();
+                let start_ts = checkpoint.map(|c| c.timestamp).unwrap_or(0);
 
-                let event_start_key = match &checkpoint {
-                    Some(ckpt) => format!(
-                        "event:{}:{:0pwidth$}:{}:{}\0",
-                        event_type,
-                        partition,
-                        ckpt.timestamp,
-                        ckpt.uuid,
-                        pwidth = PARTITION_DIGITS,
-                    ),
-                    None => format!(
-                        "event:{}:{:0pwidth$}:0",
-                        event_type,
-                        partition,
-                        pwidth = PARTITION_DIGITS,
-                    ),
-                };
-                let event_end_key = format!(
+                // Scan from checkpoint
+                let event_start = format!(
                     "event:{}:{:0pwidth$}:{}",
-                    event_type,
-                    partition,
-                    now + 1,
+                    event_type, partition, start_ts,
+                    pwidth = PARTITION_DIGITS,
+                );
+                let event_end = format!(
+                    "event:{}:{:0pwidth$}:{}",
+                    event_type, partition, now + 1,
                     pwidth = PARTITION_DIGITS,
                 );
 
                 let events = tx.scan(
-                    event_start_key.as_bytes()..event_end_key.as_bytes(),
+                    event_start.as_bytes()..event_end.as_bytes(),
                     limit
-                )
-                .await
-                .map_err(|e| TitoError::QueryFailed(format!("Event scan failed: {}", e)))?;
+                ).await.map_err(|e| TitoError::QueryFailed(format!("Scan failed: {}", e)))?;
 
-                for (event_key, event_bytes) in events {
-                    if let Ok(event) = serde_json::from_slice::<TitoEvent>(&event_bytes) {
-                        if event.timestamp > now {
-                            continue;
-                        }
+                let mut jobs = Vec::new();
+                let mut oldest_pending_ts: Option<i64> = None;
 
-                        let event_key_str = String::from_utf8_lossy(&event_key);
-                        let parts: Vec<&str> = event_key_str.split(':').collect();
-                        if parts.len() < 5 {
-                            continue;
-                        }
-                        let partition_str = parts[2];
-                        let timestamp_str = parts[3];
-                        let uuid_str = parts[4];
+                for (_key, value) in events {
+                    let event: TitoEvent = match serde_json::from_slice(&value) {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    };
 
-                        let completed_key = format!(
-                            "queue:{}:{}:completed:{}:{}:{}",
-                            consumer, event_type, partition_str, timestamp_str, uuid_str
-                        );
-                        let progress_key = format!(
-                            "queue:{}:{}:progress:{}:{}:{}",
-                            consumer, event_type, partition_str, timestamp_str, uuid_str
-                        );
-
-                        let is_completed = tx.get(completed_key.as_bytes()).await
-                            .map_err(|e| TitoError::QueryFailed(format!("Completed check failed: {}", e)))?
-                            .is_some();
-
-                        let is_in_progress = tx.get(progress_key.as_bytes()).await
-                            .map_err(|e| TitoError::QueryFailed(format!("Progress check failed: {}", e)))?
-                            .is_some();
-
-                        if !is_completed && !is_in_progress {
-                            let progress = QueueProgress {
-                                retries: event.retries,
-                                updated_at: Utc::now().timestamp(),
-                            };
-                            tx.put(progress_key.as_bytes(), serde_json::to_vec(&progress).unwrap())
-                                .await
-                                .map_err(|e| TitoError::UpdateFailed(format!("Progress put failed: {}", e)))?;
-
-                            jobs.push(event);
-
-                            if jobs.len() >= limit as usize {
-                                break;
-                            }
-                        }
+                    // Skip future events
+                    if event.timestamp > now {
+                        continue;
                     }
+
+                    // Parse key parts
+                    let parts: Vec<&str> = event.key.split(':').collect();
+                    if parts.len() < 5 { continue; }
+                    let partition_str = parts[2];
+                    let timestamp_str = parts[3];
+                    let uuid_str = parts[4];
+
+                    // Check completed
+                    let completed_key = format!(
+                        "queue:{}:{}:completed:{}:{}:{}",
+                        consumer, event_type, partition_str, timestamp_str, uuid_str
+                    );
+                    let is_completed = tx.get(completed_key.as_bytes()).await
+                        .map_err(|e| TitoError::QueryFailed(format!("Completed check: {}", e)))?
+                        .is_some();
+
+                    if is_completed {
+                        continue;
+                    }
+
+                    // Track oldest pending
+                    if oldest_pending_ts.is_none() || event.timestamp < oldest_pending_ts.unwrap() {
+                        oldest_pending_ts = Some(event.timestamp);
+                    }
+
+                    jobs.push(event);
+                }
+
+                // Checkpoint = oldest pending (so we retry from there)
+                if let Some(ts) = oldest_pending_ts {
+                    let new_ckpt = QueueCheckpoint { timestamp: ts, uuid: String::new() };
+                    tx.put(checkpoint_key.as_bytes(), serde_json::to_vec(&new_ckpt).unwrap())
+                        .await
+                        .map_err(|e| TitoError::UpdateFailed(format!("Checkpoint update: {}", e)))?;
                 }
 
                 Ok::<_, TitoError>(jobs)
@@ -130,7 +114,7 @@ impl<E: TitoEngine> TitoQueue<E> {
     }
 
     pub async fn success_job(&self, consumer: String, job_id: String) -> Result<(), TitoError> {
-        use crate::types::{QueueCompleted, QueueCheckpoint};
+        use crate::types::QueueCompleted;
         use chrono::Utc;
 
         self.engine
@@ -140,61 +124,26 @@ impl<E: TitoEngine> TitoQueue<E> {
                 async move {
                 let parts: Vec<&str> = job_id.split(':').collect();
                 if parts.len() < 5 {
-                    return Err(TitoError::InvalidInput("Invalid event key format".to_string()));
+                    return Err(TitoError::InvalidInput("Invalid key".to_string()));
                 }
                 let event_type = parts[1];
                 let partition_str = parts[2];
                 let timestamp_str = parts[3];
                 let uuid_str = parts[4];
-                let timestamp: i64 = timestamp_str.parse()
-                    .map_err(|_| TitoError::InvalidInput("Invalid timestamp".to_string()))?;
 
-                let progress_key = format!(
-                    "queue:{}:{}:progress:{}:{}:{}",
-                    consumer, event_type, partition_str, timestamp_str, uuid_str
-                );
-                tx.delete(progress_key.as_bytes())
-                    .await
-                    .map_err(|e| TitoError::DeleteFailed(format!("Delete progress failed: {}", e)))?;
-
+                // Create completed key
                 let completed_key = format!(
                     "queue:{}:{}:completed:{}:{}:{}",
                     consumer, event_type, partition_str, timestamp_str, uuid_str
                 );
-                let completed = QueueCompleted {
-                    updated_at: Utc::now().timestamp(),
-                };
+                let completed = QueueCompleted { updated_at: Utc::now().timestamp() };
                 tx.put(completed_key.as_bytes(), serde_json::to_vec(&completed).unwrap())
                     .await
-                    .map_err(|e| TitoError::UpdateFailed(format!("Put completed failed: {}", e)))?;
-
-                let checkpoint_key = format!("queue_checkpoint:{}:{}:{}", consumer, event_type, partition_str);
-                let current_checkpoint = tx.get(checkpoint_key.as_bytes()).await
-                    .map_err(|e| TitoError::QueryFailed(format!("Checkpoint read failed: {}", e)))?
-                    .and_then(|bytes| serde_json::from_slice::<QueueCheckpoint>(&bytes).ok());
-
-                let should_advance = match &current_checkpoint {
-                    Some(ckpt) => {
-                        (timestamp, uuid_str) > (ckpt.timestamp, ckpt.uuid.as_str())
-                    }
-                    None => true,
-                };
-
-                if should_advance {
-                    let new_checkpoint = QueueCheckpoint {
-                        timestamp,
-                        uuid: uuid_str.to_string(),
-                    };
-                    tx.put(checkpoint_key.as_bytes(), serde_json::to_vec(&new_checkpoint).unwrap())
-                        .await
-                        .map_err(|e| TitoError::UpdateFailed(format!("Checkpoint update failed: {}", e)))?;
-                }
+                    .map_err(|e| TitoError::UpdateFailed(format!("Put completed: {}", e)))?;
 
                 Ok::<_, TitoError>(())
             }})
-            .await?;
-
-        Ok(())
+            .await
     }
 
     pub async fn fail_job(&self, consumer: String, job_id: String) -> Result<(), TitoError> {
@@ -208,56 +157,45 @@ impl<E: TitoEngine> TitoQueue<E> {
                 async move {
                 let parts: Vec<&str> = job_id.split(':').collect();
                 if parts.len() < 5 {
-                    return Err(TitoError::InvalidInput("Invalid event key format".to_string()));
+                    return Err(TitoError::InvalidInput("Invalid key".to_string()));
                 }
                 let event_type = parts[1];
                 let partition_str = parts[2];
                 let timestamp_str = parts[3];
                 let uuid_str = parts[4];
 
-                let progress_key = format!(
-                    "queue:{}:{}:progress:{}:{}:{}",
-                    consumer, event_type, partition_str, timestamp_str, uuid_str
-                );
-
-                tx.delete(progress_key.as_bytes())
-                    .await
-                    .map_err(|e| TitoError::DeleteFailed(format!("Delete progress failed: {}", e)))?;
-
-                let event_bytes = tx.get(job_id.as_bytes())
-                    .await
-                    .map_err(|e| TitoError::QueryFailed(format!("Get event failed: {}", e)))?;
+                // Get event
+                let event_bytes = tx.get(job_id.as_bytes()).await
+                    .map_err(|e| TitoError::QueryFailed(format!("Get event: {}", e)))?;
 
                 if let Some(bytes) = event_bytes {
                     let mut event: TitoEvent = serde_json::from_slice(&bytes)
-                        .map_err(|_| TitoError::DeserializationFailed(String::from("Failed to deserialize event")))?;
+                        .map_err(|_| TitoError::DeserializationFailed("Event".to_string()))?;
 
                     const MAX_RETRIES: u32 = 5;
 
                     if event.retries < MAX_RETRIES {
+                        // Reschedule with backoff
                         event.retries += 1;
-                        let backoff_seconds = 2_i64.pow(event.retries);
-                        let new_timestamp = Utc::now().timestamp() + backoff_seconds;
-                        event.timestamp = new_timestamp;
+                        let backoff = 2_i64.pow(event.retries);
+                        let new_ts = Utc::now().timestamp() + backoff;
+                        event.timestamp = new_ts;
                         event.updated_at = Utc::now().timestamp();
 
                         let new_key = format!(
                             "event:{}:{}:{}:{}",
-                            event_type, partition_str, new_timestamp, uuid_str
+                            event_type, partition_str, new_ts, uuid_str
                         );
                         event.key = new_key.clone();
 
-                        tx.delete(job_id.as_bytes())
-                            .await
-                            .map_err(|e| TitoError::DeleteFailed(format!("Delete old event failed: {}", e)))?;
-
-                        tx.put(new_key.as_bytes(), serde_json::to_vec(&event).unwrap())
-                            .await
-                            .map_err(|e| TitoError::UpdateFailed(format!("Put new event failed: {}", e)))?;
+                        tx.delete(job_id.as_bytes()).await
+                            .map_err(|e| TitoError::DeleteFailed(format!("Delete old: {}", e)))?;
+                        tx.put(new_key.as_bytes(), serde_json::to_vec(&event).unwrap()).await
+                            .map_err(|e| TitoError::UpdateFailed(format!("Put new: {}", e)))?;
                     } else {
-                        tx.delete(job_id.as_bytes())
-                            .await
-                            .map_err(|e| TitoError::DeleteFailed(format!("Delete event failed: {}", e)))?;
+                        // Max retries - move to failed
+                        tx.delete(job_id.as_bytes()).await
+                            .map_err(|e| TitoError::DeleteFailed(format!("Delete: {}", e)))?;
 
                         let failed_key = format!(
                             "queue:{}:{}:failed:{}:{}:{}",
@@ -266,20 +204,16 @@ impl<E: TitoEngine> TitoQueue<E> {
                         let failed = QueueFailed {
                             retries: event.retries,
                             updated_at: Utc::now().timestamp(),
-                            error: Some("Max retries exceeded".to_string()),
+                            error: Some("Max retries".to_string()),
                         };
-
-                        tx.put(failed_key.as_bytes(), serde_json::to_vec(&failed).unwrap())
-                            .await
-                            .map_err(|e| TitoError::UpdateFailed(format!("Put failed entry: {}", e)))?;
+                        tx.put(failed_key.as_bytes(), serde_json::to_vec(&failed).unwrap()).await
+                            .map_err(|e| TitoError::UpdateFailed(format!("Put failed: {}", e)))?;
                     }
                 }
 
                 Ok::<_, TitoError>(())
             }})
-            .await?;
-
-        Ok(())
+            .await
     }
 
     pub async fn clear(&self) -> Result<(), TitoError> {
@@ -287,6 +221,7 @@ impl<E: TitoEngine> TitoQueue<E> {
     }
 }
 
+/// Worker - one per partition, no competition
 pub async fn run_worker<E: TitoEngine + 'static, H>(
     queue: Arc<TitoQueue<E>>,
     config: crate::types::WorkerConfig,
@@ -301,9 +236,8 @@ where
         + 'static,
 {
     tokio::spawn(async move {
-        use futures::future::join_all;
-
         let mut handles = Vec::new();
+
         for partition in config.partition_range.clone() {
             let q = queue.clone();
             let h = handler.clone();
@@ -314,44 +248,20 @@ where
             handles.push(tokio::spawn(async move {
                 loop {
                     tokio::select! {
-                        _ = rx.recv() => {
-                            break;
-                        }
+                        _ = rx.recv() => break,
                         _ = async {
-                            match q.pull_partition(
-                                consumer.clone(),
-                                event_type.clone(),
-                                partition,
-                                50,
-                            ).await {
+                            match q.pull_partition(consumer.clone(), event_type.clone(), partition, 50).await {
                                 Ok(jobs) if jobs.is_empty() => {
                                     sleep(Duration::from_millis(1000)).await;
                                 }
                                 Ok(jobs) => {
-                                    use std::collections::HashMap;
-
-                                    let mut by_entity: HashMap<String, Vec<TitoEvent>> = HashMap::new();
-                                    for job in jobs {
-                                        by_entity.entry(job.entity.clone()).or_default().push(job);
-                                    }
-
-                                    let futures: Vec<_> = by_entity.into_iter().map(|(_entity, events)| {
-                                        let h = h.clone();
-                                        let q = q.clone();
-                                        let consumer = consumer.clone();
-                                        async move {
-                                            for event in events {
-                                                let key = event.key.clone();
-                                                let result = h(event).await;
-                                                let _ = match result {
-                                                    Ok(_) => q.success_job(consumer.clone(), key).await,
-                                                    Err(_) => q.fail_job(consumer.clone(), key).await,
-                                                };
-                                            }
+                                    for event in jobs {
+                                        let key = event.key.clone();
+                                        match h(event).await {
+                                            Ok(_) => { let _ = q.success_job(consumer.clone(), key).await; }
+                                            Err(_) => { let _ = q.fail_job(consumer.clone(), key).await; }
                                         }
-                                    }).collect();
-
-                                    join_all(futures).await;
+                                    }
                                 }
                                 Err(_) => {
                                     sleep(Duration::from_millis(500)).await;
@@ -363,8 +273,8 @@ where
             }));
         }
 
-        for handle in handles {
-            let _ = handle.await;
+        for h in handles {
+            let _ = h.await;
         }
     })
 }
