@@ -257,10 +257,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
         while let Some((current_value, depth)) = to_process.pop() {
             if depth == parts.len() {
-                // Check if the final value is a HashMap (JSON object)
-                // If so, expand it into key-value pairs
                 if let Some(obj) = current_value.as_object() {
-                    // This is a HashMap - expand each entry
                     for (key, value) in obj.iter() {
                         results.push(FieldValue::HashMapEntry {
                             key: key.clone(),
@@ -277,7 +274,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                 Some(nested) => {
                     if nested.is_array() {
                         if let Some(array) = nested.as_array() {
-                            // If array is empty, return None
                             if array.is_empty() {
                                 return None;
                             }
@@ -289,7 +285,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                         to_process.push((nested.clone(), depth + 1));
                     }
                 }
-                None => return None, // Return None if any part of the path is missing
+                None => return None,
             }
         }
 
@@ -354,7 +350,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         )
         .await?;
 
-        // Sync references graph (outbound from this entity)
         let source_typed = format!("{}:{}", self.model.table(), payload.id());
         let targets = payload.references();
         self.sync_references(&source_typed, targets, tx).await?;
@@ -725,7 +720,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         let id = format!("{}:{}", self.get_table(), raw_id);
         let reverse_index_key = format!("reverse-index:{}", id);
 
-        // Clear references graph for this source (typed)
         let source_typed = format!("{}:{}", self.model.table(), raw_id);
         self.clear_references(&source_typed, tx).await?;
 
@@ -786,7 +780,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         .await
     }
 
-    // References graph API
     pub async fn has_inbound_references(
         engine: &E,
         target_id: &str,
@@ -861,13 +854,11 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         for (k, _) in items {
             if let Ok(s) = String::from_utf8(k.clone()) {
                 if let Some(dst) = s.split("target:").nth(1) {
-                    // delete forward
                     tx.delete(k.clone())
                         .await
                         .map_err(|e| TitoError::DeleteFailed(e.to_string()))?;
-                    // delete reverse
                     let rev = format!("reference:i:target:{}:source:{}", dst, source_id);
-                    let _ = tx.delete(rev).await; // ignore missing
+                    let _ = tx.delete(rev).await;
                 }
             }
         }
@@ -880,9 +871,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         targets: Vec<String>,
         tx: &E::Transaction,
     ) -> Result<(), TitoError> {
-        // Clear old
         self.clear_references(source_id, tx).await?;
-        // Insert new
         use std::collections::HashSet;
         let unique: HashSet<String> = targets.into_iter().filter(|t| !t.is_empty()).collect();
         for dst in unique.into_iter() {
@@ -946,7 +935,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         let end_key = next_string_lexicographically(table_prefix.clone());
         let mut stats = MigrateStats::default();
 
-        // Load checkpoint or start from beginning
         let mut cursor = self
             .load_migrate_checkpoint(checkpoint)
             .await?
@@ -964,7 +952,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                     let checkpoint_key = checkpoint_key.clone();
 
                     async move {
-                        // Scan for next record
                         let kvs = tx
                             .scan(cursor.as_bytes()..end_key.as_bytes(), 1)
                             .await
@@ -980,7 +967,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                         let record: T = serde_json::from_slice(&kvs[0].1)
                             .map_err(|e| TitoError::DeserializationFailed(e.to_string()))?;
 
-                        // Call user's async closure
                         let modified = match f(record).await? {
                             Some(updated) => {
                                 self.update_with_options(
@@ -994,7 +980,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                             None => false,
                         };
 
-                        // Save checkpoint
                         let next_cursor = next_string_lexicographically(key.clone());
                         tx.put(checkpoint_key.as_bytes(), next_cursor.as_bytes())
                             .await

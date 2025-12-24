@@ -29,7 +29,6 @@ impl<E: TitoEngine> TitoQueue<E> {
                 async move {
                 let now = Utc::now().timestamp();
 
-                // Get checkpoint
                 let checkpoint_key = format!(
                     "queue_checkpoint:{}:{}:{:0width$}",
                     consumer, event_type, partition,
@@ -41,7 +40,6 @@ impl<E: TitoEngine> TitoQueue<E> {
 
                 let start_ts = checkpoint.map(|c| c.timestamp).unwrap_or(0);
 
-                // Scan from checkpoint
                 let event_start = format!(
                     "event:{}:{:0pwidth$}:{}",
                     event_type, partition, start_ts,
@@ -58,49 +56,36 @@ impl<E: TitoEngine> TitoQueue<E> {
                     limit
                 ).await.map_err(|e| TitoError::QueryFailed(format!("Scan failed: {}", e)))?;
 
+                let mut parsed: Vec<(TitoEvent, Vec<u8>)> = Vec::new();
+                for (_key, value) in events {
+                    if let Ok(event) = serde_json::from_slice::<TitoEvent>(&value) {
+                        if event.timestamp > now { continue; }
+                        let parts: Vec<&str> = event.key.split(':').collect();
+                        if parts.len() < 5 { continue; }
+                        let completed_key = format!(
+                            "queue:{}:{}:completed:{}:{}:{}",
+                            consumer, event_type, parts[2], parts[3], parts[4]
+                        ).into_bytes();
+                        parsed.push((event, completed_key));
+                    }
+                }
+
+                let completed_keys: Vec<Vec<u8>> = parsed.iter().map(|(_, k)| k.clone()).collect();
+                let completed: std::collections::HashSet<Vec<u8>> = tx
+                    .batch_get(completed_keys).await
+                    .map_err(|e| TitoError::QueryFailed(format!("Batch check: {}", e)))?
+                    .into_iter().map(|(k, _)| k).collect();
+
                 let mut jobs = Vec::new();
                 let mut oldest_pending_ts: Option<i64> = None;
-
-                for (_key, value) in events {
-                    let event: TitoEvent = match serde_json::from_slice(&value) {
-                        Ok(e) => e,
-                        Err(_) => continue,
-                    };
-
-                    // Skip future events
-                    if event.timestamp > now {
-                        continue;
-                    }
-
-                    // Parse key parts
-                    let parts: Vec<&str> = event.key.split(':').collect();
-                    if parts.len() < 5 { continue; }
-                    let partition_str = parts[2];
-                    let timestamp_str = parts[3];
-                    let uuid_str = parts[4];
-
-                    // Check completed
-                    let completed_key = format!(
-                        "queue:{}:{}:completed:{}:{}:{}",
-                        consumer, event_type, partition_str, timestamp_str, uuid_str
-                    );
-                    let is_completed = tx.get(completed_key.as_bytes()).await
-                        .map_err(|e| TitoError::QueryFailed(format!("Completed check: {}", e)))?
-                        .is_some();
-
-                    if is_completed {
-                        continue;
-                    }
-
-                    // Track oldest pending
+                for (event, completed_key) in parsed {
+                    if completed.contains(&completed_key) { continue; }
                     if oldest_pending_ts.is_none() || event.timestamp < oldest_pending_ts.unwrap() {
                         oldest_pending_ts = Some(event.timestamp);
                     }
-
                     jobs.push(event);
                 }
 
-                // Checkpoint = oldest pending (so we retry from there)
                 if let Some(ts) = oldest_pending_ts {
                     let new_ckpt = QueueCheckpoint { timestamp: ts, uuid: String::new() };
                     tx.put(checkpoint_key.as_bytes(), serde_json::to_vec(&new_ckpt).unwrap())
@@ -131,7 +116,6 @@ impl<E: TitoEngine> TitoQueue<E> {
                 let timestamp_str = parts[3];
                 let uuid_str = parts[4];
 
-                // Create completed key
                 let completed_key = format!(
                     "queue:{}:{}:completed:{}:{}:{}",
                     consumer, event_type, partition_str, timestamp_str, uuid_str
@@ -164,7 +148,6 @@ impl<E: TitoEngine> TitoQueue<E> {
                 let timestamp_str = parts[3];
                 let uuid_str = parts[4];
 
-                // Get event
                 let event_bytes = tx.get(job_id.as_bytes()).await
                     .map_err(|e| TitoError::QueryFailed(format!("Get event: {}", e)))?;
 
@@ -175,7 +158,6 @@ impl<E: TitoEngine> TitoQueue<E> {
                     const MAX_RETRIES: u32 = 5;
 
                     if event.retries < MAX_RETRIES {
-                        // Reschedule with backoff
                         event.retries += 1;
                         let backoff = 2_i64.pow(event.retries);
                         let new_ts = Utc::now().timestamp() + backoff;
@@ -193,7 +175,6 @@ impl<E: TitoEngine> TitoQueue<E> {
                         tx.put(new_key.as_bytes(), serde_json::to_vec(&event).unwrap()).await
                             .map_err(|e| TitoError::UpdateFailed(format!("Put new: {}", e)))?;
                     } else {
-                        // Max retries - move to failed
                         tx.delete(job_id.as_bytes()).await
                             .map_err(|e| TitoError::DeleteFailed(format!("Delete: {}", e)))?;
 
@@ -221,7 +202,6 @@ impl<E: TitoEngine> TitoQueue<E> {
     }
 }
 
-/// Worker - one per partition, no competition
 pub async fn run_worker<E: TitoEngine + 'static, H>(
     queue: Arc<TitoQueue<E>>,
     config: crate::types::WorkerConfig,
