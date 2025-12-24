@@ -159,25 +159,19 @@ impl TitoEngine for TiKVBackend {
             .with_cf(ColumnFamily::Default)
             .delete_range(range.clone())
             .await
-            .map_err(|e| {
-                TitoError::DeleteFailed(format!("Delete range (Default CF) failed: {}", e))
-            })?;
+            .map_err(|e| TitoError::DeleteFailed(format!("Delete range (Default CF) failed: {}", e)))?;
 
         self.raw_client
             .with_cf(ColumnFamily::Write)
             .delete_range(range.clone())
             .await
-            .map_err(|e| {
-                TitoError::DeleteFailed(format!("Delete range (Write CF) failed: {}", e))
-            })?;
+            .map_err(|e| TitoError::DeleteFailed(format!("Delete range (Write CF) failed: {}", e)))?;
 
         self.raw_client
             .with_cf(ColumnFamily::Lock)
             .delete_range(range)
             .await
-            .map_err(|e| {
-                TitoError::DeleteFailed(format!("Delete range (Lock CF) failed: {}", e))
-            })?;
+            .map_err(|e| TitoError::DeleteFailed(format!("Delete range (Lock CF) failed: {}", e)))?;
 
         Ok(())
     }

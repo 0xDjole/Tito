@@ -324,6 +324,9 @@ where
                                 partition,
                                 50,
                             ).await {
+                                Ok(jobs) if jobs.is_empty() => {
+                                    sleep(Duration::from_millis(100)).await;
+                                }
                                 Ok(jobs) => {
                                     use std::collections::HashMap;
 
@@ -354,7 +357,6 @@ where
                                     sleep(Duration::from_millis(500)).await;
                                 }
                             }
-                            sleep(Duration::from_millis(125)).await;
                         } => {}
                     }
                 }

@@ -6,8 +6,8 @@ use crate::{
     types::{
         DBUuid, FieldValue, MigrateStats, ReverseIndex, TitoCursor, TitoEngine,
         TitoEvent, TitoFindPayload, TitoGenerateEventPayload, TitoKvPair,
-        TitoModelTrait, TitoOperation, TitoOptions, TitoPaginated, TitoRelationshipConfig,
-        TitoScanPayload, TitoTransaction,
+        TitoModelOptions, TitoModelTrait, TitoOperation, TitoOptions, TitoPaginated,
+        TitoRelationshipConfig, TitoScanPayload, TitoTransaction,
     },
     utils::{next_string_lexicographically, previous_string_lexicographically},
 };
@@ -25,13 +25,15 @@ use serde_json::Value;
 pub struct TitoModel<E: TitoEngine, T> {
     pub model: T,
     pub engine: E,
+    pub partition_count: u32,
 }
 
 impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
-    pub(crate) fn new(engine: E) -> Self {
+    pub fn new(engine: E, options: TitoModelOptions) -> Self {
         Self {
             model: T::default(),
             engine,
+            partition_count: options.partition_count,
         }
     }
 
@@ -391,7 +393,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
             let mut hasher = DefaultHasher::new();
             payload.key.hash(&mut hasher);
-            let partition = (hasher.finish() % event_config.partitions as u64) as u32;
+            let partition = (hasher.finish() % self.partition_count as u64) as u32;
 
             let timestamp = event_config.timestamp;
 

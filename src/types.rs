@@ -29,6 +29,25 @@ pub type TitoValue = Vec<u8>;
 pub type TitoKvPair = (TitoKey, TitoValue);
 pub type TitoRange = Range<TitoKey>;
 
+#[derive(Debug, Clone)]
+pub struct TitoModelOptions {
+    pub partition_count: u32,
+}
+
+impl Default for TitoModelOptions {
+    fn default() -> Self {
+        Self {
+            partition_count: 1,
+        }
+    }
+}
+
+impl TitoModelOptions {
+    pub fn with_partitions(partition_count: u32) -> Self {
+        Self { partition_count }
+    }
+}
+
 #[async_trait]
 pub trait TitoEngine: Send + Sync + Clone {
     type Transaction: TitoTransaction;
@@ -47,8 +66,8 @@ pub trait TitoEngine: Send + Sync + Clone {
 
     async fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<(), TitoError>;
 
-    fn model<T: TitoModelConstraints>(self) -> TitoModel<Self, T> {
-        TitoModel::new(self)
+    fn model<T: TitoModelConstraints>(self, options: TitoModelOptions) -> TitoModel<Self, T> {
+        TitoModel::new(self, options)
     }
 }
 
@@ -328,7 +347,6 @@ pub type DBUuid = Uuid;
 pub struct TitoEventConfig {
     pub name: String,
     pub timestamp: i64,
-    pub partitions: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
