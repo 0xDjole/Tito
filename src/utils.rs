@@ -3,9 +3,9 @@ pub fn next_string_lexicographically(payload: String) -> String {
 
     if let Some(last_byte) = prefix_end.last_mut() {
         if *last_byte < 0xFF {
-            *last_byte += 1; // Increment the last byte if it's less than 0xFF
+            *last_byte += 1;
         } else {
-            prefix_end.push(0x00); // Otherwise, append 0x00
+            prefix_end.push(0x00);
         }
     }
 
@@ -17,9 +17,9 @@ pub fn previous_string_lexicographically(payload: String) -> String {
 
     if let Some(last_byte) = prefix_end.last_mut() {
         if *last_byte > 0x00 {
-            *last_byte -= 1; // Decrement the last byte if it's greater than 0x00
+            *last_byte -= 1;
         } else {
-            prefix_end.pop(); // Otherwise, remove the last byte if it is 0x00
+            prefix_end.pop();
         }
     }
 

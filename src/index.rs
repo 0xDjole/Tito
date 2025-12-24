@@ -49,7 +49,6 @@ impl<
 
                 for field_value in field_values {
                     let field_str = match field_value {
-                        // Handle HashMap entries with key-value pairs
                         FieldValue::HashMapEntry { key, value } => match field.r#type {
                             TitoIndexBlockType::String => match value.as_str() {
                                 Some("") => Some(format!("{}:{}.__null__", field.name, key)),
@@ -63,7 +62,6 @@ impl<
                                 None => Some(format!("{}:{}:__null__", field.name, key)),
                             },
                         },
-                        // Handle simple values
                         FieldValue::Simple(value) => match field.r#type {
                             TitoIndexBlockType::String => match value.as_str() {
                                 Some("") => Some(format!("{}:__null__", field.name)),

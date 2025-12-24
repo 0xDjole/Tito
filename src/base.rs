@@ -1009,13 +1009,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                         stats.skipped += 1;
                     }
                     cursor = next_cursor;
-
-                    if stats.processed % 100 == 0 {
-                        println!(
-                            "[migrate] processed: {}, modified: {}, skipped: {}",
-                            stats.processed, stats.modified, stats.skipped
-                        );
-                    }
                 }
             }
         }

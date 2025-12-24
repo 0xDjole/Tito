@@ -66,13 +66,11 @@ impl TitoEngine for TiKVBackend {
                 Ok(value) => {
                     match tx.commit().await {
                         Ok(_) => {
-                            // Remove from tracking AFTER successful commit
                             let mut active_transactions = self.active_transactions.lock().await;
                             active_transactions.remove(&tx_id);
                             return Ok(value);
                         }
                         Err(e) => {
-                            // Remove from tracking on commit failure before retry
                             {
                                 let mut active_transactions = self.active_transactions.lock().await;
                                 active_transactions.remove(&tx_id);
@@ -80,11 +78,10 @@ impl TitoEngine for TiKVBackend {
 
                             if Self::is_retryable_error(&e) && retries < MAX_RETRIES {
                                 retries += 1;
-                                // Exponential backoff with jitter to prevent thundering herd
                                 let jitter = rand::thread_rng().gen_range(0..base_delay_ms / 2);
                                 let delay = base_delay_ms + jitter;
                                 sleep(Duration::from_millis(delay)).await;
-                                base_delay_ms = (base_delay_ms * 2).min(2000); // Cap at 2 seconds
+                                base_delay_ms = (base_delay_ms * 2).min(2000);
                                 continue;
                             }
                             return Err(E::from(e));
@@ -93,13 +90,11 @@ impl TitoEngine for TiKVBackend {
                 }
                 Err(e) => {
                     let _ = tx.rollback().await;
-                    // Remove from tracking AFTER rollback
                     {
                         let mut active_transactions = self.active_transactions.lock().await;
                         active_transactions.remove(&tx_id);
                     }
 
-                    // Check if this is a retryable error (e.g., lock conflicts during reads)
                     let err_str = format!("{:?}", e);
                     let err_lower = err_str.to_lowercase();
                     let is_retryable = err_lower.contains("lock")
@@ -127,27 +122,8 @@ impl TitoEngine for TiKVBackend {
         let transactions: Vec<_> = active_transactions.drain().collect();
         drop(active_transactions);
 
-        // Wait for and rollback each transaction - we CANNOT skip them
-        // because skipping means they get dropped without commit/rollback
-        for (tx_id, tx) in transactions {
-            eprintln!(
-                "Waiting for transaction {} to become available for cleanup...",
-                tx_id
-            );
-
-            // Use .lock().await to WAIT for the transaction to become available
-            // This blocks until the transaction is no longer being used
-            match tx.inner.lock().await.rollback().await {
-                Ok(_) => {
-                    eprintln!(
-                        "Successfully rolled back transaction {} during cleanup",
-                        tx_id
-                    );
-                }
-                Err(e) => {
-                    eprintln!("Warning: Failed to rollback transaction {}: {:?}", tx_id, e);
-                }
-            }
+        for (_tx_id, tx) in transactions {
+            let _ = tx.inner.lock().await.rollback().await;
         }
         Ok(())
     }
@@ -316,11 +292,9 @@ impl TiKVBackend {
     }
 }
 
-/// TiKV connection helper
 pub struct TiKV;
 
 impl TiKV {
-    /// Connect to TiKV with PD endpoints
     pub async fn connect<S: AsRef<str>>(endpoints: Vec<S>) -> Result<TiKVBackend, TitoError> {
         let endpoint_strings: Vec<String> =
             endpoints.iter().map(|s| s.as_ref().to_string()).collect();

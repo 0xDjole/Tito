@@ -52,43 +52,36 @@ where
         }
     }
 
-    // Modified to use &mut self
     pub fn value(&mut self, value: impl Into<String>) -> &mut Self {
         self.values.push(value.into());
         self
     }
 
-    // Modified to use &mut self
     pub fn exact_match(&mut self, value: bool) -> &mut Self {
         self.exact_match = value;
         self
     }
 
-    // Modified to use &mut self
     pub fn relationship(&mut self, rel: impl Into<String>) -> &mut Self {
         self.rels.push(rel.into());
         self
     }
 
-    // Modified to use &mut self
     pub fn limit(&mut self, limit: Option<u32>) -> &mut Self {
         self.limit = limit;
         self
     }
 
-    // Modified to use &mut self
     pub fn cursor(&mut self, cursor: Option<impl Into<String>>) -> &mut Self {
         self.cursor = cursor.map(|cursor| cursor.into());
         self
     }
 
-    // Modified to use &mut self
     pub fn end(&mut self, end: Option<impl Into<String>>) -> &mut Self {
         self.end = end.map(|end| end.into());
         self
     }
 
-    // Terminal method with optional transaction
     pub async fn execute(
         &mut self,
         tx: Option<&E::Transaction>,
@@ -106,7 +99,6 @@ where
         self.model.find_by_index(payload, tx).await
     }
 
-    // Terminal method with optional transaction
     pub async fn execute_reverse(
         &mut self,
         tx: Option<&E::Transaction>,

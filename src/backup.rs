@@ -97,7 +97,6 @@ impl TitoBackupService {
                     value,
                 };
 
-                // Add comma before record if not first
                 if !*first_record {
                     file.write_all(b",\n")
                         .await
@@ -105,7 +104,6 @@ impl TitoBackupService {
                 }
                 *first_record = false;
 
-                // Write the record
                 let record_json = serde_json::to_string_pretty(&record)
                     .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
 
@@ -127,7 +125,7 @@ impl TitoBackupService {
 
     pub async fn delete_all_data<T: TitoTransaction>(&self, tx: &T) -> Result<usize, TitoError> {
         let start_key = String::new();
-        let end_key = String::from_utf8(vec![255; 10]).unwrap(); // Max key
+        let end_key = String::from_utf8(vec![255; 10]).unwrap();
 
         let mut deleted_count = 0;
 
@@ -148,7 +146,6 @@ impl TitoBackupService {
                 break;
             }
 
-            // Delete in batches
             for key in &keys_to_delete {
                 tx.delete(key.as_bytes())
                     .await
@@ -201,7 +198,6 @@ impl TitoBackupService {
         Ok(records)
     }
 
-    // Delete specific prefix
     pub async fn delete_prefix<T: TitoTransaction>(
         &self,
         prefix: &str,
@@ -231,7 +227,6 @@ impl TitoBackupService {
                 break;
             }
 
-            // Delete batch
             for key in &keys_to_delete {
                 tx.delete(key.as_bytes())
                     .await

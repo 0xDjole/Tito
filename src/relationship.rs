@@ -19,7 +19,6 @@ impl<
             + TitoModelTrait,
     > TitoModel<E, T>
 {
-    /// Public entry point for stitching a relationship into a JSON Value.
     pub fn stitch_relationship(
         &self,
         item: &mut Value,
@@ -28,11 +27,9 @@ impl<
     ) {
         let source_parts: Vec<&str> = config.source_field_name.split('.').collect();
         let dest_parts: Vec<&str> = config.destination_field_name.split('.').collect();
-        // Calls the robust iterative helper function.
         Self::_stitch_iterative_helper(item, &source_parts, &dest_parts, rel_map, config);
     }
 
-    /// Iteratively traverses a JSON structure to embed related data, avoiding recursion.
     fn _stitch_iterative_helper(
         root_node: &mut Value,
         source_path: &[&str],
@@ -40,25 +37,21 @@ impl<
         rel_map: &HashMap<String, Value>,
         config: &TitoRelationshipConfig,
     ) {
-        // Use a stack to manage traversal, mimicking a recursive call stack safely.
         let mut stack: Vec<(&mut Value, &[&str], &[&str])> = Vec::new();
         stack.push((root_node, source_path, dest_path));
 
         while let Some((current_node, source_path_remaining, dest_path_remaining)) = stack.pop() {
-            // Base case: We've reached the target object for stitching.
             if source_path_remaining.len() == 1 && dest_path_remaining.len() == 1 {
                 let source_key = source_path_remaining[0];
                 let dest_key = dest_path_remaining[0];
 
                 if let Some(obj_to_modify) = current_node.as_object_mut() {
                     if let Some(id_val_at_source_key) = obj_to_modify.get(source_key) {
-                        // Handle a single ID string.
                         if let Some(id_str) = id_val_at_source_key.as_str() {
                             let rel_lookup_key = format!("table:{}:{}", config.model, id_str);
                             if let Some(related_data) = rel_map.get(&rel_lookup_key) {
                                 obj_to_modify.insert(dest_key.to_string(), related_data.clone());
                             }
-                        // Handle an array of ID strings.
                         } else if let Some(ids_array) = id_val_at_source_key.as_array() {
                             let mut stitched_related_items_array = Vec::new();
                             for id_elem_in_array in ids_array {
@@ -77,10 +70,9 @@ impl<
                         }
                     }
                 }
-                continue; // Finished with this branch, process next item on stack.
+                continue;
             }
 
-            // Traversal step: Navigate deeper if paths have a common prefix.
             if !source_path_remaining.is_empty()
                 && !dest_path_remaining.is_empty()
                 && source_path_remaining[0] == dest_path_remaining[0]
@@ -96,7 +88,6 @@ impl<
                             ));
                         }
                         Value::Array(arr) => {
-                            // If it's an array, push each element onto the stack to be processed.
                             for element_in_array in arr.iter_mut() {
                                 stack.push((
                                     element_in_array,
@@ -105,31 +96,28 @@ impl<
                                 ));
                             }
                         }
-                        _ => {} // Not an object or array, cannot traverse further down this path.
+                        _ => {}
                     }
                 }
             }
         }
     }
 
-    /// Gathers all relationship keys that need to be fetched from a list of items.
     pub fn get_relationship_data(
         &self,
         items: &Vec<(String, Value)>,
         rels_config: &[TitoRelationshipConfig],
-        rels: &Vec<String>, // List of destination_field_names to populate
+        rels: &Vec<String>,
     ) -> Vec<(TitoRelationshipConfig, String)> {
         let mut relationship_keys_to_fetch = Vec::new();
 
         for (_, item_value) in items {
             for config in rels_config {
-                // Check if this relationship is requested for population.
                 if rels.contains(&config.destination_field_name) {
                     if let Some(found_values_at_source_path) =
                         self.get_nested_values(item_value, &config.source_field_name)
                     {
                         for field_value in found_values_at_source_path {
-                            // Extract the actual value from FieldValue enum
                             let actual_value = match field_value {
                                 FieldValue::Simple(v) => v,
                                 FieldValue::HashMapEntry { value, .. } => value,
@@ -162,7 +150,6 @@ impl<
         relationship_keys_to_fetch
     }
 
-    /// Fetches and stitches all requested relationships for a vector of items.
     pub async fn fetch_and_stitch_relationships(
         &self,
         items: Vec<(String, Value)>,
@@ -178,7 +165,6 @@ impl<
 
         let rel_keys: Vec<String> = relationship_data.into_iter().map(|item| item.1).collect();
 
-        // Fetch all related items in a batch.
         let rel_items = self.batch_get(rel_keys, tx).await?;
 
         let mut rel_map: HashMap<String, Value> = HashMap::new();
@@ -186,7 +172,6 @@ impl<
             rel_map.insert(kv.0, kv.1);
         }
 
-        // Map over the original items and stitch the fetched data into each one.
         let final_items = items
             .into_iter()
             .map(|mut item| {
@@ -202,7 +187,6 @@ impl<
         Ok(final_items)
     }
 
-    /// A helper function to extract a relationship string.
     pub fn extract_relationship(&self, input: &str) -> Option<String> {
         if let (Some(start), Some(end)) = (input.find('-').map(|idx| idx + 1), input.rfind('-')) {
             if start < end {
