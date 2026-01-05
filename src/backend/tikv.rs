@@ -289,6 +289,8 @@ impl TiKVBackend {
             || err_lower.contains("region")
             || err_lower.contains("not leader")
             || err_lower.contains("stale")
+            || err_lower.contains("resolve lock")
+            || err_lower.contains("lock")
     }
 }
 
