@@ -4,6 +4,7 @@ use tokio::sync::broadcast;
 use tokio::time::sleep;
 
 use crate::types::{TitoEngine, TitoEvent, TitoTransaction};
+use crate::utils::next_string_lexicographically;
 use crate::TitoError;
 
 #[derive(Clone)]
@@ -50,14 +51,15 @@ impl<E: TitoEngine> TitoQueue<E> {
 
                     // If we have a UUID, start AFTER that specific event to skip already-processed ones
                     let event_start = if !start_uuid.is_empty() {
-                        format!(
-                            "event:{}:{:0pwidth$}:{}:{}~",
+                        let last_key = format!(
+                            "event:{}:{:0pwidth$}:{}:{}",
                             event_type,
                             partition,
                             start_ts,
                             start_uuid,
                             pwidth = PARTITION_DIGITS,
-                        )
+                        );
+                        next_string_lexicographically(last_key)
                     } else {
                         format!(
                             "event:{}:{:0pwidth$}:{}",
