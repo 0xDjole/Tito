@@ -377,9 +377,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
         for event_config in model.events().iter() {
             let created_at = Utc::now().timestamp();
-
-            let message = event_config.name.to_string();
-
             let uuid_str = DBUuid::new_v4().to_string();
 
             use crate::types::PARTITION_DIGITS;
@@ -408,13 +405,8 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                 key: key.clone(),
                 entity: payload.key.clone(),
                 action: payload.operation.to_string(),
-                status: String::from(""),
-                message,
-                retries: 0,
-                max_retries: 5,
                 timestamp,
                 created_at,
-                updated_at: created_at,
                 metadata: metadata.clone(),
             };
 

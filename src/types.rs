@@ -198,13 +198,8 @@ pub struct TitoEvent {
     pub key: String,
     pub entity: String,
     pub r#action: String,
-    pub message: String,
-    pub status: String,
-    pub retries: u32,
-    pub max_retries: u32,
     pub timestamp: i64,
     pub created_at: i64,
-    pub updated_at: i64,
     pub metadata: serde_json::Value,
 }
 
