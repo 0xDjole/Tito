@@ -12,7 +12,6 @@ pub struct QueueEvent<T> {
     pub payload: T,
     pub created_at: i64,
     pub scheduled_at: i64,
-    pub actor: Option<String>,
     pub retry_count: u32,
     pub max_retries: u32,
     pub error: Option<String>,
@@ -28,16 +27,10 @@ impl<T: EventType> QueueEvent<T> {
             payload,
             created_at: now,
             scheduled_at: now,
-            actor: None,
             retry_count: 0,
             max_retries: 0,
             error: None,
         }
-    }
-
-    pub fn with_actor(mut self, actor: impl Into<String>) -> Self {
-        self.actor = Some(actor.into());
-        self
     }
 
     pub fn scheduled_for(mut self, timestamp: i64) -> Self {
