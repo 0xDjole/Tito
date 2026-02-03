@@ -4,9 +4,9 @@ use crate::{
     error::TitoError,
     query::IndexQueryBuilder,
     types::{
-        DBUuid, FieldValue, MigrateStats, ReverseIndex, TitoCursor, TitoEngine,
-        TitoEvent, TitoFindPayload, TitoGenerateEventPayload, TitoKvPair,
-        TitoModelOptions, TitoModelTrait, TitoOperation, TitoOptions, TitoPaginated,
+        FieldValue, MigrateStats, ReverseIndex, TitoCursor, TitoEngine,
+        TitoFindPayload, TitoKvPair,
+        TitoModelOptions, TitoPaginated,
         TitoRelationshipConfig, TitoScanPayload, TitoTransaction,
     },
     utils::{next_string_lexicographically, previous_string_lexicographically},
@@ -296,21 +296,8 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         }
     }
 
+    /// Build (create) a new record in the database
     pub async fn build(&self, payload: T, tx: &E::Transaction) -> Result<T, TitoError>
-    where
-        T: serde::de::DeserializeOwned,
-    {
-        let metadata = serde_json::to_value(&payload).unwrap_or_default();
-        let options = TitoOptions::with_metadata(TitoOperation::Insert, metadata);
-        self.build_with_options(payload, options, tx).await
-    }
-
-    pub async fn build_with_options(
-        &self,
-        payload: T,
-        options: TitoOptions,
-        tx: &E::Transaction,
-    ) -> Result<T, TitoError>
     where
         T: serde::de::DeserializeOwned,
     {
@@ -339,81 +326,11 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
         self.put(reverse_key.clone(), index_json_key, tx).await?;
 
-        self.generate_event(
-            TitoGenerateEventPayload {
-                key: id.clone(),
-                operation: options.operation,
-                event: options.event.clone(),
-            },
-            &payload,
-            tx,
-        )
-        .await?;
-
         let source_typed = format!("{}:{}", self.model.table(), payload.id());
         let targets = payload.references();
         self.sync_references(&source_typed, targets, tx).await?;
 
         Ok(payload)
-    }
-
-    async fn generate_event(
-        &self,
-        payload: TitoGenerateEventPayload,
-        model: &T,
-        tx: &E::Transaction,
-    ) -> Result<bool, TitoError> {
-        use crate::types::EventConfig;
-
-        if matches!(payload.event, EventConfig::None) {
-            return Ok(true);
-        }
-
-        let metadata = match payload.event {
-            EventConfig::None => unreachable!(),
-            EventConfig::Generate => serde_json::Value::Null,
-            EventConfig::GenerateWithMetadata(custom_meta) => custom_meta,
-        };
-
-        for event_config in model.events().iter() {
-            let created_at = Utc::now().timestamp();
-            let uuid_str = DBUuid::new_v4().to_string();
-
-            use crate::types::PARTITION_DIGITS;
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-
-            let mut hasher = DefaultHasher::new();
-            payload.key.hash(&mut hasher);
-            let partition = (hasher.finish() % self.partition_count as u64) as u32;
-
-            let timestamp = event_config.timestamp;
-
-            let event_type = &event_config.name;
-
-            let key = format!(
-                "event:{}:{:0pwidth$}:{}:{}",
-                event_type,
-                partition,
-                timestamp,
-                uuid_str,
-                pwidth = PARTITION_DIGITS,
-            );
-
-            let event = TitoEvent {
-                id: uuid_str,
-                key: key.clone(),
-                entity: payload.key.clone(),
-                action: payload.operation.to_string(),
-                timestamp,
-                created_at,
-                metadata: metadata.clone(),
-            };
-
-            self.put(key.clone(), &event, tx).await?;
-        }
-
-        Ok(true)
     }
 
     async fn find_by_id_with_tx(
@@ -651,42 +568,23 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         Ok((items, has_more))
     }
 
+    /// Update an existing record in the database
     pub async fn update(&self, payload: T, tx: &E::Transaction) -> Result<bool, TitoError>
-    where
-        T: serde::de::DeserializeOwned,
-    {
-        let metadata = serde_json::to_value(&payload).unwrap_or_default();
-        let options = TitoOptions::with_metadata(TitoOperation::Update, metadata);
-        self.update_with_options(payload, options, tx).await
-    }
-
-    pub fn get_last_id(&self, key: String) -> Option<String> {
-        let parts: Vec<&str> = key.split(':').collect();
-        parts.last().map(|last| last.to_string())
-    }
-
-    pub async fn update_with_options(
-        &self,
-        payload: T,
-        options: TitoOptions,
-        tx: &E::Transaction,
-    ) -> Result<bool, TitoError>
     where
         T: serde::de::DeserializeOwned,
     {
         let raw_id = payload.id();
 
-        let deleted = self
-            .delete_by_id_with_options(
-                &raw_id,
-                TitoOptions::skip_events(TitoOperation::Delete),
-                tx,
-            )
-            .await;
+        let _ = self.delete_by_id(&raw_id, tx).await;
 
-        self.build_with_options(payload, options, tx).await?;
+        self.build(payload, tx).await?;
 
         Ok(true)
+    }
+
+    pub fn get_last_id(&self, key: String) -> Option<String> {
+        let parts: Vec<&str> = key.split(':').collect();
+        parts.last().map(|last| last.to_string())
     }
 
     pub async fn batch_get(
@@ -703,73 +601,29 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         }
     }
 
-    pub async fn delete_by_id_with_options(
-        &self,
-        raw_id: &str,
-        options: TitoOptions,
-        tx: &E::Transaction,
-    ) -> Result<bool, TitoError> {
+    /// Delete a record by its ID
+    pub async fn delete_by_id(&self, raw_id: &str, tx: &E::Transaction) -> Result<bool, TitoError> {
         let id = format!("{}:{}", self.get_table(), raw_id);
         let reverse_index_key = format!("reverse-index:{}", id);
 
         let source_typed = format!("{}:{}", self.model.table(), raw_id);
         self.clear_references(&source_typed, tx).await?;
 
-        let (mut metadata, model) = match tx.get(&id).await {
-            Ok(Some(entity_data)) => {
-                let metadata = match serde_json::from_slice::<serde_json::Value>(&entity_data) {
-                    Ok(entity_json) => entity_json,
-                    Err(_) => serde_json::json!({}),
-                };
-                let model = serde_json::from_slice::<T>(&entity_data).map_err(|e| {
-                    TitoError::DeserializationFailed(format!(
-                        "Failed to deserialize model for delete event: {}",
-                        e
-                    ))
-                })?;
-                (metadata, model)
-            }
-            Ok(None) => return Err(TitoError::NotFound(format!("Entity not found: {}", id))),
-            Err(e) => {
-                return Err(TitoError::QueryFailed(format!(
-                    "Failed to fetch entity: {}",
-                    e
-                )))
-            }
+        let reverse_index = match self.get_reverse_index(&reverse_index_key, tx).await {
+            Ok(idx) => idx,
+            Err(_) => return Err(TitoError::NotFound(format!("Entity not found: {}", id))),
         };
 
-        let reverse_index = self.get_reverse_index(&reverse_index_key, tx).await?;
         let mut keys = reverse_index.value;
 
         keys.push(id.clone());
-
         keys.push(reverse_index_key);
 
         for key in keys.into_iter() {
             self.delete(key, tx).await?;
         }
 
-        self.generate_event(
-            TitoGenerateEventPayload {
-                key: id.to_string(),
-                operation: options.operation,
-                event: options.event.clone(),
-            },
-            &model,
-            tx,
-        )
-        .await?;
-
         Ok(true)
-    }
-
-    pub async fn delete_by_id(&self, raw_id: &str, tx: &E::Transaction) -> Result<bool, TitoError> {
-        self.delete_by_id_with_options(
-            raw_id,
-            TitoOptions::with_events(TitoOperation::Delete),
-            tx,
-        )
-        .await
     }
 
     pub async fn has_inbound_references(
@@ -961,12 +815,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
                         let modified = match f(record).await? {
                             Some(updated) => {
-                                self.update_with_options(
-                                    updated,
-                                    TitoOptions::skip_events(TitoOperation::Update),
-                                    &tx,
-                                )
-                                .await?;
+                                self.update(updated, &tx).await?;
                                 true
                             }
                             None => false,

@@ -24,9 +24,13 @@ pub mod relationship;
 
 pub use error::TitoError;
 pub use types::{
-    TitoEngine, TitoEvent, TitoModelOptions, TitoOperation, TitoOptions, EventConfig,
-    PartitionConfig, WorkerConfig, QueueCheckpoint, QueueProgress, QueueCompleted, QueueFailed,
-    PARTITION_DIGITS, MigrateStats,
+    MigrateStats, PartitionConfig, TitoEngine, TitoModelOptions, TitoModelTrait,
+    PARTITION_DIGITS,
+};
+
+// Re-export queue types at crate root for convenience
+pub use queue::{
+    EventHandler, EventType, Queue, QueueConfig, QueueEvent, RetryPolicy, TitoQueue, WorkerConfig,
 };
 
 pub mod backup;
