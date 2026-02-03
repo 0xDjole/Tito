@@ -12,18 +12,13 @@ use super::{EventType, Queue, QueueEvent};
 use crate::types::TitoEngine;
 use crate::TitoError;
 
-/// Configuration for running a worker
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
-    /// Event type to process (e.g., "events")
     pub event_type: String,
-    /// Consumer name
     pub consumer: String,
-    /// Partition range to process
     pub partition_range: std::ops::Range<u32>,
 }
 
-/// Run a worker with a closure handler
 pub async fn run_worker<E, T, H>(
     queue: Arc<Queue<E>>,
     config: WorkerConfig,
@@ -66,10 +61,8 @@ where
                                                 retry_event.error = Some(err.to_string());
 
                                                 if retry_event.retry_count > retry_event.max_retries {
-                                                    // Move to DLQ
                                                     let _ = q.move_to_dlq(retry_event).await;
                                                 } else {
-                                                    // Reschedule with backoff: 2^retry_count seconds
                                                     let backoff = 2_i64.pow(retry_event.retry_count);
                                                     let new_scheduled_at = Utc::now().timestamp() + backoff;
                                                     let _ = q.reschedule(retry_event, new_scheduled_at).await;
