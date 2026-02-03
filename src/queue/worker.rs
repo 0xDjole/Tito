@@ -8,96 +8,22 @@ use serde::Serialize;
 use tokio::sync::broadcast;
 use tokio::time::sleep;
 
-use super::{EventHandler, EventType, Queue, QueueEvent, RetryPolicy, WorkerConfig};
+use super::{EventType, Queue, QueueEvent};
 use crate::types::TitoEngine;
 use crate::TitoError;
 
-/// Run a worker that processes events using an EventHandler trait implementation
-pub async fn run_worker_with_handler<E, T, H>(
-    queue: Arc<Queue<E>>,
-    config: WorkerConfig,
-    handler: Arc<H>,
-    ctx: H::Context,
-    retry_policy: RetryPolicy,
-    shutdown: broadcast::Receiver<()>,
-) -> tokio::task::JoinHandle<()>
-where
-    E: TitoEngine + 'static,
-    T: EventType + Serialize + DeserializeOwned,
-    H: EventHandler<T> + 'static,
-{
-    tokio::spawn(async move {
-        let mut handles = Vec::new();
-
-        for partition in config.partition_range.clone() {
-            let q = queue.clone();
-            let h = handler.clone();
-            let ctx = ctx.clone();
-            let event_type = config.event_type.clone();
-            let retry_policy = retry_policy.clone();
-            let mut rx = shutdown.resubscribe();
-
-            handles.push(tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = rx.recv() => break,
-                        _ = async {
-                            match q.pull::<T>(&event_type, partition, 50).await {
-                                Ok(jobs) if jobs.is_empty() => {
-                                    sleep(Duration::from_millis(1000)).await;
-                                }
-                                Ok(jobs) => {
-                                    for event in jobs {
-                                        // Check if handler accepts this event
-                                        if !h.accepts(&event.payload) {
-                                            // Ack and skip
-                                            let _ = q.ack(&event.key).await;
-                                            continue;
-                                        }
-
-                                        let key = event.key.clone();
-                                        match h.handle(&event, &ctx).await {
-                                            Ok(_) => {
-                                                // Success - ack the event
-                                                let _ = q.ack(&key).await;
-                                            }
-                                            Err(err) => {
-                                                // Handle retry logic
-                                                let mut updated_event = event.clone();
-                                                updated_event.retry_count += 1;
-                                                updated_event.error = Some(err.to_string());
-
-                                                if updated_event.retry_count > retry_policy.max_retries {
-                                                    // Max retries exceeded - just ack (drop)
-                                                    // TODO: Could move to DLQ here
-                                                    let _ = q.ack(&key).await;
-                                                } else {
-                                                    // Reschedule with backoff
-                                                    let backoff = retry_policy.backoff_seconds(updated_event.retry_count);
-                                                    let new_scheduled_at = Utc::now().timestamp() + backoff;
-                                                    let _ = q.reschedule(updated_event, new_scheduled_at).await;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(_) => {
-                                    sleep(Duration::from_millis(500)).await;
-                                }
-                            }
-                        } => {}
-                    }
-                }
-            }));
-        }
-
-        for h in handles {
-            let _ = h.await;
-        }
-    })
+/// Configuration for running a worker
+#[derive(Debug, Clone)]
+pub struct WorkerConfig {
+    /// Event type to process (e.g., "events")
+    pub event_type: String,
+    /// Consumer name
+    pub consumer: String,
+    /// Partition range to process
+    pub partition_range: std::ops::Range<u32>,
 }
 
-/// Run a worker with a closure handler (backward compatible API)
+/// Run a worker with a closure handler
 pub async fn run_worker<E, T, H>(
     queue: Arc<Queue<E>>,
     config: WorkerConfig,
@@ -130,9 +56,25 @@ where
                                 Ok(jobs) => {
                                     for event in jobs {
                                         let key = event.key.clone();
-                                        match h(event).await {
-                                            Ok(_) => { let _ = q.ack(&key).await; }
-                                            Err(_) => { let _ = q.ack(&key).await; }
+                                        match h(event.clone()).await {
+                                            Ok(_) => {
+                                                let _ = q.ack(&key).await;
+                                            }
+                                            Err(err) => {
+                                                let mut retry_event = event.clone();
+                                                retry_event.retry_count += 1;
+                                                retry_event.error = Some(err.to_string());
+
+                                                if retry_event.retry_count > retry_event.max_retries {
+                                                    // Move to DLQ
+                                                    let _ = q.move_to_dlq(retry_event).await;
+                                                } else {
+                                                    // Reschedule with backoff: 2^retry_count seconds
+                                                    let backoff = 2_i64.pow(retry_event.retry_count);
+                                                    let new_scheduled_at = Utc::now().timestamp() + backoff;
+                                                    let _ = q.reschedule(retry_event, new_scheduled_at).await;
+                                                }
+                                            }
                                         }
                                     }
                                 }

@@ -164,10 +164,6 @@ pub struct TitoRelIndexConfig {
     pub field: String,
 }
 
-/// Trait for models stored in Tito
-///
-/// Note: The `events()` method is no longer used for automatic event generation.
-/// Events should be explicitly published using `Queue::publish_in_tx()`.
 pub trait TitoModelTrait {
     fn relationships(&self) -> Vec<TitoRelationshipConfig> {
         vec![]

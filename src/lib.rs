@@ -29,8 +29,6 @@ pub use types::{
 };
 
 // Re-export queue types at crate root for convenience
-pub use queue::{
-    EventHandler, EventType, Queue, QueueConfig, QueueEvent, RetryPolicy, TitoQueue, WorkerConfig,
-};
+pub use queue::{EventType, Queue, QueueConfig, QueueEvent, TitoQueue, WorkerConfig};
 
 pub mod backup;

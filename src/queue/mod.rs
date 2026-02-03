@@ -2,9 +2,9 @@ mod traits;
 mod types;
 mod worker;
 
-pub use traits::{EventHandler, EventType};
-pub use types::{QueueConfig, QueueEvent, RetryPolicy, WorkerConfig};
-pub use worker::run_worker;
+pub use traits::EventType;
+pub use types::{QueueConfig, QueueEvent};
+pub use worker::{run_worker, WorkerConfig};
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -16,7 +16,6 @@ use serde::Serialize;
 use crate::types::{TitoEngine, TitoTransaction, PARTITION_DIGITS};
 use crate::TitoError;
 
-/// Generic queue backed by TitoEngine
 #[derive(Clone)]
 pub struct Queue<E: TitoEngine> {
     pub engine: E,
@@ -28,7 +27,6 @@ impl<E: TitoEngine> Queue<E> {
         Self { engine, config }
     }
 
-    /// Publish an event to the queue within an existing transaction
     pub async fn publish_in_tx<T: EventType + Serialize>(
         &self,
         mut event: QueueEvent<T>,
@@ -36,12 +34,10 @@ impl<E: TitoEngine> Queue<E> {
     ) -> Result<(), TitoError> {
         let event_type = T::event_type_name();
 
-        // Calculate partition from entity_id
         let mut hasher = DefaultHasher::new();
         event.entity_id.hash(&mut hasher);
         let partition = (hasher.finish() % self.config.partition_count as u64) as u32;
 
-        // Generate storage key
         let key = format!(
             "event:{}:{:0pwidth$}:{}:{}",
             event_type,
@@ -63,7 +59,6 @@ impl<E: TitoEngine> Queue<E> {
         Ok(())
     }
 
-    /// Publish an event to the queue (creates its own transaction)
     pub async fn publish<T: EventType + Serialize>(
         &self,
         event: QueueEvent<T>,
@@ -76,7 +71,6 @@ impl<E: TitoEngine> Queue<E> {
             .await
     }
 
-    /// Pull events from a specific partition that are ready to process
     pub async fn pull<T: EventType + DeserializeOwned>(
         &self,
         event_type: &str,
@@ -124,7 +118,6 @@ impl<E: TitoEngine> Queue<E> {
             .await
     }
 
-    /// Acknowledge (delete) an event from the queue
     pub async fn ack(&self, key: &str) -> Result<(), TitoError> {
         self.engine
             .transaction(|tx| {
@@ -139,7 +132,6 @@ impl<E: TitoEngine> Queue<E> {
             .await
     }
 
-    /// Reschedule an event with updated scheduled_at time
     pub async fn reschedule<T: EventType + Serialize>(
         &self,
         mut event: QueueEvent<T>,
@@ -153,20 +145,16 @@ impl<E: TitoEngine> Queue<E> {
                 let event_type = T::event_type_name();
 
                 async move {
-                    // Delete old event
                     tx.delete(old_key.as_bytes())
                         .await
                         .map_err(|e| TitoError::DeleteFailed(format!("Delete old event: {}", e)))?;
 
-                    // Calculate partition
                     let mut hasher = DefaultHasher::new();
                     event.entity_id.hash(&mut hasher);
                     let partition = (hasher.finish() % self.config.partition_count as u64) as u32;
 
-                    // Update scheduled_at
                     event.scheduled_at = new_scheduled_at;
 
-                    // Generate new key with updated timestamp
                     let new_key = format!(
                         "event:{}:{:0pwidth$}:{}:{}",
                         event_type,
@@ -191,11 +179,50 @@ impl<E: TitoEngine> Queue<E> {
             .await
     }
 
-    /// Clear all events (for testing)
     pub async fn clear(&self) -> Result<(), TitoError> {
         Ok(())
     }
+
+    pub async fn move_to_dlq<T: EventType + Serialize>(
+        &self,
+        event: QueueEvent<T>,
+    ) -> Result<(), TitoError> {
+        let event_type = T::event_type_name();
+
+        let mut hasher = DefaultHasher::new();
+        event.entity_id.hash(&mut hasher);
+        let partition = (hasher.finish() % self.config.partition_count as u64) as u32;
+
+        let dlq_key = format!(
+            "dlq:{}:{:0pwidth$}:{}:{}",
+            event_type,
+            partition,
+            event.created_at,
+            event.id,
+            pwidth = PARTITION_DIGITS,
+        );
+
+        self.engine
+            .transaction(|tx| {
+                let old_key = event.key.clone();
+                let dlq_key = dlq_key.clone();
+                let event = event.clone();
+                async move {
+                    tx.delete(old_key.as_bytes())
+                        .await
+                        .map_err(|e| TitoError::DeleteFailed(format!("Delete event: {}", e)))?;
+
+                    let bytes = serde_json::to_vec(&event)
+                        .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
+                    tx.put(&dlq_key, bytes)
+                        .await
+                        .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
+
+                    Ok::<_, TitoError>(())
+                }
+            })
+            .await
+    }
 }
 
-// Keep backward compatibility with old TitoQueue name
 pub type TitoQueue<E> = Queue<E>;

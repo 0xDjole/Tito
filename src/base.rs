@@ -58,7 +58,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     }
 
     fn decode_cursor(&self, cursor: String) -> Result<TitoCursor, TitoError> {
-        let cursor = decode(cursor).map_err(|err| {
+        let cursor = decode(cursor).map_err(|_err| {
             TitoError::DeserializationFailed("Failed to decode cursor".to_string())
         })?;
         if let Ok(value) = serde_json::from_slice::<TitoCursor>(&cursor) {
@@ -296,7 +296,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         }
     }
 
-    /// Build (create) a new record in the database
     pub async fn build(&self, payload: T, tx: &E::Transaction) -> Result<T, TitoError>
     where
         T: serde::de::DeserializeOwned,
@@ -568,7 +567,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         Ok((items, has_more))
     }
 
-    /// Update an existing record in the database
     pub async fn update(&self, payload: T, tx: &E::Transaction) -> Result<bool, TitoError>
     where
         T: serde::de::DeserializeOwned,
@@ -601,7 +599,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         }
     }
 
-    /// Delete a record by its ID
     pub async fn delete_by_id(&self, raw_id: &str, tx: &E::Transaction) -> Result<bool, TitoError> {
         let id = format!("{}:{}", self.get_table(), raw_id);
         let reverse_index_key = format!("reverse-index:{}", id);
@@ -627,7 +624,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     }
 
     pub async fn has_inbound_references(
-        engine: &E,
+        _engine: &E,
         target_id: &str,
         tx: &E::Transaction,
     ) -> Result<bool, TitoError> {
@@ -641,7 +638,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     }
 
     pub async fn inbound_references(
-        engine: &E,
+        _engine: &E,
         target_id: &str,
         limit: u32,
         tx: &E::Transaction,
@@ -664,7 +661,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     }
 
     pub async fn outbound_references(
-        engine: &E,
+        _engine: &E,
         source_id: &str,
         limit: u32,
         tx: &E::Transaction,
