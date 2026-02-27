@@ -155,8 +155,11 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         if let serde_json::Value::Object(ref mut map) = value {
             let now = Utc::now().timestamp();
 
-            let existing = tx.get(&key).await;
-            if existing.is_err() || existing.unwrap().is_none() {
+            let is_new = match tx.get(&key).await {
+                Ok(Some(_)) => false,
+                _ => true,
+            };
+            if is_new {
                 map.insert("created_at".to_string(), serde_json::json!(now));
             }
             map.insert("updated_at".to_string(), serde_json::json!(now));
@@ -213,13 +216,12 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             }
         }
 
-        let cursor = if has_more && last_item.is_some() {
-            Some(
-                self.encode_cursors(vec![Some(last_item.unwrap())])
-                    .expect("Failed to encode cursor"),
-            )
-        } else {
-            None
+        let cursor = match (has_more, last_item) {
+            (true, Some(item)) => Some(
+                self.encode_cursors(vec![Some(item)])
+                    .map_err(|e| TitoError::SerializationFailed(format!("Failed to encode cursor: {}", e)))?,
+            ),
+            _ => None,
         };
 
         let results = TitoPaginated::new(results, cursor);
@@ -300,7 +302,8 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     where
         T: serde::de::DeserializeOwned,
     {
-        let value = serde_json::to_value(&payload).unwrap();
+        let value = serde_json::to_value(&payload)
+            .map_err(|e| TitoError::SerializationFailed(format!("Failed to serialize payload: {}", e)))?;
 
         let raw_id = payload.id();
 

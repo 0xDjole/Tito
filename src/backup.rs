@@ -125,7 +125,7 @@ impl TitoBackupService {
 
     pub async fn delete_all_data<T: TitoTransaction>(&self, tx: &T) -> Result<usize, TitoError> {
         let start_key = String::new();
-        let end_key = String::from_utf8(vec![255; 10]).unwrap();
+        let end_key = unsafe { String::from_utf8_unchecked(vec![255; 10]) };
 
         let mut deleted_count = 0;
 

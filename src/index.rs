@@ -115,13 +115,13 @@ impl<
         let index = indexes
             .iter()
             .find(|index_config| index_config.name == payload.index)
-            .unwrap();
+            .ok_or_else(|| TitoError::IndexError(format!("Index '{}' not found on model '{}'", payload.index, self.model.table())))?;
 
         let index_fields = index.fields.clone();
 
         let mut key_from_values = vec![];
         for (i, value) in payload.values.iter().enumerate() {
-            let index_field = index_fields[i].clone();
+            let index_field = index_fields.get(i).cloned().ok_or_else(|| TitoError::IndexError(format!("Index '{}' has {} fields but {} values were provided", payload.index, index_fields.len(), payload.values.len())))?;
             let index_field_type = index_field.r#type;
 
             let value = match index_field_type {
@@ -183,13 +183,13 @@ impl<
         let index = indexes
             .iter()
             .find(|index_config| index_config.name == payload.index)
-            .unwrap();
+            .ok_or_else(|| TitoError::IndexError(format!("Index '{}' not found on model '{}'", payload.index, self.model.table())))?;
 
         let index_fields = index.fields.clone();
 
         let mut key_from_values = vec![];
         for (i, value) in payload.values.iter().enumerate() {
-            let index_field = index_fields[i].clone();
+            let index_field = index_fields.get(i).cloned().ok_or_else(|| TitoError::IndexError(format!("Index '{}' has {} fields but {} values were provided", payload.index, index_fields.len(), payload.values.len())))?;
             let index_field_type = index_field.r#type;
 
             let value = match index_field_type {
