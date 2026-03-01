@@ -293,10 +293,3 @@ impl PartitionConfig {
 }
 
 pub const PARTITION_DIGITS: usize = 4;
-
-#[derive(Default, Debug, Clone)]
-pub struct MigrateStats {
-    pub processed: usize,
-    pub modified: usize,
-    pub skipped: usize,
-}

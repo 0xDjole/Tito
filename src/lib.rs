@@ -24,7 +24,7 @@ pub mod relationship;
 
 pub use error::TitoError;
 pub use types::{
-    MigrateStats, PartitionConfig, TitoEngine, TitoModelOptions, TitoModelTrait,
+    PartitionConfig, TitoEngine, TitoModelOptions, TitoModelTrait,
     PARTITION_DIGITS,
 };
 
