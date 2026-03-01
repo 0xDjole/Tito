@@ -602,6 +602,60 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         }
     }
 
+    /// Delete all entities matching an index value, in batches.
+    /// Each batch runs in its own transaction so we never exceed TiKV limits.
+    /// Naturally resumes where it left off — committed batches are permanent,
+    /// so re-querying only returns remaining items.
+    pub async fn delete_by_index(
+        &self,
+        index: &str,
+        value: &str,
+        batch_size: u32,
+    ) -> Result<Vec<String>, TitoError>
+    where
+        T: DeserializeOwned,
+    {
+        let index = index.to_string();
+        let value = value.to_string();
+        let mut all_deleted_ids = vec![];
+
+        loop {
+            let batch_ids: Vec<String> = self
+                .tx(|tx| {
+                    let index = index.clone();
+                    let value = value.clone();
+                    async move {
+                        let mut query = self.query_by_index(&index);
+                        query.value(value);
+                        query.limit(Some(batch_size));
+                        let items = query.execute(Some(&tx)).await?;
+
+                        if items.items.is_empty() {
+                            return Ok(vec![]);
+                        }
+
+                        let mut ids = vec![];
+                        for item in items.items {
+                            let id = item.id();
+                            self.delete_by_id(&id, &tx).await?;
+                            ids.push(id);
+                        }
+
+                        Ok(ids)
+                    }
+                })
+                .await?;
+
+            if batch_ids.is_empty() {
+                break;
+            }
+
+            all_deleted_ids.extend(batch_ids);
+        }
+
+        Ok(all_deleted_ids)
+    }
+
     pub async fn delete_by_id(&self, raw_id: &str, tx: &E::Transaction) -> Result<bool, TitoError> {
         let id = format!("{}:{}", self.get_table(), raw_id);
         let reverse_index_key = format!("reverse-index:{}", id);

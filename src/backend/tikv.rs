@@ -76,7 +76,7 @@ impl TitoEngine for TiKVBackend {
                                 active_transactions.remove(&tx_id);
                             }
 
-                            if Self::is_retryable_error(&e) && retries < MAX_RETRIES {
+                            if retries < MAX_RETRIES {
                                 retries += 1;
                                 let jitter = rand::thread_rng().gen_range(0..base_delay_ms / 2);
                                 let delay = base_delay_ms + jitter;
@@ -95,15 +95,7 @@ impl TitoEngine for TiKVBackend {
                         active_transactions.remove(&tx_id);
                     }
 
-                    let err_str = format!("{:?}", e);
-                    let err_lower = err_str.to_lowercase();
-                    let is_retryable = err_lower.contains("lock")
-                        || err_lower.contains("conflict")
-                        || err_lower.contains("retryable")
-                        || err_lower.contains("region")
-                        || err_lower.contains("stale");
-
-                    if is_retryable && retries < MAX_RETRIES {
+                    if retries < MAX_RETRIES {
                         retries += 1;
                         let jitter = rand::thread_rng().gen_range(0..base_delay_ms / 2);
                         let delay = base_delay_ms + jitter;
@@ -276,23 +268,6 @@ impl TitoTransaction for TiKVTransaction {
     }
 }
 
-impl TiKVBackend {
-    fn is_retryable_error(err: &TitoError) -> bool {
-        let err_str = format!("{:?}", err);
-        let err_lower = err_str.to_lowercase();
-        err_lower.contains("writeconflict")
-            || err_lower.contains("write conflict")
-            || err_lower.contains("conflict")
-            || err_lower.contains("txnlocknotfound")
-            || err_lower.contains("keyislocked")
-            || err_lower.contains("retryable")
-            || err_lower.contains("region")
-            || err_lower.contains("not leader")
-            || err_lower.contains("stale")
-            || err_lower.contains("resolve lock")
-            || err_lower.contains("lock")
-    }
-}
 
 pub struct TiKV;
 
