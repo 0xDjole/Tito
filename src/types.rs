@@ -128,6 +128,7 @@ pub type TitoRelationshipConfig = TitoEmbeddedRelationshipConfig;
 pub enum TitoIndexBlockType {
     String,
     Number,
+    Custom(std::string::String),
 }
 
 #[derive(Debug, Clone)]
@@ -166,10 +167,6 @@ pub struct TitoRelIndexConfig {
 
 pub trait TitoModelTrait {
     fn relationships(&self) -> Vec<TitoRelationshipConfig> {
-        vec![]
-    }
-
-    fn references(&self) -> Vec<String> {
         vec![]
     }
 

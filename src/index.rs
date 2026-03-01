@@ -40,17 +40,22 @@ impl<
             let mut combinations: Vec<String> = vec![String::new()];
 
             for field in index_config.fields.iter() {
-                let field_values = match self.get_nested_values(json, &field.name) {
-                    Some(values) if !values.is_empty() => values,
-                    _ => vec![FieldValue::Simple(Value::String("__null__".to_string()))],
+                let field_values = match &field.r#type {
+                    TitoIndexBlockType::Custom(value) => {
+                        vec![FieldValue::Simple(Value::String(value.clone()))]
+                    }
+                    _ => match self.get_nested_values(json, &field.name) {
+                        Some(values) if !values.is_empty() => values,
+                        _ => vec![FieldValue::Simple(Value::String("__null__".to_string()))],
+                    },
                 };
 
                 let mut new_combinations = vec![];
 
                 for field_value in field_values {
                     let field_str = match field_value {
-                        FieldValue::HashMapEntry { key, value } => match field.r#type {
-                            TitoIndexBlockType::String => match value.as_str() {
+                        FieldValue::HashMapEntry { key, value } => match &field.r#type {
+                            TitoIndexBlockType::String | TitoIndexBlockType::Custom(_) => match value.as_str() {
                                 Some("") => Some(format!("{}:{}.__null__", field.name, key)),
                                 Some(s) => {
                                     Some(format!("{}:{}.{}", field.name, key, safe_encode(&s)))
@@ -62,8 +67,8 @@ impl<
                                 None => Some(format!("{}:{}:__null__", field.name, key)),
                             },
                         },
-                        FieldValue::Simple(value) => match field.r#type {
-                            TitoIndexBlockType::String => match value.as_str() {
+                        FieldValue::Simple(value) => match &field.r#type {
+                            TitoIndexBlockType::String | TitoIndexBlockType::Custom(_) => match value.as_str() {
                                 Some("") => Some(format!("{}:__null__", field.name)),
                                 Some(s) => Some(format!("{}:{}", field.name, safe_encode(&s))),
                                 None => Some(format!("{}:__null__", field.name)),
@@ -125,7 +130,7 @@ impl<
             let index_field_type = index_field.r#type;
 
             let value = match index_field_type {
-                TitoIndexBlockType::String => safe_encode(value),
+                TitoIndexBlockType::String | TitoIndexBlockType::Custom(_) => safe_encode(value),
                 TitoIndexBlockType::Number => format!("{:0>10}", value),
             };
 
@@ -193,7 +198,7 @@ impl<
             let index_field_type = index_field.r#type;
 
             let value = match index_field_type {
-                TitoIndexBlockType::String => safe_encode(value),
+                TitoIndexBlockType::String | TitoIndexBlockType::Custom(_) => safe_encode(value),
                 TitoIndexBlockType::Number => format!("{:0>10}", value),
             };
 

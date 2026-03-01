@@ -59,10 +59,6 @@ impl TitoModelTrait for Post {
         }]
     }
 
-    fn references(&self) -> Vec<String> {
-        self.tag_ids.clone()
-    }
-
     fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![
             TitoIndexConfig {
