@@ -10,6 +10,47 @@ use std::sync::Arc;
 use tikv_client::{ColumnFamily, RawClient, Transaction, TransactionClient};
 use tokio::time::{sleep, Duration};
 
+fn classify_tikv_error(e: tikv_client::Error, context: &str) -> TitoError {
+    let msg = format!("{}: {}", context, e);
+    match &e {
+        tikv_client::Error::RegionError(_)
+        | tikv_client::Error::RegionForKeyNotFound { .. }
+        | tikv_client::Error::RegionForRangeNotFound { .. }
+        | tikv_client::Error::RegionNotFoundInResponse { .. }
+        | tikv_client::Error::LeaderNotFound { .. }
+        | tikv_client::Error::ResolveLockError(_)
+        | tikv_client::Error::NoCurrentRegions
+        | tikv_client::Error::EntryNotFoundInRegionCache
+        | tikv_client::Error::UndeterminedError(_)
+        | tikv_client::Error::PessimisticLockError { .. } => TitoError::Retryable(msg),
+        tikv_client::Error::KeyError(ke) => {
+            if ke.locked.is_some() || ke.conflict.is_some() || !ke.retryable.is_empty() {
+                TitoError::Retryable(msg)
+            } else {
+                TitoError::TransactionFailed(msg)
+            }
+        }
+        tikv_client::Error::MultipleKeyErrors(errs) | tikv_client::Error::ExtractedErrors(errs) => {
+            let any_retryable = errs.iter().any(|inner| {
+                matches!(
+                    inner,
+                    tikv_client::Error::RegionError(_)
+                    | tikv_client::Error::ResolveLockError(_)
+                    | tikv_client::Error::LeaderNotFound { .. }
+                    | tikv_client::Error::RegionForKeyNotFound { .. }
+                    | tikv_client::Error::KeyError(_)
+                )
+            });
+            if any_retryable {
+                TitoError::Retryable(msg)
+            } else {
+                TitoError::TransactionFailed(msg)
+            }
+        }
+        _ => TitoError::TransactionFailed(msg),
+    }
+}
+
 #[derive(Clone)]
 pub struct TiKVBackend {
     pub client: Arc<TransactionClient>,
@@ -24,7 +65,7 @@ impl TitoEngine for TiKVBackend {
 
     async fn begin_transaction(&self) -> Result<Self::Transaction, Self::Error> {
         let tx = self.client.begin_optimistic().await.map_err(|e| {
-            TitoError::TransactionFailed(format!("Failed to begin transaction: {}", e))
+            classify_tikv_error(e, "Failed to begin transaction")
         })?;
         Ok(TiKVTransaction {
             id: DBUuid::new_v4().to_string(),
@@ -76,7 +117,7 @@ impl TitoEngine for TiKVBackend {
                                 active_transactions.remove(&tx_id);
                             }
 
-                            if retries < MAX_RETRIES {
+                            if e.is_retryable() && retries < MAX_RETRIES {
                                 retries += 1;
                                 let jitter = rand::thread_rng().gen_range(0..base_delay_ms / 2);
                                 let delay = base_delay_ms + jitter;
@@ -95,7 +136,11 @@ impl TitoEngine for TiKVBackend {
                         active_transactions.remove(&tx_id);
                     }
 
-                    if retries < MAX_RETRIES {
+                    // User function errors: check if the underlying error is retryable
+                    // by looking for our Retryable variant in the Debug output
+                    let is_retryable = format!("{:?}", e).contains("Retryable(");
+
+                    if is_retryable && retries < MAX_RETRIES {
                         retries += 1;
                         let jitter = rand::thread_rng().gen_range(0..base_delay_ms / 2);
                         let delay = base_delay_ms + jitter;
@@ -163,7 +208,7 @@ impl TitoTransaction for TiKVTransaction {
             .await
             .get(tikv_key)
             .await
-            .map_err(|e| TitoError::QueryFailed(format!("Get operation failed: {}", e)))
+            .map_err(|e| classify_tikv_error(e, "Get operation failed"))
     }
 
     async fn put<K: AsRef<[u8]> + Send, V: AsRef<[u8]> + Send>(
@@ -179,7 +224,7 @@ impl TitoTransaction for TiKVTransaction {
             .await
             .put(tikv_key, value_bytes)
             .await
-            .map_err(|e| TitoError::UpdateFailed(format!("Put operation failed: {}", e)))
+            .map_err(|e| classify_tikv_error(e, "Put operation failed"))
     }
 
     async fn delete<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<(), Self::Error> {
@@ -190,7 +235,7 @@ impl TitoTransaction for TiKVTransaction {
             .await
             .delete(tikv_key)
             .await
-            .map_err(|e| TitoError::DeleteFailed(format!("Delete operation failed: {}", e)))
+            .map_err(|e| classify_tikv_error(e, "Delete operation failed"))
     }
 
     async fn scan<K: AsRef<[u8]> + Send>(
@@ -208,7 +253,7 @@ impl TitoTransaction for TiKVTransaction {
             .await
             .scan(bound_range, limit)
             .await
-            .map_err(|e| TitoError::QueryFailed(format!("Scan operation failed: {}", e)))?;
+            .map_err(|e| classify_tikv_error(e, "Scan operation failed"))?;
 
         Ok(result.map(|kv| (kv.0.into(), kv.1)).collect())
     }
@@ -228,7 +273,7 @@ impl TitoTransaction for TiKVTransaction {
             .await
             .scan_reverse(bound_range, limit)
             .await
-            .map_err(|e| TitoError::QueryFailed(format!("Reverse scan operation failed: {}", e)))?;
+            .map_err(|e| classify_tikv_error(e, "Reverse scan operation failed"))?;
 
         Ok(result.map(|kv| (kv.0.into(), kv.1)).collect())
     }
@@ -246,7 +291,7 @@ impl TitoTransaction for TiKVTransaction {
             .await
             .batch_get(tikv_keys)
             .await
-            .map_err(|e| TitoError::QueryFailed(format!("Batch get operation failed: {}", e)))?;
+            .map_err(|e| classify_tikv_error(e, "Batch get operation failed"))?;
 
         Ok(result.map(|kv| (kv.0.into(), kv.1)).collect())
     }
@@ -258,16 +303,15 @@ impl TitoTransaction for TiKVTransaction {
             .commit()
             .await
             .map(|_| ())
-            .map_err(|e| TitoError::TransactionFailed(format!("Transaction commit failed: {}", e)))
+            .map_err(|e| classify_tikv_error(e, "Transaction commit failed"))
     }
 
     async fn rollback(self) -> Result<(), Self::Error> {
         self.inner.lock().await.rollback().await.map_err(|e| {
-            TitoError::TransactionFailed(format!("Transaction rollback failed: {}", e))
+            classify_tikv_error(e, "Transaction rollback failed")
         })
     }
 }
-
 
 pub struct TiKV;
 

@@ -11,6 +11,9 @@ pub enum TitoError {
     #[error("Transaction failed: {0}")]
     TransactionFailed(String),
 
+    #[error("Retryable error: {0}")]
+    Retryable(String),
+
     #[error("Failed to create resource: {0}")]
     CreateFailed(String),
 
@@ -52,4 +55,10 @@ pub enum TitoError {
 
     #[error("Configuration error: {0}")]
     Configuration(String),
+}
+
+impl TitoError {
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, TitoError::Retryable(_))
+    }
 }
