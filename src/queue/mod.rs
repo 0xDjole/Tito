@@ -29,13 +29,13 @@ impl<E: TitoEngine> Queue<E> {
 
     pub async fn publish_in_tx<T: EventType + Serialize>(
         &self,
-        mut event: QueueEvent<T>,
+        event: QueueEvent<T>,
         tx: &E::Transaction,
     ) -> Result<(), TitoError> {
         let event_type = T::event_type_name();
 
         let mut hasher = DefaultHasher::new();
-        event.entity_id.hash(&mut hasher);
+        event.key.hash(&mut hasher);
         let partition = (hasher.finish() % self.config.partition_count as u64) as u32;
 
         let key = format!(
@@ -46,8 +46,6 @@ impl<E: TitoEngine> Queue<E> {
             event.id,
             pwidth = PARTITION_DIGITS,
         );
-
-        event.key = key.clone();
 
         let bytes = serde_json::to_vec(&event)
             .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
@@ -76,7 +74,7 @@ impl<E: TitoEngine> Queue<E> {
         event_type: &str,
         partition: u32,
         limit: u32,
-    ) -> Result<Vec<QueueEvent<T>>, TitoError> {
+    ) -> Result<Vec<(String, QueueEvent<T>)>, TitoError> {
         self.engine
             .transaction(|tx| {
                 let event_type = event_type.to_string();
@@ -103,11 +101,12 @@ impl<E: TitoEngine> Queue<E> {
                         .await
                         .map_err(|e| TitoError::QueryFailed(format!("Scan failed: {}", e)))?;
 
-                    let mut jobs: Vec<QueueEvent<T>> = Vec::new();
-                    for (_key, value) in events.into_iter() {
+                    let mut jobs: Vec<(String, QueueEvent<T>)> = Vec::new();
+                    for (storage_key, value) in events.into_iter() {
                         if let Ok(event) = serde_json::from_slice::<QueueEvent<T>>(&value) {
                             if event.scheduled_at <= now {
-                                jobs.push(event);
+                                let key_str = String::from_utf8_lossy(&storage_key).into_owned();
+                                jobs.push((key_str, event));
                             }
                         }
                     }
@@ -135,9 +134,10 @@ impl<E: TitoEngine> Queue<E> {
     pub async fn reschedule<T: EventType + Serialize>(
         &self,
         mut event: QueueEvent<T>,
+        storage_key: &str,
         new_scheduled_at: i64,
     ) -> Result<(), TitoError> {
-        let old_key = event.key.clone();
+        let old_key = storage_key.to_string();
 
         self.engine
             .transaction(|tx| {
@@ -150,7 +150,7 @@ impl<E: TitoEngine> Queue<E> {
                         .map_err(|e| TitoError::DeleteFailed(format!("Delete old event: {}", e)))?;
 
                     let mut hasher = DefaultHasher::new();
-                    event.entity_id.hash(&mut hasher);
+                    event.key.hash(&mut hasher);
                     let partition = (hasher.finish() % self.config.partition_count as u64) as u32;
 
                     event.scheduled_at = new_scheduled_at;
@@ -163,8 +163,6 @@ impl<E: TitoEngine> Queue<E> {
                         event.id,
                         pwidth = PARTITION_DIGITS,
                     );
-
-                    event.key = new_key.clone();
 
                     let bytes = serde_json::to_vec(&event)
                         .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
@@ -186,11 +184,12 @@ impl<E: TitoEngine> Queue<E> {
     pub async fn move_to_dlq<T: EventType + Serialize>(
         &self,
         event: QueueEvent<T>,
+        storage_key: &str,
     ) -> Result<(), TitoError> {
         let event_type = T::event_type_name();
 
         let mut hasher = DefaultHasher::new();
-        event.entity_id.hash(&mut hasher);
+        event.key.hash(&mut hasher);
         let partition = (hasher.finish() % self.config.partition_count as u64) as u32;
 
         let dlq_key = format!(
@@ -204,7 +203,7 @@ impl<E: TitoEngine> Queue<E> {
 
         self.engine
             .transaction(|tx| {
-                let old_key = event.key.clone();
+                let old_key = storage_key.to_string();
                 let dlq_key = dlq_key.clone();
                 let event = event.clone();
                 async move {

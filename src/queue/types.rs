@@ -6,9 +6,7 @@ use super::traits::EventType;
 #[serde(rename_all = "camelCase")]
 pub struct QueueEvent<T> {
     pub id: String,
-    #[serde(default)]
     pub key: String,
-    pub entity_id: String,
     pub payload: T,
     pub created_at: i64,
     pub scheduled_at: i64,
@@ -18,12 +16,11 @@ pub struct QueueEvent<T> {
 }
 
 impl<T: EventType> QueueEvent<T> {
-    pub fn new(entity_id: impl Into<String>, payload: T) -> Self {
+    pub fn new(key: impl Into<String>, payload: T) -> Self {
         let now = chrono::Utc::now().timestamp();
         Self {
             id: uuid::Uuid::new_v4().to_string(),
-            key: String::new(),
-            entity_id: entity_id.into(),
+            key: key.into(),
             payload,
             created_at: now,
             scheduled_at: now,
@@ -43,16 +40,12 @@ impl<T: EventType> QueueEvent<T> {
         self
     }
 
-    pub fn entity_type(&self) -> &str {
-        self.entity_id.split(':').next().unwrap_or(&self.entity_id)
+    pub fn key_type(&self) -> &str {
+        self.key.split(':').next().unwrap_or(&self.key)
     }
 
-    pub fn entity_value(&self) -> &str {
-        self.entity_id.split(':').nth(1).unwrap_or(&self.entity_id)
-    }
-
-    pub fn entity(&self) -> &str {
-        &self.entity_id
+    pub fn key_value(&self) -> &str {
+        self.key.split(':').nth(1).unwrap_or(&self.key)
     }
 
     pub fn event(&self) -> &T {

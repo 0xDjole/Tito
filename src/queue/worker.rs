@@ -49,11 +49,10 @@ where
                                     sleep(Duration::from_millis(1000)).await;
                                 }
                                 Ok(jobs) => {
-                                    for event in jobs {
-                                        let key = event.key.clone();
+                                    for (storage_key, event) in jobs {
                                         match h(event.clone()).await {
                                             Ok(_) => {
-                                                let _ = q.ack(&key).await;
+                                                let _ = q.ack(&storage_key).await;
                                             }
                                             Err(err) => {
                                                 let mut retry_event = event.clone();
@@ -61,11 +60,11 @@ where
                                                 retry_event.error = Some(err.to_string());
 
                                                 if retry_event.retry_count > retry_event.max_retries {
-                                                    let _ = q.move_to_dlq(retry_event).await;
+                                                    let _ = q.move_to_dlq(retry_event, &storage_key).await;
                                                 } else {
                                                     let backoff = 2_i64.pow(retry_event.retry_count);
                                                     let new_scheduled_at = Utc::now().timestamp() + backoff;
-                                                    let _ = q.reschedule(retry_event, new_scheduled_at).await;
+                                                    let _ = q.reschedule(retry_event, &storage_key, new_scheduled_at).await;
                                                 }
                                             }
                                         }
