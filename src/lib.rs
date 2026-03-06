@@ -32,3 +32,5 @@ pub use types::{
 pub use queue::{EventType, Queue, QueueConfig, QueueEvent, TitoQueue, WorkerConfig};
 
 pub mod backup;
+
+pub use utils::next_string_lexicographically;

@@ -14,6 +14,7 @@ use crate::{
 
 use base64::{decode, encode};
 use chrono::Utc;
+use rand::Rng;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 
@@ -294,6 +295,13 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         }
     }
 
+    fn changelog_key() -> String {
+        let now = chrono::Utc::now();
+        let ts = now.timestamp_millis();
+        let rand: u32 = rand::thread_rng().gen();
+        format!("changelog:{}:{:08x}", ts, rand)
+    }
+
     pub async fn build(&self, payload: T, tx: &E::Transaction) -> Result<T, TitoError>
     where
         T: serde::de::DeserializeOwned,
@@ -306,6 +314,18 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         let id = format!("{}:{}", self.get_table(), raw_id);
 
         self.put(id.clone(), &value, tx).await?;
+
+        let changelog_key = Self::changelog_key();
+        let changelog_entry = serde_json::json!({
+            "op": "create",
+            "key": id.clone(),
+            "data": value.clone(),
+        });
+        let changelog_bytes = serde_json::to_vec(&changelog_entry)
+            .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
+        tx.put(changelog_key, changelog_bytes)
+            .await
+            .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
 
         let all_index_data = self.get_index_keys(id.clone(), &payload.clone(), &value)?;
 
@@ -656,6 +676,17 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             Ok(idx) => idx,
             Err(_) => return Err(TitoError::NotFound(format!("Entity not found: {}", id))),
         };
+
+        let changelog_key = Self::changelog_key();
+        let changelog_entry = serde_json::json!({
+            "op": "delete",
+            "key": id.clone(),
+        });
+        let changelog_bytes = serde_json::to_vec(&changelog_entry)
+            .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
+        tx.put(changelog_key, changelog_bytes)
+            .await
+            .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
 
         let mut keys = reverse_index.value;
 
