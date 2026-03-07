@@ -317,7 +317,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
         let changelog_key = Self::changelog_key();
         let changelog_entry = serde_json::json!({
-            "op": "create",
+            "op": "put",
             "key": id.clone(),
             "data": value.clone(),
         });
@@ -345,6 +345,35 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         self.put(reverse_key.clone(), index_json_key, tx).await?;
 
         Ok(payload)
+    }
+
+    pub async fn rebuild_index(&self, raw_id: &str, payload: &T, tx: &E::Transaction) -> Result<(), TitoError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let value = serde_json::to_value(payload)
+            .map_err(|e| TitoError::SerializationFailed(format!("Failed to serialize payload: {}", e)))?;
+
+        let id = format!("{}:{}", self.get_table(), raw_id);
+
+        let all_index_data = self.get_index_keys(id.clone(), payload, &value)?;
+
+        let mut all_index_keys = vec![];
+
+        for data in all_index_data {
+            all_index_keys.push(data.0.clone());
+            self.put(data.0.clone(), &data.1, tx).await?;
+        }
+
+        let index_json_key = ReverseIndex {
+            value: all_index_keys,
+        };
+
+        let reverse_key = format!("reverse-index:{}", id);
+
+        self.put(reverse_key, index_json_key, tx).await?;
+
+        Ok(())
     }
 
     async fn find_by_id_with_tx(
