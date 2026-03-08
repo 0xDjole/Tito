@@ -12,7 +12,7 @@ use crate::{
     utils::{next_string_lexicographically, previous_string_lexicographically},
 };
 
-use base64::{decode, encode};
+use base64::{engine::general_purpose, Engine};
 use chrono::Utc;
 use rand::Rng;
 use serde::{de::DeserializeOwned, Serialize};
@@ -55,7 +55,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     }
 
     fn decode_cursor(&self, cursor: String) -> Result<TitoCursor, TitoError> {
-        let cursor = decode(cursor).map_err(|_err| {
+        let cursor = general_purpose::STANDARD.decode(cursor).map_err(|_err| {
             TitoError::DeserializationFailed("Failed to decode cursor".to_string())
         })?;
         if let Ok(value) = serde_json::from_slice::<TitoCursor>(&cursor) {
@@ -71,7 +71,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         let json_bytes = serde_json::to_vec(&tikv_cursor).map_err(|_| {
             TitoError::SerializationFailed("Failed to serialize cursor".to_string())
         })?;
-        Ok(encode(&json_bytes))
+        Ok(general_purpose::STANDARD.encode(&json_bytes))
     }
 
     pub async fn tx<F, Fut, R, Err>(&self, f: F) -> Result<R, Err>
@@ -611,13 +611,31 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         Ok((items, has_more))
     }
 
+    async fn clear_indexes(&self, raw_id: &str, tx: &E::Transaction) -> Result<(), TitoError> {
+        let id = format!("{}:{}", self.get_table(), raw_id);
+        let reverse_index_key = format!("reverse-index:{}", id);
+
+        match self.get_reverse_index(&reverse_index_key, tx).await {
+            Ok(reverse_index) => {
+                for key in reverse_index.value {
+                    self.delete(key, tx).await?;
+                }
+                self.delete(reverse_index_key, tx).await?;
+            }
+            Err(TitoError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+
+        Ok(())
+    }
+
     pub async fn update(&self, payload: T, tx: &E::Transaction) -> Result<bool, TitoError>
     where
         T: serde::de::DeserializeOwned,
     {
         let raw_id = payload.id();
 
-        let _ = self.delete_by_id(&raw_id, tx).await;
+        self.clear_indexes(&raw_id, tx).await?;
 
         self.build(payload, tx).await?;
 

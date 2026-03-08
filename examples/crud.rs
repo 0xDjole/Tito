@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
 use tito::{
     types::{
-        DBUuid, TitoEngine, TitoEventConfig, TitoIndexBlockType, TitoIndexConfig, TitoIndexField,
+        DBUuid, TitoEngine, TitoIndexBlockType, TitoIndexConfig, TitoIndexField,
         TitoModelTrait,
     },
-    TiKV, TitoError,
+    TiKV, TitoError, TitoModelOptions,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -30,10 +30,6 @@ impl TitoModelTrait for User {
         "users".to_string()
     }
 
-    fn events(&self) -> Vec<TitoEventConfig> {
-        vec![]
-    }
-
     fn id(&self) -> String {
         self.id.clone()
     }
@@ -42,7 +38,7 @@ impl TitoModelTrait for User {
 #[tokio::main]
 async fn main() -> Result<(), TitoError> {
     let tito_db = TiKV::connect(vec!["127.0.0.1:2379"]).await?;
-    let user_model = tito_db.clone().model::<User>();
+    let user_model = tito_db.clone().model::<User>(TitoModelOptions::default());
 
     let user_id = DBUuid::new_v4().to_string();
     let user = User {

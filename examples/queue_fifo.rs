@@ -4,48 +4,26 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tito::{
-    queue::{run_worker, TitoQueue},
-    types::{
-        DBUuid, TitoEngine, TitoEventConfig, TitoIndexBlockType, TitoIndexConfig, TitoIndexField,
-        TitoModelTrait, WorkerConfig,
-    },
-    TiKV, TitoError, TitoOperation, TitoOptions,
+    queue::{run_worker, EventType, QueueConfig, QueueEvent, TitoQueue},
+    types::DBUuid,
+    TiKV, TitoError, WorkerConfig,
 };
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
-struct User {
-    id: String,
+struct UserEvent {
+    user_id: String,
     name: String,
     email: String,
+    action: String,
 }
 
-impl TitoModelTrait for User {
-    fn indexes(&self) -> Vec<TitoIndexConfig> {
-        vec![TitoIndexConfig {
-            condition: true,
-            name: "user-by-email".to_string(),
-            fields: vec![TitoIndexField {
-                name: "email".to_string(),
-                r#type: TitoIndexBlockType::String,
-            }],
-        }]
+impl EventType for UserEvent {
+    fn event_type_name() -> &'static str {
+        "user"
     }
 
-    fn table(&self) -> String {
-        "user".to_string()
-    }
-
-    fn events(&self) -> Vec<TitoEventConfig> {
-        let now = chrono::Utc::now().timestamp();
-        vec![TitoEventConfig {
-            name: "user".to_string(),
-            timestamp: now,
-            partitions: 1,
-        }]
-    }
-
-    fn id(&self) -> String {
-        self.id.clone()
+    fn variant_name(&self) -> &'static str {
+        "user_created"
     }
 }
 
@@ -54,58 +32,47 @@ async fn main() -> Result<(), TitoError> {
     println!("Testing FIFO Queue\n");
 
     let tito_db = TiKV::connect(vec!["127.0.0.1:2379"]).await?;
-    let user_model = tito_db.clone().model::<User>();
 
-    println!("Creating 5 users...\n");
+    let queue = Arc::new(TitoQueue::new(
+        tito_db.clone(),
+        QueueConfig::with_partitions(1),
+    ));
+
+    println!("Publishing 5 events...\n");
 
     for i in 1..=5 {
-        let user = User {
-            id: DBUuid::new_v4().to_string(),
-            name: format!("User {}", i),
-            email: format!("user{}@example.com", i),
-        };
+        let user_id = DBUuid::new_v4().to_string();
+        let event = QueueEvent::new(
+            format!("user:{}", user_id),
+            UserEvent {
+                user_id,
+                name: format!("User {}", i),
+                email: format!("user{}@example.com", i),
+                action: "created".to_string(),
+            },
+        );
 
-        tito_db
-            .transaction(|tx| {
-                let user_model = user_model.clone();
-                let user_clone = user.clone();
-                async move {
-                    user_model
-                        .build_with_options(
-                            user_clone,
-                            TitoOptions::with_events(TitoOperation::Insert),
-                            &tx,
-                        )
-                        .await?;
-                    Ok::<_, TitoError>(())
-                }
-            })
-            .await?;
-
-        println!("Created: {} ({})", user.name, user.email);
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        queue.publish(event).await?;
+        println!("Published event for User {}", i);
     }
 
     println!("\nStarting worker...\n");
-
-    let queue = Arc::new(TitoQueue {
-        engine: tito_db.clone(),
-    });
 
     let events_processed = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let events_processed_clone = events_processed.clone();
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
-    let handler = move |event: tito::TitoEvent| {
+    let handler = move |event: QueueEvent<UserEvent>| {
         let counter = events_processed_clone.clone();
         Box::pin(async move {
             let count = counter.fetch_add(1, Ordering::SeqCst) + 1;
             println!(
-                "[{}] {} - {}",
+                "[{}] {} - {} ({})",
                 count,
-                event.action,
-                event.entity,
+                event.payload.action,
+                event.payload.name,
+                event.payload.email,
             );
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             Ok::<_, TitoError>(())
@@ -117,7 +84,7 @@ async fn main() -> Result<(), TitoError> {
         WorkerConfig {
             event_type: String::from("user"),
             consumer: String::from("example-consumer"),
-            partition: 0,
+            partition_range: 0..1,
         },
         handler,
         shutdown_rx,

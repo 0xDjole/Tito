@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
 use tito::{
     types::{
-        DBUuid, TitoEngine, TitoEventConfig, TitoIndexBlockType,
+        DBUuid, TitoEngine, TitoIndexBlockType,
         TitoIndexConfig, TitoIndexField, TitoModelTrait,
     },
-    TiKV, TitoError,
+    TiKV, TitoError, TitoModelOptions,
 };
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
@@ -39,10 +39,6 @@ impl TitoModelTrait for Tag {
 
     fn table(&self) -> String {
         "tag".to_string()
-    }
-
-    fn events(&self) -> Vec<TitoEventConfig> {
-        vec![]
     }
 
     fn id(&self) -> String {
@@ -84,10 +80,6 @@ impl TitoModelTrait for Post {
         "post".to_string()
     }
 
-    fn events(&self) -> Vec<TitoEventConfig> {
-        vec![]
-    }
-
     fn id(&self) -> String {
         self.id.clone()
     }
@@ -97,8 +89,8 @@ impl TitoModelTrait for Post {
 async fn main() -> Result<(), TitoError> {
     let tito_db = TiKV::connect(vec!["127.0.0.1:2379"]).await?;
 
-    let post_model = tito_db.clone().model::<Post>();
-    let tag_model = tito_db.clone().model::<Tag>();
+    let post_model = tito_db.clone().model::<Post>(TitoModelOptions::default());
+    let tag_model = tito_db.clone().model::<Tag>(TitoModelOptions::default());
 
     let tech_tag = tito_db
         .transaction(|tx| {
