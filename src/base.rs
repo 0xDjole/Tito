@@ -25,6 +25,63 @@ pub struct TitoModel<E: TitoEngine, T> {
     pub partition_count: u32,
 }
 
+pub struct SetBuilder<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> {
+    model: &'a TitoModel<E, T>,
+    payload: T,
+    changelog: bool,
+    timestamps: bool,
+}
+
+impl<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> SetBuilder<'a, E, T> {
+    pub fn changelog(mut self, changelog: bool) -> Self {
+        self.changelog = changelog;
+        self
+    }
+
+    pub fn timestamps(mut self, timestamps: bool) -> Self {
+        self.timestamps = timestamps;
+        self
+    }
+
+    pub async fn execute(self, tx: &E::Transaction) -> Result<T, TitoError> {
+        self.model.set_internal(self.payload, self.changelog, self.timestamps, tx).await
+    }
+}
+
+pub struct GetBuilder<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> {
+    model: &'a TitoModel<E, T>,
+    id: String,
+    rels: Vec<String>,
+}
+
+impl<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> GetBuilder<'a, E, T> {
+    pub fn relationship(mut self, rel: impl Into<String>) -> Self {
+        self.rels.push(rel.into());
+        self
+    }
+
+    pub async fn execute(self, tx: Option<&E::Transaction>) -> Result<T, TitoError> {
+        self.model.get_internal(&self.id, self.rels, tx).await
+    }
+}
+
+pub struct GetManyBuilder<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> {
+    model: &'a TitoModel<E, T>,
+    ids: Vec<String>,
+    rels: Vec<String>,
+}
+
+impl<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> GetManyBuilder<'a, E, T> {
+    pub fn relationship(mut self, rel: impl Into<String>) -> Self {
+        self.rels.push(rel.into());
+        self
+    }
+
+    pub async fn execute(self, tx: Option<&E::Transaction>) -> Result<Vec<T>, TitoError> {
+        self.model.get_many_internal(self.ids, self.rels, tx).await
+    }
+}
+
 impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     pub fn new(engine: E, options: TitoModelOptions) -> Self {
         Self {
@@ -105,7 +162,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
         Ok(results)
     }
-    async fn get(
+    async fn get_raw(
         &self,
         key: &str,
         tx: &E::Transaction,
@@ -142,24 +199,26 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             .map_err(|_| TitoError::NotFound("Not found".to_string()))
     }
 
-    async fn put<P>(&self, key: String, payload: P, tx: &E::Transaction) -> Result<bool, TitoError>
+    async fn put_with_options<P>(&self, key: String, payload: P, timestamps: bool, tx: &E::Transaction) -> Result<Value, TitoError>
     where
         P: Serialize + Unpin + std::marker::Send + Sync,
     {
         let mut value = serde_json::to_value(&payload)
             .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
 
-        if let serde_json::Value::Object(ref mut map) = value {
-            let now = Utc::now().timestamp();
+        if timestamps {
+            if let serde_json::Value::Object(ref mut map) = value {
+                let now = Utc::now().timestamp();
 
-            let is_new = match tx.get(&key).await {
-                Ok(Some(_)) => false,
-                _ => true,
-            };
-            if is_new {
-                map.insert("created_at".to_string(), serde_json::json!(now));
+                let is_new = match tx.get(&key).await {
+                    Ok(Some(_)) => false,
+                    _ => true,
+                };
+                if is_new {
+                    map.insert("created_at".to_string(), serde_json::json!(now));
+                }
+                map.insert("updated_at".to_string(), serde_json::json!(now));
             }
-            map.insert("updated_at".to_string(), serde_json::json!(now));
         }
 
         let bytes = serde_json::to_vec(&value)
@@ -169,7 +228,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             .await
             .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
 
-        Ok(true)
+        Ok(value)
     }
 
     pub async fn delete(&self, key: String, tx: &E::Transaction) -> Result<bool, TitoError> {
@@ -302,67 +361,50 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         format!("changelog:{}:{:08x}", ts, rand)
     }
 
-    pub async fn build(&self, payload: T, tx: &E::Transaction) -> Result<T, TitoError>
+    pub fn set(&self, payload: T) -> SetBuilder<'_, E, T> {
+        SetBuilder {
+            model: self,
+            payload,
+            changelog: true,
+            timestamps: true,
+        }
+    }
+
+    async fn set_internal(&self, payload: T, changelog: bool, timestamps: bool, tx: &E::Transaction) -> Result<T, TitoError>
     where
         T: serde::de::DeserializeOwned,
     {
+        let raw_id = payload.id();
+        let id = format!("{}:{}", self.get_table(), raw_id);
+
+        self.clear_indexes(&raw_id, tx).await?;
+
         let value = serde_json::to_value(&payload)
             .map_err(|e| TitoError::SerializationFailed(format!("Failed to serialize payload: {}", e)))?;
 
-        let raw_id = payload.id();
+        let stored_value = self.put_with_options(id.clone(), &value, timestamps, tx).await?;
 
-        let id = format!("{}:{}", self.get_table(), raw_id);
-
-        self.put(id.clone(), &value, tx).await?;
-
-        let changelog_key = Self::changelog_key();
-        let changelog_entry = serde_json::json!({
-            "op": "put",
-            "key": id.clone(),
-            "data": value.clone(),
-        });
-        let changelog_bytes = serde_json::to_vec(&changelog_entry)
-            .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
-        tx.put(changelog_key, changelog_bytes)
-            .await
-            .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
-
-        let all_index_data = self.get_index_keys(id.clone(), &payload.clone(), &value)?;
-
-        let mut all_index_keys = vec![];
-
-        for data in all_index_data.clone() {
-            all_index_keys.push(data.0.clone());
-            self.put(data.0.clone(), &data.1, tx).await?;
+        if changelog {
+            let changelog_key = Self::changelog_key();
+            let changelog_entry = serde_json::json!({
+                "op": "put",
+                "key": id.clone(),
+                "data": value.clone(),
+            });
+            let changelog_bytes = serde_json::to_vec(&changelog_entry)
+                .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
+            tx.put(changelog_key, changelog_bytes)
+                .await
+                .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
         }
 
-        let index_json_key = ReverseIndex {
-            value: all_index_keys.clone(),
-        };
-
-        let reverse_key = format!("reverse-index:{}", id);
-
-        self.put(reverse_key.clone(), index_json_key, tx).await?;
-
-        Ok(payload)
-    }
-
-    pub async fn rebuild_index(&self, raw_id: &str, payload: &T, tx: &E::Transaction) -> Result<(), TitoError>
-    where
-        T: serde::de::DeserializeOwned,
-    {
-        let value = serde_json::to_value(payload)
-            .map_err(|e| TitoError::SerializationFailed(format!("Failed to serialize payload: {}", e)))?;
-
-        let id = format!("{}:{}", self.get_table(), raw_id);
-
-        let all_index_data = self.get_index_keys(id.clone(), payload, &value)?;
+        let all_index_data = self.get_index_keys(id.clone(), &payload, &stored_value)?;
 
         let mut all_index_keys = vec![];
 
         for data in all_index_data {
             all_index_keys.push(data.0.clone());
-            self.put(data.0.clone(), &data.1, tx).await?;
+            self.put_with_options(data.0.clone(), &data.1, false, tx).await?;
         }
 
         let index_json_key = ReverseIndex {
@@ -371,12 +413,14 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
         let reverse_key = format!("reverse-index:{}", id);
 
-        self.put(reverse_key, index_json_key, tx).await?;
+        self.put_with_options(reverse_key, index_json_key, false, tx).await?;
 
-        Ok(())
+        serde_json::from_value(stored_value).map_err(|e| {
+            TitoError::DeserializationFailed(format!("Failed to deserialize stored value: {}", e))
+        })
     }
 
-    async fn find_by_id_with_tx(
+    async fn get_one_with_tx(
         &self,
         id: &str,
         rels: Vec<String>,
@@ -387,7 +431,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     {
         let id = format!("{}:{}", self.get_table(), id);
 
-        let value = match self.get(&id, tx).await {
+        let value = match self.get_raw(&id, tx).await {
             Ok(value) => value,
             Err(e) => {
                 return Err(TitoError::NotFound(format!(
@@ -425,7 +469,15 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         }
     }
 
-    pub async fn find_by_id(
+    pub fn get(&self, id: &str) -> GetBuilder<'_, E, T> {
+        GetBuilder {
+            model: self,
+            id: id.to_string(),
+            rels: vec![],
+        }
+    }
+
+    async fn get_internal(
         &self,
         id: &str,
         rels: Vec<String>,
@@ -435,13 +487,13 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         T: serde::de::DeserializeOwned,
     {
         match tx {
-            Some(tx) => self.find_by_id_with_tx(id, rels, tx).await,
+            Some(tx) => self.get_one_with_tx(id, rels, tx).await,
             None => {
                 let id = id.to_string();
                 self.tx(|tx| {
                     let id = id.clone();
                     let rels = rels.clone();
-                    async move { self.find_by_id_with_tx(&id, rels, &tx).await }
+                    async move { self.get_one_with_tx(&id, rels, &tx).await }
                 })
                 .await
             }
@@ -497,7 +549,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         Ok((items, has_more))
     }
 
-    pub async fn find_by_ids_raw(
+    pub async fn get_many_raw(
         &self,
         ids: Vec<String>,
         rels: Vec<String>,
@@ -517,7 +569,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         Ok(items)
     }
 
-    async fn find_by_ids_with_tx(
+    async fn get_many_with_tx(
         &self,
         ids: Vec<String>,
         rels: Vec<String>,
@@ -526,7 +578,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     where
         T: DeserializeOwned,
     {
-        let items = self.find_by_ids_raw(ids, rels, tx).await?;
+        let items = self.get_many_raw(ids, rels, tx).await?;
 
         let mut result = vec![];
 
@@ -539,7 +591,15 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         Ok(result)
     }
 
-    pub async fn find_by_ids(
+    pub fn get_many(&self, ids: Vec<String>) -> GetManyBuilder<'_, E, T> {
+        GetManyBuilder {
+            model: self,
+            ids,
+            rels: vec![],
+        }
+    }
+
+    async fn get_many_internal(
         &self,
         ids: Vec<String>,
         rels: Vec<String>,
@@ -549,12 +609,12 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         T: DeserializeOwned,
     {
         match tx {
-            Some(tx) => self.find_by_ids_with_tx(ids, rels, tx).await,
+            Some(tx) => self.get_many_with_tx(ids, rels, tx).await,
             None => {
                 self.tx(|tx| {
                     let ids = ids.clone();
                     let rels = rels.clone();
-                    async move { self.find_by_ids_with_tx(ids, rels, &tx).await }
+                    async move { self.get_many_with_tx(ids, rels, &tx).await }
                 })
                 .await
             }
@@ -629,19 +689,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         Ok(())
     }
 
-    pub async fn update(&self, payload: T, tx: &E::Transaction) -> Result<bool, TitoError>
-    where
-        T: serde::de::DeserializeOwned,
-    {
-        let raw_id = payload.id();
-
-        self.clear_indexes(&raw_id, tx).await?;
-
-        self.build(payload, tx).await?;
-
-        Ok(true)
-    }
-
     pub fn get_last_id(&self, key: String) -> Option<String> {
         let parts: Vec<&str> = key.split(':').collect();
         parts.last().map(|last| last.to_string())
@@ -665,7 +712,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     /// Each batch runs in its own transaction so we never exceed TiKV limits.
     /// Naturally resumes where it left off — committed batches are permanent,
     /// so re-querying only returns remaining items.
-    pub async fn delete_by_index(
+    pub async fn remove_by_index(
         &self,
         index: &str,
         value: &str,
@@ -696,7 +743,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                         let mut ids = vec![];
                         for item in items.items {
                             let id = item.id();
-                            self.delete_by_id(&id, &tx).await?;
+                            self.remove(&id, &tx).await?;
                             ids.push(id);
                         }
 
@@ -715,7 +762,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         Ok(all_deleted_ids)
     }
 
-    pub async fn delete_by_id(&self, raw_id: &str, tx: &E::Transaction) -> Result<bool, TitoError> {
+    pub async fn remove(&self, raw_id: &str, tx: &E::Transaction) -> Result<bool, TitoError> {
         let id = format!("{}:{}", self.get_table(), raw_id);
         let reverse_index_key = format!("reverse-index:{}", id);
 
@@ -779,39 +826,4 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         .await
     }
 
-    pub async fn find_all(&self) -> Result<TitoPaginated<T>, TitoError> {
-        let table_name = self.get_table();
-        let start_key = format!("{}:", table_name);
-        let end_key = next_string_lexicographically(start_key.clone());
-
-        self.tx(|tx| {
-            let start_key = start_key.clone();
-            let end_key = end_key.clone();
-            async move {
-                let (items, _has_more) = self
-                    .scan(
-                        TitoScanPayload {
-                            start: start_key,
-                            end: Some(end_key),
-                            limit: None,
-                            cursor: None,
-                        },
-                        &tx,
-                    )
-                    .await?;
-
-                let results: Vec<T> = items
-                    .iter()
-                    .map(|(_, value)| {
-                        serde_json::from_value::<T>(value.clone()).map_err(|_| {
-                            TitoError::DeserializationFailed("Failed to deserialize".to_string())
-                        })
-                    })
-                    .collect::<Result<_, _>>()?;
-
-                Ok(TitoPaginated::new(results, None))
-            }
-        })
-        .await
-    }
 }

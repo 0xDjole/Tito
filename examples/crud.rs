@@ -50,13 +50,13 @@ async fn main() -> Result<(), TitoError> {
     let saved_user = tito_db
         .transaction(|tx| {
             let user_model = user_model.clone();
-            async move { user_model.build(user, &tx).await }
+            async move { user_model.set(user).execute(&tx).await }
         })
         .await?;
 
     println!("Created user: {:?}", saved_user);
 
-    let found_user = user_model.find_by_id(&user_id, vec![], None).await?;
+    let found_user = user_model.get(&user_id).execute(None).await?;
     println!("Found user: {:?}", found_user);
 
     let updated_user = User {
@@ -68,7 +68,7 @@ async fn main() -> Result<(), TitoError> {
     tito_db
         .transaction(|tx| {
             let user_model = user_model.clone();
-            async move { user_model.update(updated_user, &tx).await }
+            async move { user_model.set(updated_user).execute(&tx).await }
         })
         .await?;
 
@@ -77,7 +77,7 @@ async fn main() -> Result<(), TitoError> {
     tito_db
         .transaction(|tx| {
             let user_model = user_model.clone();
-            async move { user_model.delete_by_id(&user_id, &tx).await }
+            async move { user_model.remove(&user_id, &tx).await }
         })
         .await?;
 

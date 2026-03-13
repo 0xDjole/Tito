@@ -102,7 +102,7 @@ async fn main() -> Result<(), TitoError> {
             };
             let tag_clone = tag.clone();
             async move {
-                tag_model.build(tag_clone, &tx).await?;
+                tag_model.set(tag_clone).execute(&tx).await?;
                 Ok::<_, TitoError>(tag)
             }
         })
@@ -118,7 +118,7 @@ async fn main() -> Result<(), TitoError> {
             };
             let tag_clone = tag.clone();
             async move {
-                tag_model.build(tag_clone, &tx).await?;
+                tag_model.set(tag_clone).execute(&tx).await?;
                 Ok::<_, TitoError>(tag)
             }
         })
@@ -139,7 +139,7 @@ async fn main() -> Result<(), TitoError> {
             };
             let post_clone = post.clone();
             async move {
-                post_model.build(post_clone, &tx).await?;
+                post_model.set(post_clone).execute(&tx).await?;
                 Ok::<_, TitoError>(post)
             }
         })
@@ -148,7 +148,9 @@ async fn main() -> Result<(), TitoError> {
     println!("Created post: {}", post.title);
 
     let post_with_tags = post_model
-        .find_by_id(&post.id, vec!["tags".to_string()], None)
+        .get(&post.id)
+        .relationship("tags")
+        .execute(None)
         .await?;
 
     println!("Post: {}", post_with_tags.title);
