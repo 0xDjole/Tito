@@ -25,6 +25,66 @@ pub struct TitoModel<E: TitoEngine, T> {
     pub partition_count: u32,
 }
 
+/// Async drain that deletes index matches in batches.
+/// Each call to `.next()` deletes one batch (in its own transaction) and returns the deleted IDs.
+/// Returns `Ok(None)` when no more matches exist.
+pub struct IndexDrain<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> {
+    model: &'a TitoModel<E, T>,
+    index: String,
+    value: String,
+    batch_size: u32,
+    done: bool,
+}
+
+impl<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> IndexDrain<'a, E, T> {
+    pub async fn next(&mut self) -> Result<Option<Vec<String>>, TitoError>
+    where
+        T: DeserializeOwned,
+    {
+        if self.done {
+            return Ok(None);
+        }
+
+        let model = self.model;
+        let index = self.index.clone();
+        let value = self.value.clone();
+        let batch_size = self.batch_size;
+
+        let batch_ids: Vec<String> = model
+            .tx(|tx| {
+                let index = index.clone();
+                let value = value.clone();
+                async move {
+                    let mut query = model.query_by_index(&index);
+                    query.value(value);
+                    query.limit(Some(batch_size));
+                    let items = query.execute(Some(&tx)).await?;
+
+                    if items.items.is_empty() {
+                        return Ok(vec![]);
+                    }
+
+                    let mut ids = vec![];
+                    for item in items.items {
+                        let id = item.id();
+                        model.remove(&id, &tx).await?;
+                        ids.push(id);
+                    }
+
+                    Ok(ids)
+                }
+            })
+            .await?;
+
+        if batch_ids.is_empty() {
+            self.done = true;
+            return Ok(None);
+        }
+
+        Ok(Some(batch_ids))
+    }
+}
+
 pub struct SetBuilder<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> {
     model: &'a TitoModel<E, T>,
     payload: T,
@@ -708,58 +768,19 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         }
     }
 
-    /// Delete all entities matching an index value, in batches.
-    /// Each batch runs in its own transaction so we never exceed TiKV limits.
+    /// Returns an `IndexDrain` that deletes matching entities in batches.
+    /// Each call to `.next()` deletes one batch (in its own transaction) and returns the IDs.
+    /// Returns `None` when no more matches exist.
     /// Naturally resumes where it left off — committed batches are permanent,
     /// so re-querying only returns remaining items.
-    pub async fn remove_by_index(
-        &self,
-        index: &str,
-        value: &str,
-        batch_size: u32,
-    ) -> Result<Vec<String>, TitoError>
-    where
-        T: DeserializeOwned,
-    {
-        let index = index.to_string();
-        let value = value.to_string();
-        let mut all_deleted_ids = vec![];
-
-        loop {
-            let batch_ids: Vec<String> = self
-                .tx(|tx| {
-                    let index = index.clone();
-                    let value = value.clone();
-                    async move {
-                        let mut query = self.query_by_index(&index);
-                        query.value(value);
-                        query.limit(Some(batch_size));
-                        let items = query.execute(Some(&tx)).await?;
-
-                        if items.items.is_empty() {
-                            return Ok(vec![]);
-                        }
-
-                        let mut ids = vec![];
-                        for item in items.items {
-                            let id = item.id();
-                            self.remove(&id, &tx).await?;
-                            ids.push(id);
-                        }
-
-                        Ok(ids)
-                    }
-                })
-                .await?;
-
-            if batch_ids.is_empty() {
-                break;
-            }
-
-            all_deleted_ids.extend(batch_ids);
+    pub fn remove_by_index(&self, index: &str, value: &str, batch_size: u32) -> IndexDrain<'_, E, T> {
+        IndexDrain {
+            model: self,
+            index: index.to_string(),
+            value: value.to_string(),
+            batch_size,
+            done: false,
         }
-
-        Ok(all_deleted_ids)
     }
 
     pub async fn remove(&self, raw_id: &str, tx: &E::Transaction) -> Result<bool, TitoError> {

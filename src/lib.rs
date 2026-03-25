@@ -6,7 +6,7 @@ pub mod types;
 
 mod base;
 
-pub use base::{TitoModel, SetBuilder, GetBuilder, GetManyBuilder};
+pub use base::{TitoModel, SetBuilder, GetBuilder, GetManyBuilder, IndexDrain};
 
 mod utils;
 
