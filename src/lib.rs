@@ -28,7 +28,6 @@ pub use types::{
     PARTITION_DIGITS,
 };
 
-// Re-export queue types at crate root for convenience
 pub use queue::{EventType, Queue, QueueConfig, QueueEvent, TitoQueue, WorkerConfig};
 
 pub mod backup;

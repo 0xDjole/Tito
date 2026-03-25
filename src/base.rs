@@ -25,9 +25,6 @@ pub struct TitoModel<E: TitoEngine, T> {
     pub partition_count: u32,
 }
 
-/// Async drain that deletes index matches in batches.
-/// Each call to `.next()` deletes one batch (in its own transaction) and returns the deleted IDs.
-/// Returns `Ok(None)` when no more matches exist.
 pub struct IndexDrain<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> {
     model: &'a TitoModel<E, T>,
     index: String,
@@ -768,11 +765,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         }
     }
 
-    /// Returns an `IndexDrain` that deletes matching entities in batches.
-    /// Each call to `.next()` deletes one batch (in its own transaction) and returns the IDs.
-    /// Returns `None` when no more matches exist.
-    /// Naturally resumes where it left off — committed batches are permanent,
-    /// so re-querying only returns remaining items.
     pub fn remove_by_index(&self, index: &str, value: &str, batch_size: u32) -> IndexDrain<'_, E, T> {
         IndexDrain {
             model: self,

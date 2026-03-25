@@ -136,8 +136,6 @@ impl TitoEngine for TiKVBackend {
                         active_transactions.remove(&tx_id);
                     }
 
-                    // User function errors: check if the underlying error is retryable
-                    // by looking for our Retryable variant in the Debug output
                     let is_retryable = format!("{:?}", e).contains("Retryable(");
 
                     if is_retryable && retries < MAX_RETRIES {
