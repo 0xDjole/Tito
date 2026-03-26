@@ -25,63 +25,6 @@ pub struct TitoModel<E: TitoEngine, T> {
     pub partition_count: u32,
 }
 
-pub struct IndexDrain<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> {
-    model: &'a TitoModel<E, T>,
-    index: String,
-    value: String,
-    batch_size: u32,
-    done: bool,
-}
-
-impl<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> IndexDrain<'a, E, T> {
-    pub async fn next(&mut self) -> Result<Option<Vec<String>>, TitoError>
-    where
-        T: DeserializeOwned,
-    {
-        if self.done {
-            return Ok(None);
-        }
-
-        let model = self.model;
-        let index = self.index.clone();
-        let value = self.value.clone();
-        let batch_size = self.batch_size;
-
-        let batch_ids: Vec<String> = model
-            .tx(|tx| {
-                let index = index.clone();
-                let value = value.clone();
-                async move {
-                    let mut query = model.query_by_index(&index);
-                    query.value(value);
-                    query.limit(Some(batch_size));
-                    let items = query.execute(Some(&tx)).await?;
-
-                    if items.items.is_empty() {
-                        return Ok(vec![]);
-                    }
-
-                    let mut ids = vec![];
-                    for item in items.items {
-                        let id = item.id();
-                        model.remove(&id, &tx).await?;
-                        ids.push(id);
-                    }
-
-                    Ok(ids)
-                }
-            })
-            .await?;
-
-        if batch_ids.is_empty() {
-            self.done = true;
-            return Ok(None);
-        }
-
-        Ok(Some(batch_ids))
-    }
-}
-
 pub struct SetBuilder<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> {
     model: &'a TitoModel<E, T>,
     payload: T,
@@ -765,14 +708,33 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         }
     }
 
-    pub fn remove_by_index(&self, index: &str, value: &str, batch_size: u32) -> IndexDrain<'_, E, T> {
-        IndexDrain {
-            model: self,
-            index: index.to_string(),
-            value: value.to_string(),
-            batch_size,
-            done: false,
+    pub async fn remove_by_index(
+        &self,
+        index: &str,
+        value: &str,
+        batch_size: u32,
+        tx: &E::Transaction,
+    ) -> Result<Vec<String>, TitoError>
+    where
+        T: DeserializeOwned,
+    {
+        let mut query = self.query_by_index(index);
+        query.value(value.to_string());
+        query.limit(Some(batch_size));
+        let items = query.execute(Some(tx)).await?;
+
+        if items.items.is_empty() {
+            return Ok(vec![]);
         }
+
+        let mut ids = vec![];
+        for item in items.items {
+            let id = item.id();
+            self.remove(&id, tx).await?;
+            ids.push(id);
+        }
+
+        Ok(ids)
     }
 
     pub async fn remove(&self, raw_id: &str, tx: &E::Transaction) -> Result<bool, TitoError> {
