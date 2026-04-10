@@ -1,5 +1,7 @@
 use std::future::Future;
 
+use std::marker::PhantomData;
+
 use crate::{
     error::TitoError,
     query::IndexQueryBuilder,
@@ -20,9 +22,9 @@ use serde_json::Value;
 
 #[derive(Clone)]
 pub struct TitoModel<E: TitoEngine, T> {
-    pub model: T,
     pub engine: E,
     pub partition_count: u32,
+    _phantom: PhantomData<T>,
 }
 
 pub struct SetBuilder<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> {
@@ -85,18 +87,18 @@ impl<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> GetManyBuilder<'a
 impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     pub fn new(engine: E, options: TitoModelOptions) -> Self {
         Self {
-            model: T::default(),
             engine,
             partition_count: options.partition_count,
+            _phantom: PhantomData,
         }
     }
 
     pub fn relationships(&self) -> Vec<TitoRelationshipConfig> {
-        self.model.relationships()
+        T::relationships()
     }
 
     pub fn get_table(&self) -> String {
-        format!("table:{}", self.model.table())
+        format!("table:{}", T::table())
     }
 
     pub fn get_id_from_table(&self, key: String) -> String {

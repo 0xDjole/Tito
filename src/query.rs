@@ -30,13 +30,13 @@ where
 impl<E, T> IndexQueryBuilder<E, T>
 where
     E: TitoEngine,
-    T: Clone
+    T: Default
+        + Clone
         + Serialize
         + DeserializeOwned
         + Unpin
         + std::marker::Send
         + Sync
-        + Default
         + TitoModelTrait,
 {
     pub fn new(model: TitoModel<E, T>, index: String) -> Self {

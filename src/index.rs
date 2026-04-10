@@ -115,12 +115,13 @@ impl<
     where
         T: serde::de::DeserializeOwned,
     {
-        let indexes = self.model.indexes();
+        let schema = T::default();
+        let indexes = schema.indexes();
 
         let index = indexes
             .iter()
             .find(|index_config| index_config.name == payload.index)
-            .ok_or_else(|| TitoError::IndexError(format!("Index '{}' not found on model '{}'", payload.index, self.model.table())))?;
+            .ok_or_else(|| TitoError::IndexError(format!("Index '{}' not found on model '{}'", payload.index, T::table())))?;
 
         let index_fields = index.fields.clone();
 
@@ -184,11 +185,12 @@ impl<
     where
         T: serde::de::DeserializeOwned,
     {
-        let indexes = self.model.indexes();
+        let schema = T::default();
+        let indexes = schema.indexes();
         let index = indexes
             .iter()
             .find(|index_config| index_config.name == payload.index)
-            .ok_or_else(|| TitoError::IndexError(format!("Index '{}' not found on model '{}'", payload.index, self.model.table())))?;
+            .ok_or_else(|| TitoError::IndexError(format!("Index '{}' not found on model '{}'", payload.index, T::table())))?;
 
         let index_fields = index.fields.clone();
 

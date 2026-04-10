@@ -166,12 +166,12 @@ pub struct TitoRelIndexConfig {
 }
 
 pub trait TitoModelTrait {
-    fn relationships(&self) -> Vec<TitoRelationshipConfig> {
+    fn relationships() -> Vec<TitoRelationshipConfig> {
         vec![]
     }
 
     fn indexes(&self) -> Vec<TitoIndexConfig>;
-    fn table(&self) -> String;
+    fn table() -> String;
     fn id(&self) -> String;
 }
 
