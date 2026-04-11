@@ -50,9 +50,8 @@ impl TitoModelOptions {
 #[async_trait]
 pub trait TitoEngine: Send + Sync + Clone {
     type Transaction: TitoTransaction;
-    type Error: std::error::Error + Send + Sync + 'static;
 
-    async fn begin_transaction(&self) -> Result<Self::Transaction, Self::Error>;
+    async fn begin_transaction(&self) -> Result<Self::Transaction, TitoError>;
 
     async fn transaction<F, Fut, T, E>(&self, f: F) -> Result<T, E>
     where
@@ -72,34 +71,32 @@ pub trait TitoEngine: Send + Sync + Clone {
 
 #[async_trait]
 pub trait TitoTransaction: Send + Sync {
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<TitoValue>, Self::Error>;
+    async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<TitoValue>, TitoError>;
     async fn put<K: AsRef<[u8]> + Send, V: AsRef<[u8]> + Send>(
         &self,
         key: K,
         value: V,
-    ) -> Result<(), Self::Error>;
-    async fn delete<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<(), Self::Error>;
+    ) -> Result<(), TitoError>;
+    async fn delete<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<(), TitoError>;
     async fn scan<K: AsRef<[u8]> + Send>(
         &self,
         range: Range<K>,
         limit: u32,
-    ) -> Result<Vec<TitoKvPair>, Self::Error>;
+    ) -> Result<Vec<TitoKvPair>, TitoError>;
 
     async fn scan_reverse<K: AsRef<[u8]> + Send>(
         &self,
         range: Range<K>,
         limit: u32,
-    ) -> Result<Vec<TitoKvPair>, Self::Error>;
+    ) -> Result<Vec<TitoKvPair>, TitoError>;
 
     async fn batch_get<K: AsRef<[u8]> + Send>(
         &self,
         keys: Vec<K>,
-    ) -> Result<Vec<TitoKvPair>, Self::Error>;
+    ) -> Result<Vec<TitoKvPair>, TitoError>;
 
-    async fn commit(self) -> Result<(), Self::Error>;
-    async fn rollback(self) -> Result<(), Self::Error>;
+    async fn commit(self) -> Result<(), TitoError>;
+    async fn rollback(self) -> Result<(), TitoError>;
 }
 
 pub struct TitoLockItem {

@@ -190,10 +190,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         }
     }
     pub async fn get_key(&self, key: &str, tx: &E::Transaction) -> Result<Value, TitoError> {
-        let result = tx
-            .get(key.to_string())
-            .await
-            .map_err(|e| TitoError::NotFound(e.to_string()))?;
+        let result = tx.get(key.to_string()).await?;
 
         let result = result.ok_or(TitoError::NotFound("Not found".to_string()))?;
 
@@ -226,17 +223,13 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         let bytes = serde_json::to_vec(&value)
             .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
 
-        tx.put(key, bytes)
-            .await
-            .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
+        tx.put(key, bytes).await?;
 
         Ok(value)
     }
 
     pub async fn delete(&self, key: String, tx: &E::Transaction) -> Result<bool, TitoError> {
-        tx.delete(key)
-            .await
-            .map_err(|e| TitoError::DeleteFailed(e.to_string()))?;
+        tx.delete(key).await?;
 
         Ok(true)
     }
@@ -291,12 +284,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         key: &str,
         tx: &E::Transaction,
     ) -> Result<ReverseIndex, TitoError> {
-        let result = tx.get(key.to_string()).await.map_err(|e| {
-            TitoError::NotFound(format!(
-                "Failed to get reverse index for key '{}': {}",
-                key, e
-            ))
-        })?;
+        let result = tx.get(key.to_string()).await?;
 
         let result = result.ok_or(TitoError::NotFound(format!(
             "Reverse index not found for key '{}'",
@@ -395,9 +383,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             });
             let changelog_bytes = serde_json::to_vec(&changelog_entry)
                 .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
-            tx.put(changelog_key, changelog_bytes)
-                .await
-                .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
+            tx.put(changelog_key, changelog_bytes).await?;
         }
 
         let all_index_data = self.get_index_keys(id.clone(), &payload, &stored_value)?;
@@ -533,8 +519,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
         let scan_stream = tx
             .scan(start_bound..end_bound, limit_plus_one)
-            .await
-            .map_err(|e| TitoError::NotFound(e.to_string()))?;
+            .await?;
 
         let mut items = self.to_results(scan_stream)?;
 
@@ -655,8 +640,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
         let scan_stream = tx
             .scan_reverse(start_bound..end_bound, limit_plus_one)
-            .await
-            .map_err(|e| TitoError::NotFound(e.to_string()))?;
+            .await?;
 
         let mut items = self.to_results(scan_stream)?;
 
@@ -701,12 +685,9 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         keys: Vec<String>,
         tx: &E::Transaction,
     ) -> Result<Vec<(String, Value)>, TitoError> {
-        match tx.batch_get(keys.clone()).await {
+        match tx.batch_get(keys).await {
             Ok(res) => self.to_results(res.into_iter()),
-            Err(e) => Err(TitoError::NotFound(format!(
-                "Failed to batch get keys {:?}: {}",
-                keys, e
-            ))),
+            Err(e) => Err(e),
         }
     }
 
@@ -755,9 +736,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         });
         let changelog_bytes = serde_json::to_vec(&changelog_entry)
             .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
-        tx.put(changelog_key, changelog_bytes)
-            .await
-            .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
+        tx.put(changelog_key, changelog_bytes).await?;
 
         let mut keys = reverse_index.value;
 
