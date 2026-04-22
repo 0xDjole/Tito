@@ -21,8 +21,6 @@ where
     index: String,
     values: Vec<String>,
     rels: Vec<String>,
-    end: Option<String>,
-    exact_match: bool,
     limit: Option<u32>,
     cursor: Option<String>,
 }
@@ -45,8 +43,6 @@ where
             index,
             values: Vec::new(),
             rels: Vec::new(),
-            end: None,
-            exact_match: true,
             limit: None,
             cursor: None,
         }
@@ -54,11 +50,6 @@ where
 
     pub fn value(&mut self, value: impl Into<String>) -> &mut Self {
         self.values.push(value.into());
-        self
-    }
-
-    pub fn exact_match(&mut self, value: bool) -> &mut Self {
-        self.exact_match = value;
         self
     }
 
@@ -77,11 +68,6 @@ where
         self
     }
 
-    pub fn end(&mut self, end: Option<impl Into<String>>) -> &mut Self {
-        self.end = end.map(|end| end.into());
-        self
-    }
-
     pub async fn execute(
         &mut self,
         tx: Option<&E::Transaction>,
@@ -90,8 +76,6 @@ where
             index: self.index.clone(),
             values: self.values.clone(),
             rels: self.rels.clone(),
-            end: self.end.clone(),
-            exact_match: self.exact_match,
             limit: self.limit,
             cursor: self.cursor.clone(),
         };
@@ -107,8 +91,6 @@ where
             index: self.index.clone(),
             values: self.values.clone(),
             rels: self.rels.clone(),
-            end: self.end.clone(),
-            exact_match: self.exact_match,
             limit: self.limit,
             cursor: self.cursor.clone(),
         };

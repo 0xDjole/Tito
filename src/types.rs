@@ -218,8 +218,6 @@ pub struct TitoFindByIndexPayload {
     pub index: String,
     pub values: Vec<String>,
     pub rels: Vec<String>,
-    pub end: Option<String>,
-    pub exact_match: bool,
     pub limit: Option<u32>,
     pub cursor: Option<String>,
 }

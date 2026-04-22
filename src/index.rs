@@ -142,27 +142,13 @@ impl<
 
         let key_from_value = key_from_values.join(":");
 
-        let mut id = format!("index:{}:{}", payload.index, key_from_value);
-
-        if payload.exact_match {
-            id.push_str(":");
-        }
-
-        let end = if let Some(end) = payload.end {
-            if let Some(last_colon_index) = id.rfind(':') {
-                Some(format!("{}:{}", &id[..last_colon_index], end))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let id = format!("index:{}:{}:", payload.index, key_from_value);
 
         let (items, has_more) = self
             .scan(
                 TitoScanPayload {
                     start: id,
-                    end,
+                    end: None,
                     limit: payload.limit,
                     cursor: payload.cursor.clone(),
                 },
@@ -211,13 +197,13 @@ impl<
 
         let key_from_value = key_from_values.join(":");
 
-        let id = format!("index:{}:{}", payload.index, key_from_value);
+        let id = format!("index:{}:{}:", payload.index, key_from_value);
 
         let (items, has_more) = self
             .scan_reverse(
                 TitoScanPayload {
                     start: id,
-                    end: payload.end.clone(),
+                    end: None,
                     limit: payload.limit,
                     cursor: payload.cursor.clone(),
                 },
@@ -241,18 +227,7 @@ impl<
         T: serde::de::DeserializeOwned,
     {
         let (items, has_more) = self
-            .find_by_index_raw(
-                TitoFindByIndexPayload {
-                    index: payload.index,
-                    values: payload.values,
-                    rels: payload.rels,
-                    end: payload.end,
-                    exact_match: payload.exact_match,
-                    limit: payload.limit,
-                    cursor: payload.cursor,
-                },
-                tx,
-            )
+            .find_by_index_raw(payload, tx)
             .await?;
 
         let results = self.to_paginated_items(items, has_more)?;
@@ -329,8 +304,6 @@ impl<
                     index: payload.index.clone(),
                     values: payload.values.clone(),
                     rels: payload.rels.clone(),
-                    end: None,
-                    exact_match: true,
                     limit: Some(1),
                     cursor: None,
                 },
