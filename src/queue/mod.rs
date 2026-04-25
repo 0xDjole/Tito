@@ -117,6 +117,57 @@ impl<E: TitoEngine> Queue<E> {
             .await
     }
 
+    pub async fn clear_by_key_in_tx<T: EventType + DeserializeOwned>(
+        &self,
+        key: &str,
+        tx: &E::Transaction,
+    ) -> Result<u32, TitoError> {
+        let event_type = T::event_type_name();
+        let mut deleted = 0u32;
+
+        for partition in 0..self.config.partition_count {
+            let start = format!(
+                "event:{}:{:0pwidth$}:0",
+                event_type, partition, pwidth = PARTITION_DIGITS,
+            );
+            let end = format!(
+                "event:{}:{:0pwidth$}:9999999999",
+                event_type, partition, pwidth = PARTITION_DIGITS,
+            );
+
+            let events = tx
+                .scan(start.as_bytes()..end.as_bytes(), 1000)
+                .await
+                .map_err(|e| TitoError::QueryFailed(format!("Scan failed: {}", e)))?;
+
+            for (storage_key, value) in events {
+                if let Ok(event) = serde_json::from_slice::<QueueEvent<T>>(&value) {
+                    if event.key == key {
+                        let key_str = String::from_utf8_lossy(&storage_key);
+                        tx.delete(key_str.as_bytes())
+                            .await
+                            .map_err(|e| TitoError::DeleteFailed(format!("Delete event: {}", e)))?;
+                        deleted += 1;
+                    }
+                }
+            }
+        }
+        Ok(deleted)
+    }
+
+    pub async fn clear_by_key<T: EventType + DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> Result<u32, TitoError> {
+        let key_owned = key.to_string();
+        self.engine
+            .transaction(|tx| {
+                let key_owned = key_owned.clone();
+                async move { self.clear_by_key_in_tx::<T>(&key_owned, &tx).await }
+            })
+            .await
+    }
+
     pub async fn ack(&self, key: &str) -> Result<(), TitoError> {
         self.engine
             .transaction(|tx| {
