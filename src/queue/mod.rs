@@ -1,8 +1,6 @@
-mod traits;
 mod types;
 mod worker;
 
-pub use traits::EventType;
 pub use types::{QueueConfig, QueueEvent};
 pub use worker::{run_worker, WorkerConfig};
 
@@ -27,20 +25,17 @@ impl<E: TitoEngine> Queue<E> {
         Self { engine, config }
     }
 
-    pub async fn publish_in_tx<T: EventType + Serialize>(
+    pub async fn publish_in_tx<T: Serialize + Clone + Send + Sync + 'static>(
         &self,
         event: QueueEvent<T>,
         tx: &E::Transaction,
     ) -> Result<(), TitoError> {
-        let event_type = T::event_type_name();
-
         let mut hasher = DefaultHasher::new();
         event.key.hash(&mut hasher);
         let partition = (hasher.finish() % self.config.partition_count as u64) as u32;
 
         let key = format!(
-            "event:{}:{:0pwidth$}:{}:{}",
-            event_type,
+            "q:{:0pwidth$}:{}:{}",
             partition,
             event.scheduled_at,
             event.id,
@@ -57,7 +52,7 @@ impl<E: TitoEngine> Queue<E> {
         Ok(())
     }
 
-    pub async fn publish<T: EventType + Serialize>(
+    pub async fn publish<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static>(
         &self,
         event: QueueEvent<T>,
     ) -> Result<(), TitoError> {
@@ -69,70 +64,61 @@ impl<E: TitoEngine> Queue<E> {
             .await
     }
 
-    pub async fn pull<T: EventType + DeserializeOwned>(
+    pub async fn pull<T: DeserializeOwned + Clone + Send + Sync + 'static>(
         &self,
-        event_type: &str,
         partition: u32,
         limit: u32,
     ) -> Result<Vec<(String, QueueEvent<T>)>, TitoError> {
         self.engine
-            .transaction(|tx| {
-                let event_type = event_type.to_string();
-                async move {
-                    let now = Utc::now().timestamp();
+            .transaction(|tx| async move {
+                let now = Utc::now().timestamp();
 
-                    let event_start = format!(
-                        "event:{}:{:0pwidth$}:{}",
-                        event_type,
-                        partition,
-                        0,
-                        pwidth = PARTITION_DIGITS,
-                    );
-                    let event_end = format!(
-                        "event:{}:{:0pwidth$}:{}",
-                        event_type,
-                        partition,
-                        now + 1,
-                        pwidth = PARTITION_DIGITS,
-                    );
+                let start = format!(
+                    "q:{:0pwidth$}:{}",
+                    partition, 0,
+                    pwidth = PARTITION_DIGITS,
+                );
+                let end = format!(
+                    "q:{:0pwidth$}:{}",
+                    partition, now + 1,
+                    pwidth = PARTITION_DIGITS,
+                );
 
-                    let events = tx
-                        .scan(event_start.as_bytes()..event_end.as_bytes(), limit)
-                        .await
-                        .map_err(|e| TitoError::QueryFailed(format!("Scan failed: {}", e)))?;
+                let events = tx
+                    .scan(start.as_bytes()..end.as_bytes(), limit)
+                    .await
+                    .map_err(|e| TitoError::QueryFailed(format!("Scan failed: {}", e)))?;
 
-                    let mut jobs: Vec<(String, QueueEvent<T>)> = Vec::new();
-                    for (storage_key, value) in events.into_iter() {
-                        if let Ok(event) = serde_json::from_slice::<QueueEvent<T>>(&value) {
-                            if event.scheduled_at <= now {
-                                let key_str = String::from_utf8_lossy(&storage_key).into_owned();
-                                jobs.push((key_str, event));
-                            }
+                let mut jobs: Vec<(String, QueueEvent<T>)> = Vec::new();
+                for (storage_key, value) in events.into_iter() {
+                    if let Ok(event) = serde_json::from_slice::<QueueEvent<T>>(&value) {
+                        if event.scheduled_at <= now {
+                            let key_str = String::from_utf8_lossy(&storage_key).into_owned();
+                            jobs.push((key_str, event));
                         }
                     }
-
-                    Ok::<_, TitoError>(jobs)
                 }
+
+                Ok::<_, TitoError>(jobs)
             })
             .await
     }
 
-    pub async fn clear_by_key_in_tx<T: EventType + DeserializeOwned>(
+    pub async fn clear_by_key_in_tx<T: DeserializeOwned + Clone + Send + Sync + 'static>(
         &self,
         key: &str,
         tx: &E::Transaction,
     ) -> Result<u32, TitoError> {
-        let event_type = T::event_type_name();
         let mut deleted = 0u32;
 
         for partition in 0..self.config.partition_count {
             let start = format!(
-                "event:{}:{:0pwidth$}:0",
-                event_type, partition, pwidth = PARTITION_DIGITS,
+                "q:{:0pwidth$}:0",
+                partition, pwidth = PARTITION_DIGITS,
             );
             let end = format!(
-                "event:{}:{:0pwidth$}:9999999999",
-                event_type, partition, pwidth = PARTITION_DIGITS,
+                "q:{:0pwidth$}:9999999999",
+                partition, pwidth = PARTITION_DIGITS,
             );
 
             let events = tx
@@ -155,7 +141,7 @@ impl<E: TitoEngine> Queue<E> {
         Ok(deleted)
     }
 
-    pub async fn clear_by_key<T: EventType + DeserializeOwned>(
+    pub async fn clear_by_key<T: DeserializeOwned + Clone + Send + Sync + 'static>(
         &self,
         key: &str,
     ) -> Result<u32, TitoError> {
@@ -182,7 +168,7 @@ impl<E: TitoEngine> Queue<E> {
             .await
     }
 
-    pub async fn reschedule<T: EventType + Serialize>(
+    pub async fn reschedule<T: Serialize + Clone + Send + Sync + 'static>(
         &self,
         mut event: QueueEvent<T>,
         storage_key: &str,
@@ -193,7 +179,6 @@ impl<E: TitoEngine> Queue<E> {
         self.engine
             .transaction(|tx| {
                 let old_key = old_key.clone();
-                let event_type = T::event_type_name();
 
                 async move {
                     tx.delete(old_key.as_bytes())
@@ -207,8 +192,7 @@ impl<E: TitoEngine> Queue<E> {
                     event.scheduled_at = new_scheduled_at;
 
                     let new_key = format!(
-                        "event:{}:{:0pwidth$}:{}:{}",
-                        event_type,
+                        "q:{:0pwidth$}:{}:{}",
                         partition,
                         event.scheduled_at,
                         event.id,
@@ -232,20 +216,17 @@ impl<E: TitoEngine> Queue<E> {
         Ok(())
     }
 
-    pub async fn move_to_dlq<T: EventType + Serialize>(
+    pub async fn move_to_dlq<T: Serialize + Clone + Send + Sync + 'static>(
         &self,
         event: QueueEvent<T>,
         storage_key: &str,
     ) -> Result<(), TitoError> {
-        let event_type = T::event_type_name();
-
         let mut hasher = DefaultHasher::new();
         event.key.hash(&mut hasher);
         let partition = (hasher.finish() % self.config.partition_count as u64) as u32;
 
         let dlq_key = format!(
-            "dlq:{}:{:0pwidth$}:{}:{}",
-            event_type,
+            "dlq:{:0pwidth$}:{}:{}",
             partition,
             event.created_at,
             event.id,

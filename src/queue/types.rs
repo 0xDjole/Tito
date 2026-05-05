@@ -1,6 +1,4 @@
-use serde::{Deserialize, Serialize};
-
-use super::traits::EventType;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -15,7 +13,7 @@ pub struct QueueEvent<T> {
     pub error: Option<String>,
 }
 
-impl<T: EventType> QueueEvent<T> {
+impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent<T> {
     pub fn new(key: impl Into<String>, payload: T) -> Self {
         let now = chrono::Utc::now().timestamp();
         Self {
@@ -58,14 +56,8 @@ pub struct QueueConfig {
     pub partition_count: u32,
 }
 
-impl Default for QueueConfig {
-    fn default() -> Self {
-        Self { partition_count: 1 }
-    }
-}
-
 impl QueueConfig {
-    pub fn with_partitions(partition_count: u32) -> Self {
+    pub fn new(partition_count: u32) -> Self {
         Self { partition_count }
     }
 }

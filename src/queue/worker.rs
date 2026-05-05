@@ -8,13 +8,12 @@ use serde::Serialize;
 use tokio::sync::broadcast;
 use tokio::time::sleep;
 
-use super::{EventType, Queue, QueueEvent};
+use super::{Queue, QueueEvent};
 use crate::types::TitoEngine;
 use crate::TitoError;
 
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
-    pub event_type: String,
     pub consumer: String,
     pub partition_range: std::ops::Range<u32>,
 }
@@ -27,7 +26,7 @@ pub async fn run_worker<E, T, H>(
 ) -> tokio::task::JoinHandle<()>
 where
     E: TitoEngine + 'static,
-    T: EventType + Serialize + DeserializeOwned,
+    T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<(), TitoError>> + Clone + Send + Sync + 'static,
 {
     tokio::spawn(async move {
@@ -36,7 +35,6 @@ where
         for partition in config.partition_range.clone() {
             let q = queue.clone();
             let h = handler.clone();
-            let event_type = config.event_type.clone();
             let mut rx = shutdown.resubscribe();
 
             handles.push(tokio::spawn(async move {
@@ -44,7 +42,7 @@ where
                     tokio::select! {
                         _ = rx.recv() => break,
                         _ = async {
-                            match q.pull::<T>(&event_type, partition, 50).await {
+                            match q.pull::<T>(partition, 50).await {
                                 Ok(jobs) if jobs.is_empty() => {
                                     sleep(Duration::from_millis(1000)).await;
                                 }

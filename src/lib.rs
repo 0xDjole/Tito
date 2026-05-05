@@ -28,7 +28,7 @@ pub use types::{
     PARTITION_DIGITS,
 };
 
-pub use queue::{EventType, Queue, QueueConfig, QueueEvent, TitoQueue, WorkerConfig};
+pub use queue::{Queue, QueueConfig, QueueEvent, TitoQueue, WorkerConfig};
 
 pub mod backup;
 
