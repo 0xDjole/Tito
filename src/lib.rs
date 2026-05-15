@@ -18,6 +18,9 @@ mod key_encoder;
 
 mod error;
 
+mod event;
+pub use event::TitoEvent;
+
 pub mod index;
 
 pub mod relationship;

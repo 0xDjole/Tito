@@ -4,9 +4,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tito::{
-    queue::{run_worker, EventType, QueueConfig, QueueEvent, TitoQueue},
+    queue::{run_worker, QueueConfig, QueueEvent},
     types::DBUuid,
-    TiKV, TitoError, WorkerConfig,
+    TiKV, TitoError, TitoQueue, WorkerConfig,
 };
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
@@ -17,16 +17,6 @@ struct UserEvent {
     action: String,
 }
 
-impl EventType for UserEvent {
-    fn event_type_name() -> &'static str {
-        "user"
-    }
-
-    fn variant_name(&self) -> &'static str {
-        "user_created"
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<(), TitoError> {
     println!("Testing FIFO Queue\n");
@@ -35,7 +25,7 @@ async fn main() -> Result<(), TitoError> {
 
     let queue = Arc::new(TitoQueue::new(
         tito_db.clone(),
-        QueueConfig::with_partitions(1),
+        QueueConfig::new(1),
     ));
 
     println!("Publishing 5 events...\n");
@@ -82,7 +72,6 @@ async fn main() -> Result<(), TitoError> {
     let worker_handle = run_worker(
         queue.clone(),
         WorkerConfig {
-            event_type: String::from("user"),
             consumer: String::from("example-consumer"),
             partition_range: 0..1,
         },

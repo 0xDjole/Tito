@@ -26,7 +26,7 @@ impl TitoModelTrait for User {
         }]
     }
 
-    fn table(&self) -> String {
+    fn table() -> String {
         "users".to_string()
     }
 

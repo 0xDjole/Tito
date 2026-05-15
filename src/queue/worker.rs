@@ -50,7 +50,7 @@ where
                                     for (storage_key, event) in jobs {
                                         match h(event.clone()).await {
                                             Ok(_) => {
-                                                let _ = q.ack(&storage_key).await;
+                                                let _ = q.ack(&storage_key, &event.id).await;
                                             }
                                             Err(err) => {
                                                 let mut retry_event = event.clone();

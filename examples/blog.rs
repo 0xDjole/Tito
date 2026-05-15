@@ -37,7 +37,7 @@ impl TitoModelTrait for Tag {
         }]
     }
 
-    fn table(&self) -> String {
+    fn table() -> String {
         "tag".to_string()
     }
 
@@ -47,7 +47,7 @@ impl TitoModelTrait for Tag {
 }
 
 impl TitoModelTrait for Post {
-    fn relationships(&self) -> Vec<tito::types::TitoRelationshipConfig> {
+    fn relationships() -> Vec<tito::types::TitoEmbeddedRelationshipConfig> {
         vec![tito::types::TitoRelationshipConfig {
             source_field_name: "tag_ids".to_string(),
             destination_field_name: "tags".to_string(),
@@ -76,7 +76,7 @@ impl TitoModelTrait for Post {
         ]
     }
 
-    fn table(&self) -> String {
+    fn table() -> String {
         "post".to_string()
     }
 

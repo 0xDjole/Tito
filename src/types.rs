@@ -170,6 +170,10 @@ pub trait TitoModelTrait {
     fn indexes(&self) -> Vec<TitoIndexConfig>;
     fn table() -> String;
     fn id(&self) -> String;
+
+    fn key_prefix() -> String {
+        format!("table:{}", Self::table())
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]

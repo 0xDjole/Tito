@@ -98,7 +98,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     }
 
     pub fn get_table(&self) -> String {
-        format!("table:{}", T::table())
+        T::key_prefix()
     }
 
     pub fn get_id_from_table(&self, key: String) -> String {

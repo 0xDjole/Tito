@@ -11,6 +11,8 @@ use chrono::Utc;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+use crate::base::TitoModel;
+use crate::event::TitoEvent;
 use crate::types::{TitoEngine, TitoTransaction, PARTITION_DIGITS};
 use crate::TitoError;
 
@@ -18,11 +20,21 @@ use crate::TitoError;
 pub struct Queue<E: TitoEngine> {
     pub engine: E,
     pub config: QueueConfig,
+    event_model: Option<TitoModel<E, TitoEvent>>,
 }
 
 impl<E: TitoEngine> Queue<E> {
     pub fn new(engine: E, config: QueueConfig) -> Self {
-        Self { engine, config }
+        Self {
+            engine,
+            config,
+            event_model: None,
+        }
+    }
+
+    pub fn with_event_model(mut self, model: TitoModel<E, TitoEvent>) -> Self {
+        self.event_model = Some(model);
+        self
     }
 
     pub async fn publish_in_tx<T: Serialize + Clone + Send + Sync + 'static>(
@@ -35,7 +47,7 @@ impl<E: TitoEngine> Queue<E> {
         let partition = (hasher.finish() % self.config.partition_count as u64) as u32;
 
         let key = format!(
-            "q:{:0pwidth$}:{}:{}",
+            "queue:{:0pwidth$}:{}:{}",
             partition,
             event.scheduled_at,
             event.id,
@@ -74,12 +86,12 @@ impl<E: TitoEngine> Queue<E> {
                 let now = Utc::now().timestamp();
 
                 let start = format!(
-                    "q:{:0pwidth$}:{}",
+                    "queue:{:0pwidth$}:{}",
                     partition, 0,
                     pwidth = PARTITION_DIGITS,
                 );
                 let end = format!(
-                    "q:{:0pwidth$}:{}",
+                    "queue:{:0pwidth$}:{}",
                     partition, now + 1,
                     pwidth = PARTITION_DIGITS,
                 );
@@ -113,11 +125,11 @@ impl<E: TitoEngine> Queue<E> {
 
         for partition in 0..self.config.partition_count {
             let start = format!(
-                "q:{:0pwidth$}:0",
+                "queue:{:0pwidth$}:0",
                 partition, pwidth = PARTITION_DIGITS,
             );
             let end = format!(
-                "q:{:0pwidth$}:9999999999",
+                "queue:{:0pwidth$}:9999999999",
                 partition, pwidth = PARTITION_DIGITS,
             );
 
@@ -154,14 +166,29 @@ impl<E: TitoEngine> Queue<E> {
             .await
     }
 
-    pub async fn ack(&self, key: &str) -> Result<(), TitoError> {
+    pub async fn ack(&self, key: &str, event_id: &str) -> Result<(), TitoError> {
         self.engine
             .transaction(|tx| {
                 let key = key.to_string();
+                let event_id = event_id.to_string();
                 async move {
                     tx.delete(key.as_bytes())
                         .await
                         .map_err(|e| TitoError::DeleteFailed(format!("Delete event: {}", e)))?;
+
+                    if let Some(model) = &self.event_model {
+                        if let Ok(mut tito_event) = model.get(&event_id).execute(Some(&tx)).await {
+                            tito_event.status = "processed".to_string();
+                            tito_event.processed_at = Utc::now().timestamp_millis();
+                            let _ = model
+                                .set(tito_event)
+                                .changelog(false)
+                                .timestamps(false)
+                                .execute(&tx)
+                                .await;
+                        }
+                    }
+
                     Ok::<_, TitoError>(())
                 }
             })
@@ -175,10 +202,12 @@ impl<E: TitoEngine> Queue<E> {
         new_scheduled_at: i64,
     ) -> Result<(), TitoError> {
         let old_key = storage_key.to_string();
+        let event_id = event.id.clone();
 
         self.engine
             .transaction(|tx| {
                 let old_key = old_key.clone();
+                let event_id = event_id.clone();
 
                 async move {
                     tx.delete(old_key.as_bytes())
@@ -192,7 +221,7 @@ impl<E: TitoEngine> Queue<E> {
                     event.scheduled_at = new_scheduled_at;
 
                     let new_key = format!(
-                        "q:{:0pwidth$}:{}:{}",
+                        "queue:{:0pwidth$}:{}:{}",
                         partition,
                         event.scheduled_at,
                         event.id,
@@ -205,6 +234,19 @@ impl<E: TitoEngine> Queue<E> {
                     tx.put(&new_key, bytes)
                         .await
                         .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
+
+                    if let Some(model) = &self.event_model {
+                        if let Ok(mut tito_event) = model.get(&event_id).execute(Some(&tx)).await {
+                            tito_event.error = event.error.clone();
+                            tito_event.retry_count = event.retry_count;
+                            let _ = model
+                                .set(tito_event)
+                                .changelog(false)
+                                .timestamps(false)
+                                .execute(&tx)
+                                .await;
+                        }
+                    }
 
                     Ok::<_, TitoError>(())
                 }
@@ -233,11 +275,14 @@ impl<E: TitoEngine> Queue<E> {
             pwidth = PARTITION_DIGITS,
         );
 
+        let event_id = event.id.clone();
+
         self.engine
             .transaction(|tx| {
                 let old_key = storage_key.to_string();
                 let dlq_key = dlq_key.clone();
                 let event = event.clone();
+                let event_id = event_id.clone();
                 async move {
                     tx.delete(old_key.as_bytes())
                         .await
@@ -248,6 +293,20 @@ impl<E: TitoEngine> Queue<E> {
                     tx.put(&dlq_key, bytes)
                         .await
                         .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
+
+                    if let Some(model) = &self.event_model {
+                        if let Ok(mut tito_event) = model.get(&event_id).execute(Some(&tx)).await {
+                            tito_event.status = "dlq".to_string();
+                            tito_event.error = event.error.clone();
+                            tito_event.retry_count = event.retry_count;
+                            let _ = model
+                                .set(tito_event)
+                                .changelog(false)
+                                .timestamps(false)
+                                .execute(&tx)
+                                .await;
+                        }
+                    }
 
                     Ok::<_, TitoError>(())
                 }
