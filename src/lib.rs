@@ -34,5 +34,9 @@ pub use types::{
 pub use queue::{Queue, QueueConfig, QueueEvent, TitoQueue, WorkerConfig};
 
 pub mod backup;
+pub use backup::{
+    BackupConfig, BackupResult, BackupStorage, ChangelogEntry, EventChangelogEntry, RestoreResult,
+    TitoBackupService,
+};
 
 pub use utils::next_string_lexicographically;

@@ -348,7 +348,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         let now = chrono::Utc::now();
         let ts = now.timestamp_millis();
         let rand: u32 = rand::thread_rng().gen();
-        format!("changelog:{}:{:08x}", ts, rand)
+        format!("state_changelog:{}:{:08x}", ts, rand)
     }
 
     pub fn set(&self, payload: T) -> SetBuilder<'_, E, T> {

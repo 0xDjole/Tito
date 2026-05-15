@@ -8,11 +8,10 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use chrono::Utc;
+use rand::Rng;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::base::TitoModel;
-use crate::event::TitoEvent;
 use crate::types::{TitoEngine, TitoTransaction, PARTITION_DIGITS};
 use crate::TitoError;
 
@@ -20,21 +19,18 @@ use crate::TitoError;
 pub struct Queue<E: TitoEngine> {
     pub engine: E,
     pub config: QueueConfig,
-    event_model: Option<TitoModel<E, TitoEvent>>,
 }
 
 impl<E: TitoEngine> Queue<E> {
     pub fn new(engine: E, config: QueueConfig) -> Self {
-        Self {
-            engine,
-            config,
-            event_model: None,
-        }
+        Self { engine, config }
     }
 
-    pub fn with_event_model(mut self, model: TitoModel<E, TitoEvent>) -> Self {
-        self.event_model = Some(model);
-        self
+    fn event_changelog_key() -> String {
+        let now = Utc::now();
+        let ts = now.timestamp_millis();
+        let rand: u32 = rand::thread_rng().gen();
+        format!("event_changelog:{}:{:08x}", ts, rand)
     }
 
     pub async fn publish_in_tx<T: Serialize + Clone + Send + Sync + 'static>(
@@ -54,10 +50,29 @@ impl<E: TitoEngine> Queue<E> {
             pwidth = PARTITION_DIGITS,
         );
 
-        let bytes = serde_json::to_vec(&event)
+        let event_value = serde_json::to_value(&event)
+            .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
+
+        let bytes = serde_json::to_vec(&event_value)
             .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
 
         tx.put(&key, bytes)
+            .await
+            .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
+
+        let changelog_key = Self::event_changelog_key();
+        let changelog_entry = serde_json::json!({
+            "event_id": event.id,
+            "event_key": event.key,
+            "created_at": event.created_at,
+            "scheduled_at": event.scheduled_at,
+            "max_retries": event.max_retries,
+            "data": event_value,
+        });
+        let changelog_bytes = serde_json::to_vec(&changelog_entry)
+            .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
+
+        tx.put(changelog_key, changelog_bytes)
             .await
             .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
 
@@ -166,29 +181,14 @@ impl<E: TitoEngine> Queue<E> {
             .await
     }
 
-    pub async fn ack(&self, key: &str, event_id: &str) -> Result<(), TitoError> {
+    pub async fn ack(&self, key: &str) -> Result<(), TitoError> {
         self.engine
             .transaction(|tx| {
                 let key = key.to_string();
-                let event_id = event_id.to_string();
                 async move {
                     tx.delete(key.as_bytes())
                         .await
                         .map_err(|e| TitoError::DeleteFailed(format!("Delete event: {}", e)))?;
-
-                    if let Some(model) = &self.event_model {
-                        if let Ok(mut tito_event) = model.get(&event_id).execute(Some(&tx)).await {
-                            tito_event.status = "processed".to_string();
-                            tito_event.processed_at = Utc::now().timestamp_millis();
-                            let _ = model
-                                .set(tito_event)
-                                .changelog(false)
-                                .timestamps(false)
-                                .execute(&tx)
-                                .await;
-                        }
-                    }
-
                     Ok::<_, TitoError>(())
                 }
             })
@@ -202,12 +202,10 @@ impl<E: TitoEngine> Queue<E> {
         new_scheduled_at: i64,
     ) -> Result<(), TitoError> {
         let old_key = storage_key.to_string();
-        let event_id = event.id.clone();
 
         self.engine
             .transaction(|tx| {
                 let old_key = old_key.clone();
-                let event_id = event_id.clone();
 
                 async move {
                     tx.delete(old_key.as_bytes())
@@ -234,19 +232,6 @@ impl<E: TitoEngine> Queue<E> {
                     tx.put(&new_key, bytes)
                         .await
                         .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
-
-                    if let Some(model) = &self.event_model {
-                        if let Ok(mut tito_event) = model.get(&event_id).execute(Some(&tx)).await {
-                            tito_event.error = event.error.clone();
-                            tito_event.retry_count = event.retry_count;
-                            let _ = model
-                                .set(tito_event)
-                                .changelog(false)
-                                .timestamps(false)
-                                .execute(&tx)
-                                .await;
-                        }
-                    }
 
                     Ok::<_, TitoError>(())
                 }
@@ -275,14 +260,11 @@ impl<E: TitoEngine> Queue<E> {
             pwidth = PARTITION_DIGITS,
         );
 
-        let event_id = event.id.clone();
-
         self.engine
             .transaction(|tx| {
                 let old_key = storage_key.to_string();
                 let dlq_key = dlq_key.clone();
                 let event = event.clone();
-                let event_id = event_id.clone();
                 async move {
                     tx.delete(old_key.as_bytes())
                         .await
@@ -293,20 +275,6 @@ impl<E: TitoEngine> Queue<E> {
                     tx.put(&dlq_key, bytes)
                         .await
                         .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
-
-                    if let Some(model) = &self.event_model {
-                        if let Ok(mut tito_event) = model.get(&event_id).execute(Some(&tx)).await {
-                            tito_event.status = "dlq".to_string();
-                            tito_event.error = event.error.clone();
-                            tito_event.retry_count = event.retry_count;
-                            let _ = model
-                                .set(tito_event)
-                                .changelog(false)
-                                .timestamps(false)
-                                .execute(&tx)
-                                .await;
-                        }
-                    }
 
                     Ok::<_, TitoError>(())
                 }

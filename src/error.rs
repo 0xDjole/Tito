@@ -50,6 +50,9 @@ pub enum TitoError {
     #[error("Timeout: {0}")]
     Timeout(String),
 
+    #[error("Backup error: {0}")]
+    BackupFailed(String),
+
     #[error("Unexpected error: {0}")]
     Internal(String),
 
