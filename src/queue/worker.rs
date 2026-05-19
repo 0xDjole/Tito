@@ -27,7 +27,11 @@ pub async fn run_worker<E, T, H>(
 where
     E: TitoEngine + 'static,
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<(), TitoError>> + Clone + Send + Sync + 'static,
+    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<(), TitoError>>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
 {
     tokio::spawn(async move {
         let mut handles = Vec::new();
@@ -55,14 +59,14 @@ where
                                             Err(err) => {
                                                 let mut retry_event = event.clone();
                                                 retry_event.retry_count += 1;
-                                                retry_event.error = Some(err.to_string());
+                                                retry_event.errors.push(err.to_string());
 
                                                 if retry_event.retry_count > retry_event.max_retries {
                                                     let _ = q.move_to_dlq(retry_event, &storage_key).await;
                                                 } else {
                                                     let backoff = 2_i64.pow(retry_event.retry_count);
-                                                    let new_scheduled_at = Utc::now().timestamp() + backoff;
-                                                    let _ = q.reschedule(retry_event, &storage_key, new_scheduled_at).await;
+                                                    let new_timestamp = Utc::now().timestamp() + backoff;
+                                                    let _ = q.reschedule(retry_event, &storage_key, new_timestamp).await;
                                                 }
                                             }
                                         }

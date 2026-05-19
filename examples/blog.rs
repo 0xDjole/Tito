@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tito::{
     types::{
-        DBUuid, TitoEngine, TitoIndexBlockType,
-        TitoIndexConfig, TitoIndexField, TitoModelTrait,
+        DBUuid, TitoEngine, TitoIndexBlockType, TitoIndexConfig, TitoIndexField, TitoModelTrait,
     },
     TiKV, TitoError, TitoModelOptions,
 };
@@ -168,7 +167,15 @@ async fn main() -> Result<(), TitoError> {
 
     println!("\nAlice's posts:");
     for p in &results.items {
-        println!("- {} (tags: {})", p.title, p.tags.iter().map(|t| t.name.clone()).collect::<Vec<_>>().join(", "));
+        println!(
+            "- {} (tags: {})",
+            p.title,
+            p.tags
+                .iter()
+                .map(|t| t.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
 
     Ok(())

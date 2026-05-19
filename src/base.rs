@@ -6,10 +6,8 @@ use crate::{
     error::TitoError,
     query::IndexQueryBuilder,
     types::{
-        FieldValue, ReverseIndex, TitoCursor, TitoEngine,
-        TitoFindPayload, TitoKvPair,
-        TitoModelOptions, TitoPaginated,
-        TitoRelationshipConfig, TitoScanPayload, TitoTransaction,
+        FieldValue, ReverseIndex, TitoCursor, TitoEngine, TitoFindPayload, TitoKvPair,
+        TitoModelOptions, TitoPaginated, TitoRelationshipConfig, TitoScanPayload, TitoTransaction,
     },
     utils::{next_string_lexicographically, previous_string_lexicographically},
 };
@@ -46,7 +44,9 @@ impl<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> SetBuilder<'a, E,
     }
 
     pub async fn execute(self, tx: &E::Transaction) -> Result<T, TitoError> {
-        self.model.set_internal(self.payload, self.changelog, self.timestamps, tx).await
+        self.model
+            .set_internal(self.payload, self.changelog, self.timestamps, tx)
+            .await
     }
 }
 
@@ -164,11 +164,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
         Ok(results)
     }
-    async fn get_raw(
-        &self,
-        key: &str,
-        tx: &E::Transaction,
-    ) -> Result<(String, Value), TitoError> {
+    async fn get_raw(&self, key: &str, tx: &E::Transaction) -> Result<(String, Value), TitoError> {
         let key = key.to_string();
 
         match tx.get(key.clone()).await {
@@ -198,7 +194,13 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             .map_err(|_| TitoError::NotFound("Not found".to_string()))
     }
 
-    async fn put_with_options<P>(&self, key: String, payload: P, timestamps: bool, tx: &E::Transaction) -> Result<Value, TitoError>
+    async fn put_with_options<P>(
+        &self,
+        key: String,
+        payload: P,
+        timestamps: bool,
+        tx: &E::Transaction,
+    ) -> Result<Value, TitoError>
     where
         P: Serialize + Unpin + std::marker::Send + Sync,
     {
@@ -268,10 +270,9 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         }
 
         let cursor = match (has_more, last_item) {
-            (true, Some(item)) => Some(
-                self.encode_cursors(vec![Some(item)])
-                    .map_err(|e| TitoError::SerializationFailed(format!("Failed to encode cursor: {}", e)))?,
-            ),
+            (true, Some(item)) => Some(self.encode_cursors(vec![Some(item)]).map_err(|e| {
+                TitoError::SerializationFailed(format!("Failed to encode cursor: {}", e))
+            })?),
             _ => None,
         };
 
@@ -360,7 +361,13 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         }
     }
 
-    async fn set_internal(&self, payload: T, changelog: bool, timestamps: bool, tx: &E::Transaction) -> Result<T, TitoError>
+    async fn set_internal(
+        &self,
+        payload: T,
+        changelog: bool,
+        timestamps: bool,
+        tx: &E::Transaction,
+    ) -> Result<T, TitoError>
     where
         T: serde::de::DeserializeOwned,
     {
@@ -369,10 +376,13 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
         self.clear_indexes(&raw_id, tx).await?;
 
-        let value = serde_json::to_value(&payload)
-            .map_err(|e| TitoError::SerializationFailed(format!("Failed to serialize payload: {}", e)))?;
+        let value = serde_json::to_value(&payload).map_err(|e| {
+            TitoError::SerializationFailed(format!("Failed to serialize payload: {}", e))
+        })?;
 
-        let stored_value = self.put_with_options(id.clone(), &value, timestamps, tx).await?;
+        let stored_value = self
+            .put_with_options(id.clone(), &value, timestamps, tx)
+            .await?;
 
         if changelog {
             let changelog_key = Self::changelog_key();
@@ -392,7 +402,8 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
         for data in all_index_data {
             all_index_keys.push(data.0.clone());
-            self.put_with_options(data.0.clone(), &data.1, false, tx).await?;
+            self.put_with_options(data.0.clone(), &data.1, false, tx)
+                .await?;
         }
 
         let index_json_key = ReverseIndex {
@@ -401,7 +412,8 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
         let reverse_key = format!("reverse-index:{}", id);
 
-        self.put_with_options(reverse_key, index_json_key, false, tx).await?;
+        self.put_with_options(reverse_key, index_json_key, false, tx)
+            .await?;
 
         serde_json::from_value(stored_value).map_err(|e| {
             TitoError::DeserializationFailed(format!("Failed to deserialize stored value: {}", e))
@@ -517,9 +529,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             limit + 1
         };
 
-        let scan_stream = tx
-            .scan(start_bound..end_bound, limit_plus_one)
-            .await?;
+        let scan_stream = tx.scan(start_bound..end_bound, limit_plus_one).await?;
 
         let mut items = self.to_results(scan_stream)?;
 
@@ -781,5 +791,4 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         })
         .await
     }
-
 }

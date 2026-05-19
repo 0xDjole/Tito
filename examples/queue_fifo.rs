@@ -2,12 +2,12 @@ use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tokio::sync::broadcast;
 use tito::{
     queue::{run_worker, QueueConfig, QueueEvent},
     types::DBUuid,
     TiKV, TitoError, TitoQueue, WorkerConfig,
 };
+use tokio::sync::broadcast;
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 struct UserEvent {
@@ -23,10 +23,7 @@ async fn main() -> Result<(), TitoError> {
 
     let tito_db = TiKV::connect(vec!["127.0.0.1:2379"]).await?;
 
-    let queue = Arc::new(TitoQueue::new(
-        tito_db.clone(),
-        QueueConfig::new(1),
-    ));
+    let queue = Arc::new(TitoQueue::new(tito_db.clone(), QueueConfig::new(1)));
 
     println!("Publishing 5 events...\n");
 
@@ -59,10 +56,7 @@ async fn main() -> Result<(), TitoError> {
             let count = counter.fetch_add(1, Ordering::SeqCst) + 1;
             println!(
                 "[{}] {} - {} ({})",
-                count,
-                event.payload.action,
-                event.payload.name,
-                event.payload.email,
+                count, event.payload.action, event.payload.name, event.payload.email,
             );
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             Ok::<_, TitoError>(())

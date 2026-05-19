@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tito::{
     types::{
-        DBUuid, TitoEngine, TitoIndexBlockType, TitoIndexConfig, TitoIndexField,
-        TitoModelTrait,
+        DBUuid, TitoEngine, TitoIndexBlockType, TitoIndexConfig, TitoIndexField, TitoModelTrait,
     },
     TiKV, TitoError, TitoModelOptions,
 };

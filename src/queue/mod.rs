@@ -45,7 +45,7 @@ impl<E: TitoEngine> Queue<E> {
         let key = format!(
             "queue:{:0pwidth$}:{}:{}",
             partition,
-            event.scheduled_at,
+            event.timestamp,
             event.id,
             pwidth = PARTITION_DIGITS,
         );
@@ -64,9 +64,7 @@ impl<E: TitoEngine> Queue<E> {
         let changelog_entry = serde_json::json!({
             "event_id": event.id,
             "event_key": event.key,
-            "created_at": event.created_at,
-            "scheduled_at": event.scheduled_at,
-            "max_retries": event.max_retries,
+            "timestamp": event.timestamp,
             "data": event_value,
         });
         let changelog_bytes = serde_json::to_vec(&changelog_entry)
@@ -102,12 +100,14 @@ impl<E: TitoEngine> Queue<E> {
 
                 let start = format!(
                     "queue:{:0pwidth$}:{}",
-                    partition, 0,
+                    partition,
+                    0,
                     pwidth = PARTITION_DIGITS,
                 );
                 let end = format!(
                     "queue:{:0pwidth$}:{}",
-                    partition, now + 1,
+                    partition,
+                    now + 1,
                     pwidth = PARTITION_DIGITS,
                 );
 
@@ -119,7 +119,7 @@ impl<E: TitoEngine> Queue<E> {
                 let mut jobs: Vec<(String, QueueEvent<T>)> = Vec::new();
                 for (storage_key, value) in events.into_iter() {
                     if let Ok(event) = serde_json::from_slice::<QueueEvent<T>>(&value) {
-                        if event.scheduled_at <= now {
+                        if event.timestamp <= now {
                             let key_str = String::from_utf8_lossy(&storage_key).into_owned();
                             jobs.push((key_str, event));
                         }
@@ -139,13 +139,11 @@ impl<E: TitoEngine> Queue<E> {
         let mut deleted = 0u32;
 
         for partition in 0..self.config.partition_count {
-            let start = format!(
-                "queue:{:0pwidth$}:0",
-                partition, pwidth = PARTITION_DIGITS,
-            );
+            let start = format!("queue:{:0pwidth$}:0", partition, pwidth = PARTITION_DIGITS,);
             let end = format!(
                 "queue:{:0pwidth$}:9999999999",
-                partition, pwidth = PARTITION_DIGITS,
+                partition,
+                pwidth = PARTITION_DIGITS,
             );
 
             let events = tx
@@ -199,7 +197,7 @@ impl<E: TitoEngine> Queue<E> {
         &self,
         mut event: QueueEvent<T>,
         storage_key: &str,
-        new_scheduled_at: i64,
+        new_timestamp: i64,
     ) -> Result<(), TitoError> {
         let old_key = storage_key.to_string();
 
@@ -216,12 +214,12 @@ impl<E: TitoEngine> Queue<E> {
                     event.key.hash(&mut hasher);
                     let partition = (hasher.finish() % self.config.partition_count as u64) as u32;
 
-                    event.scheduled_at = new_scheduled_at;
+                    event.timestamp = new_timestamp;
 
                     let new_key = format!(
                         "queue:{:0pwidth$}:{}:{}",
                         partition,
-                        event.scheduled_at,
+                        event.timestamp,
                         event.id,
                         pwidth = PARTITION_DIGITS,
                     );
@@ -255,7 +253,7 @@ impl<E: TitoEngine> Queue<E> {
         let dlq_key = format!(
             "dlq:{:0pwidth$}:{}:{}",
             partition,
-            event.created_at,
+            event.timestamp,
             event.id,
             pwidth = PARTITION_DIGITS,
         );

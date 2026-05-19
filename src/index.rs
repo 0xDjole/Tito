@@ -55,24 +55,28 @@ impl<
                 for field_value in field_values {
                     let field_str = match field_value {
                         FieldValue::HashMapEntry { key, value } => match &field.r#type {
-                            TitoIndexBlockType::String | TitoIndexBlockType::Custom(_) => match value.as_str() {
-                                Some("") => Some(format!("{}:{}.__null__", field.name, key)),
-                                Some(s) => {
-                                    Some(format!("{}:{}.{}", field.name, key, safe_encode(&s)))
+                            TitoIndexBlockType::String | TitoIndexBlockType::Custom(_) => {
+                                match value.as_str() {
+                                    Some("") => Some(format!("{}:{}.__null__", field.name, key)),
+                                    Some(s) => {
+                                        Some(format!("{}:{}.{}", field.name, key, safe_encode(&s)))
+                                    }
+                                    None => Some(format!("{}:{}.__null__", field.name, key)),
                                 }
-                                None => Some(format!("{}:{}.__null__", field.name, key)),
-                            },
+                            }
                             TitoIndexBlockType::Number => match value.as_i64() {
                                 Some(n) => Some(format!("{}:{}:{:0>10}", field.name, key, n)),
                                 None => Some(format!("{}:{}:__null__", field.name, key)),
                             },
                         },
                         FieldValue::Simple(value) => match &field.r#type {
-                            TitoIndexBlockType::String | TitoIndexBlockType::Custom(_) => match value.as_str() {
-                                Some("") => Some(format!("{}:__null__", field.name)),
-                                Some(s) => Some(format!("{}:{}", field.name, safe_encode(&s))),
-                                None => Some(format!("{}:__null__", field.name)),
-                            },
+                            TitoIndexBlockType::String | TitoIndexBlockType::Custom(_) => {
+                                match value.as_str() {
+                                    Some("") => Some(format!("{}:__null__", field.name)),
+                                    Some(s) => Some(format!("{}:{}", field.name, safe_encode(&s))),
+                                    None => Some(format!("{}:__null__", field.name)),
+                                }
+                            }
                             TitoIndexBlockType::Number => match value.as_i64() {
                                 Some(n) => Some(format!("{}:{:0>10}", field.name, n)),
                                 None => Some(format!("{}:__null__", field.name)),
@@ -121,13 +125,26 @@ impl<
         let index = indexes
             .iter()
             .find(|index_config| index_config.name == payload.index)
-            .ok_or_else(|| TitoError::IndexError(format!("Index '{}' not found on model '{}'", payload.index, T::table())))?;
+            .ok_or_else(|| {
+                TitoError::IndexError(format!(
+                    "Index '{}' not found on model '{}'",
+                    payload.index,
+                    T::table()
+                ))
+            })?;
 
         let index_fields = index.fields.clone();
 
         let mut key_from_values = vec![];
         for (i, value) in payload.values.iter().enumerate() {
-            let index_field = index_fields.get(i).cloned().ok_or_else(|| TitoError::IndexError(format!("Index '{}' has {} fields but {} values were provided", payload.index, index_fields.len(), payload.values.len())))?;
+            let index_field = index_fields.get(i).cloned().ok_or_else(|| {
+                TitoError::IndexError(format!(
+                    "Index '{}' has {} fields but {} values were provided",
+                    payload.index,
+                    index_fields.len(),
+                    payload.values.len()
+                ))
+            })?;
             let index_field_type = index_field.r#type;
 
             let value = match index_field_type {
@@ -176,13 +193,26 @@ impl<
         let index = indexes
             .iter()
             .find(|index_config| index_config.name == payload.index)
-            .ok_or_else(|| TitoError::IndexError(format!("Index '{}' not found on model '{}'", payload.index, T::table())))?;
+            .ok_or_else(|| {
+                TitoError::IndexError(format!(
+                    "Index '{}' not found on model '{}'",
+                    payload.index,
+                    T::table()
+                ))
+            })?;
 
         let index_fields = index.fields.clone();
 
         let mut key_from_values = vec![];
         for (i, value) in payload.values.iter().enumerate() {
-            let index_field = index_fields.get(i).cloned().ok_or_else(|| TitoError::IndexError(format!("Index '{}' has {} fields but {} values were provided", payload.index, index_fields.len(), payload.values.len())))?;
+            let index_field = index_fields.get(i).cloned().ok_or_else(|| {
+                TitoError::IndexError(format!(
+                    "Index '{}' has {} fields but {} values were provided",
+                    payload.index,
+                    index_fields.len(),
+                    payload.values.len()
+                ))
+            })?;
             let index_field_type = index_field.r#type;
 
             let value = match index_field_type {
@@ -226,9 +256,7 @@ impl<
     where
         T: serde::de::DeserializeOwned,
     {
-        let (items, has_more) = self
-            .find_by_index_raw(payload, tx)
-            .await?;
+        let (items, has_more) = self.find_by_index_raw(payload, tx).await?;
 
         let results = self.to_paginated_items(items, has_more)?;
 
@@ -346,5 +374,4 @@ impl<
             }
         }
     }
-
 }

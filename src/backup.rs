@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
+use flate2::Compression;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{Read, Write};
@@ -26,9 +26,7 @@ pub struct ChangelogEntry {
 pub struct EventChangelogEntry {
     pub event_id: String,
     pub event_key: String,
-    pub created_at: i64,
-    pub scheduled_at: i64,
-    pub max_retries: u32,
+    pub timestamp: i64,
     pub data: Value,
 }
 
@@ -105,7 +103,11 @@ impl<E: TitoEngine, S: BackupStorage + 'static> TitoBackupService<E, S> {
         for prefix in prefixes {
             let start_key = match start_ts {
                 Some(ts) => {
-                    let ts_ms = if ts < 1_000_000_000_000 { ts * 1000 } else { ts };
+                    let ts_ms = if ts < 1_000_000_000_000 {
+                        ts * 1000
+                    } else {
+                        ts
+                    };
                     format!("{}{}:", prefix, ts_ms + 1)
                 }
                 None => prefix.to_string(),
@@ -197,7 +199,11 @@ impl<E: TitoEngine, S: BackupStorage + 'static> TitoBackupService<E, S> {
         let latest_key = format!("{}/LATEST_EVENTS", root);
         let start_key = match self.download_marker_timestamp(&latest_key).await {
             Some(ts) => {
-                let ts_ms = if ts < 1_000_000_000_000 { ts * 1000 } else { ts };
+                let ts_ms = if ts < 1_000_000_000_000 {
+                    ts * 1000
+                } else {
+                    ts
+                };
                 format!("event_changelog:{}:", ts_ms + 1)
             }
             None => "event_changelog:".to_string(),
@@ -215,9 +221,7 @@ impl<E: TitoEngine, S: BackupStorage + 'static> TitoBackupService<E, S> {
                 .clone()
                 .transaction(|tx| {
                     let scan_key = scan_key.clone();
-                    async move {
-                        scan_event_changelog_range(&scan_key, chunk_size, &tx).await
-                    }
+                    async move { scan_event_changelog_range(&scan_key, chunk_size, &tx).await }
                 })
                 .await?;
 
@@ -229,10 +233,7 @@ impl<E: TitoEngine, S: BackupStorage + 'static> TitoBackupService<E, S> {
             let changelog_keys: Vec<String> = entries.iter().map(|(k, _)| k.clone()).collect();
             let changelog_entries: Vec<_> = entries.into_iter().map(|(_, entry)| entry).collect();
 
-            let chunk_key = format!(
-                "{}/events/{}/chunk-{:04}.json.gz",
-                root, timestamp, seq
-            );
+            let chunk_key = format!("{}/events/{}/chunk-{:04}.json.gz", root, timestamp, seq);
             self.compress_and_upload_events(&changelog_entries, &chunk_key)
                 .await?;
 
@@ -319,10 +320,7 @@ impl<E: TitoEngine, S: BackupStorage + 'static> TitoBackupService<E, S> {
                 })
                 .collect();
 
-            let chunk_key = format!(
-                "{}/state/full/{}/chunk-{:04}.json.gz",
-                root, timestamp, seq
-            );
+            let chunk_key = format!("{}/state/full/{}/chunk-{:04}.json.gz", root, timestamp, seq);
             self.compress_and_upload_changelog(&entries, &chunk_key)
                 .await?;
 
@@ -423,9 +421,7 @@ impl<E: TitoEngine, S: BackupStorage + 'static> TitoBackupService<E, S> {
 
         let mut state_entries_restored = self.replay_state_chunks(&full_keys).await?;
 
-        let partial_keys = self
-            .find_partial_keys(full_backup_ts, timestamp)
-            .await?;
+        let partial_keys = self.find_partial_keys(full_backup_ts, timestamp).await?;
 
         if !partial_keys.is_empty() {
             state_entries_restored += self.replay_state_chunks(&partial_keys).await?;
@@ -567,8 +563,9 @@ impl<E: TitoEngine, S: BackupStorage + 'static> TitoBackupService<E, S> {
             .into_iter()
             .filter(|k| k.ends_with(".json.gz"))
             .filter(|k| {
-                extract_backup_timestamp(k)
-                    .map_or(false, |ts| ts > full_ts && restore_ts.map_or(true, |rts| ts <= rts))
+                extract_backup_timestamp(k).map_or(false, |ts| {
+                    ts >= full_ts && restore_ts.map_or(true, |rts| ts <= rts)
+                })
             })
             .collect();
 
@@ -576,10 +573,7 @@ impl<E: TitoEngine, S: BackupStorage + 'static> TitoBackupService<E, S> {
         Ok(chunk_keys)
     }
 
-    async fn find_event_keys(
-        &self,
-        restore_ts: Option<i64>,
-    ) -> Result<Vec<String>, TitoError> {
+    async fn find_event_keys(&self, restore_ts: Option<i64>) -> Result<Vec<String>, TitoError> {
         let root = &self.config.backup_root;
         let all_keys = self
             .storage
@@ -620,11 +614,10 @@ impl<E: TitoEngine, S: BackupStorage + 'static> TitoBackupService<E, S> {
         let mut total_restored = 0;
 
         for chunk_key in chunk_keys {
-            let compressed_bytes = self
-                .storage
-                .download(chunk_key)
-                .await
-                .map_err(|e| TitoError::BackupFailed(format!("Download {}: {}", chunk_key, e)))?;
+            let compressed_bytes =
+                self.storage.download(chunk_key).await.map_err(|e| {
+                    TitoError::BackupFailed(format!("Download {}: {}", chunk_key, e))
+                })?;
 
             let mut decoder = GzDecoder::new(&compressed_bytes[..]);
             let mut json_bytes = Vec::new();
@@ -695,11 +688,10 @@ impl<E: TitoEngine, S: BackupStorage + 'static> TitoBackupService<E, S> {
         let mut total_replayed = 0;
 
         for chunk_key in chunk_keys {
-            let compressed_bytes = self
-                .storage
-                .download(chunk_key)
-                .await
-                .map_err(|e| TitoError::BackupFailed(format!("Download {}: {}", chunk_key, e)))?;
+            let compressed_bytes =
+                self.storage.download(chunk_key).await.map_err(|e| {
+                    TitoError::BackupFailed(format!("Download {}: {}", chunk_key, e))
+                })?;
 
             let mut decoder = GzDecoder::new(&compressed_bytes[..]);
             let mut json_bytes = Vec::new();
@@ -723,24 +715,22 @@ impl<E: TitoEngine, S: BackupStorage + 'static> TitoBackupService<E, S> {
                             for entry in batch {
                                 let mut hasher = DefaultHasher::new();
                                 entry.event_key.hash(&mut hasher);
-                                let partition =
-                                    (hasher.finish() % pc as u64) as u32;
+                                let partition = (hasher.finish() % pc as u64) as u32;
 
                                 let queue_key = format!(
                                     "queue:{:0pwidth$}:{}:{}",
                                     partition,
-                                    entry.scheduled_at,
+                                    entry.timestamp,
                                     entry.event_id,
                                     pwidth = PARTITION_DIGITS,
                                 );
 
-                                let queue_value =
-                                    serde_json::to_vec(&entry.data).map_err(|e| {
-                                        TitoError::BackupFailed(format!(
-                                            "Serialize event {}: {}",
-                                            entry.event_id, e
-                                        ))
-                                    })?;
+                                let queue_value = serde_json::to_vec(&entry.data).map_err(|e| {
+                                    TitoError::BackupFailed(format!(
+                                        "Serialize event {}: {}",
+                                        entry.event_id, e
+                                    ))
+                                })?;
 
                                 tx.put(queue_key.as_bytes(), queue_value)
                                     .await

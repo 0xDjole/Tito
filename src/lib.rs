@@ -6,7 +6,7 @@ pub mod types;
 
 mod base;
 
-pub use base::{TitoModel, SetBuilder, GetBuilder, GetManyBuilder};
+pub use base::{GetBuilder, GetManyBuilder, SetBuilder, TitoModel};
 
 mod utils;
 
@@ -26,10 +26,7 @@ pub mod index;
 pub mod relationship;
 
 pub use error::TitoError;
-pub use types::{
-    PartitionConfig, TitoEngine, TitoModelOptions, TitoModelTrait,
-    PARTITION_DIGITS,
-};
+pub use types::{PartitionConfig, TitoEngine, TitoModelOptions, TitoModelTrait, PARTITION_DIGITS};
 
 pub use queue::{Queue, QueueConfig, QueueEvent, TitoQueue, WorkerConfig};
 

@@ -35,9 +35,7 @@ pub struct TitoModelOptions {
 
 impl Default for TitoModelOptions {
     fn default() -> Self {
-        Self {
-            partition_count: 1,
-        }
+        Self { partition_count: 1 }
     }
 }
 

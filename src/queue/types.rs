@@ -6,30 +6,28 @@ pub struct QueueEvent<T> {
     pub id: String,
     pub key: String,
     pub payload: T,
-    pub created_at: i64,
-    pub scheduled_at: i64,
+    pub timestamp: i64,
     pub retry_count: u32,
     pub max_retries: u32,
-    pub error: Option<String>,
+    pub errors: Vec<String>,
 }
 
 impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent<T> {
     pub fn new(key: impl Into<String>, payload: T) -> Self {
         let now = chrono::Utc::now().timestamp();
         Self {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: queue_event_id(),
             key: key.into(),
             payload,
-            created_at: now,
-            scheduled_at: now,
+            timestamp: now,
             retry_count: 0,
             max_retries: 0,
-            error: None,
+            errors: Vec::new(),
         }
     }
 
     pub fn scheduled_for(mut self, timestamp: i64) -> Self {
-        self.scheduled_at = timestamp;
+        self.timestamp = timestamp;
         self
     }
 
@@ -49,6 +47,11 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent
     pub fn event(&self) -> &T {
         &self.payload
     }
+}
+
+fn queue_event_id() -> String {
+    let micros = chrono::Utc::now().timestamp_micros();
+    format!("{micros:020}-{}", uuid::Uuid::new_v4())
 }
 
 #[derive(Debug, Clone)]
