@@ -27,16 +27,10 @@ pub struct TitoModel<E: TitoEngine, T> {
 pub struct SetBuilder<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> {
     model: &'a TitoModel<E, T>,
     payload: T,
-    changelog: bool,
     timestamps: bool,
 }
 
 impl<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> SetBuilder<'a, E, T> {
-    pub fn changelog(mut self, changelog: bool) -> Self {
-        self.changelog = changelog;
-        self
-    }
-
     pub fn timestamps(mut self, timestamps: bool) -> Self {
         self.timestamps = timestamps;
         self
@@ -44,7 +38,7 @@ impl<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> SetBuilder<'a, E,
 
     pub async fn execute(self, tx: &E::Transaction) -> Result<T, TitoError> {
         self.model
-            .set_internal(self.payload, self.changelog, self.timestamps, tx)
+            .set_internal(self.payload, self.timestamps, tx)
             .await
     }
 }
@@ -348,7 +342,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         SetBuilder {
             model: self,
             payload,
-            changelog: false,
             timestamps: true,
         }
     }
@@ -356,7 +349,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     async fn set_internal(
         &self,
         payload: T,
-        _changelog: bool,
         timestamps: bool,
         tx: &E::Transaction,
     ) -> Result<T, TitoError>
