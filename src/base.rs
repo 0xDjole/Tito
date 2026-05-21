@@ -14,7 +14,6 @@ use crate::{
 
 use base64::{engine::general_purpose, Engine};
 use chrono::Utc;
-use rand::Rng;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 
@@ -345,18 +344,11 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         }
     }
 
-    fn changelog_key() -> String {
-        let now = chrono::Utc::now();
-        let ts = now.timestamp_millis();
-        let rand: u32 = rand::thread_rng().gen();
-        format!("state_changelog:{}:{:08x}", ts, rand)
-    }
-
     pub fn set(&self, payload: T) -> SetBuilder<'_, E, T> {
         SetBuilder {
             model: self,
             payload,
-            changelog: true,
+            changelog: false,
             timestamps: true,
         }
     }
@@ -364,7 +356,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     async fn set_internal(
         &self,
         payload: T,
-        changelog: bool,
+        _changelog: bool,
         timestamps: bool,
         tx: &E::Transaction,
     ) -> Result<T, TitoError>
@@ -383,18 +375,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         let stored_value = self
             .put_with_options(id.clone(), &value, timestamps, tx)
             .await?;
-
-        if changelog {
-            let changelog_key = Self::changelog_key();
-            let changelog_entry = serde_json::json!({
-                "op": "put",
-                "key": id.clone(),
-                "data": value.clone(),
-            });
-            let changelog_bytes = serde_json::to_vec(&changelog_entry)
-                .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
-            tx.put(changelog_key, changelog_bytes).await?;
-        }
 
         let all_index_data = self.get_index_keys(id.clone(), &payload, &stored_value)?;
 
@@ -738,15 +718,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             Ok(idx) => idx,
             Err(_) => return Err(TitoError::NotFound(format!("Entity not found: {}", id))),
         };
-
-        let changelog_key = Self::changelog_key();
-        let changelog_entry = serde_json::json!({
-            "op": "delete",
-            "key": id.clone(),
-        });
-        let changelog_bytes = serde_json::to_vec(&changelog_entry)
-            .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
-        tx.put(changelog_key, changelog_bytes).await?;
 
         let mut keys = reverse_index.value;
 

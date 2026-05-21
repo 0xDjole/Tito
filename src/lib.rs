@@ -28,12 +28,6 @@ pub mod relationship;
 pub use error::TitoError;
 pub use types::{PartitionConfig, TitoEngine, TitoModelOptions, TitoModelTrait, PARTITION_DIGITS};
 
-pub use queue::{Queue, QueueConfig, QueueEvent, TitoQueue, WorkerConfig};
-
-pub mod backup;
-pub use backup::{
-    BackupConfig, BackupResult, BackupStorage, ChangelogEntry, EventChangelogEntry, RestoreResult,
-    TitoBackupService,
-};
+pub use queue::{Queue, QueueConfig, QueueEvent, QueueEventState, TitoQueue, WorkerConfig};
 
 pub use utils::next_string_lexicographically;
