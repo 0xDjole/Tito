@@ -14,7 +14,6 @@ use crate::TitoError;
 
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
-    pub consumer: String,
     pub partition_range: std::ops::Range<u32>,
 }
 

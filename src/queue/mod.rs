@@ -15,7 +15,7 @@ use serde_json::Value;
 use crate::types::{TitoEngine, TitoTransaction, PARTITION_DIGITS};
 use crate::TitoError;
 
-const DEFAULT_LOCK_SECS: i64 = 300;
+const LEGACY_EVENT_PREFIX: &str = "queue:event:";
 
 #[derive(Clone)]
 pub struct Queue<E: TitoEngine> {
@@ -35,10 +35,6 @@ impl<E: TitoEngine> Queue<E> {
         (hasher.finish() % partition_count as u64) as u32
     }
 
-    fn canonical_key(event_id: &str) -> String {
-        format!("queue:event:{}", event_id)
-    }
-
     fn pending_key(partition: u32, timestamp: i64, event_id: &str) -> String {
         format!(
             "queue:pending:{:0pwidth$}:{}:{}",
@@ -49,23 +45,13 @@ impl<E: TitoEngine> Queue<E> {
         )
     }
 
-    fn processing_key(partition: u32, locked_until: i64, event_id: &str) -> String {
-        format!(
-            "queue:processing:{:0pwidth$}:{}:{}",
-            partition,
-            locked_until,
-            event_id,
-            pwidth = PARTITION_DIGITS,
-        )
-    }
-
     fn completed_key(processed_at: i64, event_id: &str) -> String {
         format!("queue:completed:{:020}:{}", processed_at, event_id)
     }
 
-    fn dlq_key(partition: u32, failed_at: i64, event_id: &str) -> String {
+    fn failed_key(partition: u32, failed_at: i64, event_id: &str) -> String {
         format!(
-            "queue:dlq:{:0pwidth$}:{}:{}",
+            "queue:failed:{:0pwidth$}:{}:{}",
             partition,
             failed_at,
             event_id,
@@ -73,22 +59,111 @@ impl<E: TitoEngine> Queue<E> {
         )
     }
 
-    fn state_index_prefix(state: QueueEventState) -> &'static str {
+    fn state_prefixes(state: QueueEventState) -> Vec<&'static str> {
         match state {
-            QueueEventState::Pending => "queue:pending:",
-            QueueEventState::Processing => "queue:processing:",
-            QueueEventState::Completed => "queue:completed:",
-            QueueEventState::DeadLetter => "queue:dlq:",
+            QueueEventState::Pending => vec!["queue:pending:"],
+            QueueEventState::Completed => vec!["queue:completed:"],
+            QueueEventState::Failed => vec!["queue:failed:", "queue:dlq:"],
         }
     }
 
     fn state_value(state: QueueEventState) -> &'static str {
         match state {
             QueueEventState::Pending => "pending",
-            QueueEventState::Processing => "processing",
             QueueEventState::Completed => "completed",
-            QueueEventState::DeadLetter => "dead_letter",
+            QueueEventState::Failed => "failed",
         }
+    }
+
+    fn prefix_end(prefix: &str) -> Vec<u8> {
+        let mut end = prefix.as_bytes().to_vec();
+        end.push(0xff);
+        end
+    }
+
+    fn state_timestamp<T>(event: &QueueEvent<T>, state: QueueEventState) -> Option<i64> {
+        match state {
+            QueueEventState::Pending => Some(event.timestamp),
+            QueueEventState::Completed | QueueEventState::Failed => event.processed_at,
+        }
+    }
+
+    async fn read_event_from_value<T: DeserializeOwned + Clone + Send + Sync + 'static>(
+        tx: &E::Transaction,
+        value: &[u8],
+    ) -> Result<Option<(QueueEvent<T>, Option<Vec<u8>>)>, TitoError> {
+        if let Ok(event) = serde_json::from_slice::<QueueEvent<T>>(value) {
+            return Ok(Some((event, None)));
+        }
+
+        let pointer = String::from_utf8(value.to_vec()).map_err(|_| {
+            TitoError::DeserializationFailed("Invalid queue event bytes".to_string())
+        })?;
+        if !pointer.starts_with(LEGACY_EVENT_PREFIX) {
+            return Err(TitoError::DeserializationFailed(
+                "Invalid queue event bytes".to_string(),
+            ));
+        }
+
+        let Some(bytes) = tx
+            .get(pointer.as_bytes())
+            .await
+            .map_err(|e| TitoError::QueryFailed(format!("Get legacy queue event: {}", e)))?
+        else {
+            return Ok(None);
+        };
+
+        let event = serde_json::from_slice::<QueueEvent<T>>(&bytes)
+            .map_err(|e| TitoError::DeserializationFailed(e.to_string()))?;
+        Ok(Some((event, Some(pointer.into_bytes()))))
+    }
+
+    async fn read_value_from_entry(
+        tx: &E::Transaction,
+        value: &[u8],
+    ) -> Result<Option<(Value, Option<Vec<u8>>)>, TitoError> {
+        if let Ok(event) = serde_json::from_slice::<Value>(value) {
+            if event.get("id").is_some() && event.get("key").is_some() {
+                return Ok(Some((event, None)));
+            }
+        }
+
+        let pointer = String::from_utf8(value.to_vec()).map_err(|_| {
+            TitoError::DeserializationFailed("Invalid queue event bytes".to_string())
+        })?;
+        if !pointer.starts_with(LEGACY_EVENT_PREFIX) {
+            return Err(TitoError::DeserializationFailed(
+                "Invalid queue event bytes".to_string(),
+            ));
+        }
+
+        let Some(bytes) = tx
+            .get(pointer.as_bytes())
+            .await
+            .map_err(|e| TitoError::QueryFailed(format!("Get legacy queue event: {}", e)))?
+        else {
+            return Ok(None);
+        };
+
+        let event = serde_json::from_slice::<Value>(&bytes)
+            .map_err(|e| TitoError::DeserializationFailed(e.to_string()))?;
+        Ok(Some((event, Some(pointer.into_bytes()))))
+    }
+
+    async fn delete_entry(
+        tx: &E::Transaction,
+        storage_key: &[u8],
+        pointer_key: Option<Vec<u8>>,
+    ) -> Result<(), TitoError> {
+        tx.delete(storage_key)
+            .await
+            .map_err(|e| TitoError::DeleteFailed(format!("Delete queue event: {}", e)))?;
+        if let Some(pointer_key) = pointer_key {
+            tx.delete(pointer_key.as_slice()).await.map_err(|e| {
+                TitoError::DeleteFailed(format!("Delete legacy queue event: {}", e))
+            })?;
+        }
+        Ok(())
     }
 
     pub async fn publish_in_tx<T: Serialize + Clone + Send + Sync + 'static>(
@@ -96,27 +171,16 @@ impl<E: TitoEngine> Queue<E> {
         mut event: QueueEvent<T>,
         tx: &E::Transaction,
     ) -> Result<(), TitoError> {
-        let now = Utc::now().timestamp();
         let partition = self.partition_for_key(&event.key);
-        let canonical_key = Self::canonical_key(&event.id);
         let pending_key = Self::pending_key(partition, event.timestamp, &event.id);
 
         event.state = QueueEventState::Pending;
-        if event.created_at == 0 {
-            event.created_at = now;
-        }
         event.processed_at = None;
-        event.locked_until = None;
-        event.locked_by = None;
 
         let bytes = serde_json::to_vec(&event)
             .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
 
-        tx.put(canonical_key.as_bytes(), bytes)
-            .await
-            .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
-
-        tx.put(pending_key.as_bytes(), canonical_key.as_bytes())
+        tx.put(pending_key.as_bytes(), bytes)
             .await
             .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
 
@@ -135,7 +199,7 @@ impl<E: TitoEngine> Queue<E> {
             .await
     }
 
-    pub async fn pull<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static>(
+    pub async fn pull<T: DeserializeOwned + Clone + Send + Sync + 'static>(
         &self,
         partition: u32,
         limit: u32,
@@ -143,9 +207,6 @@ impl<E: TitoEngine> Queue<E> {
         self.engine
             .transaction(|tx| async move {
                 let now = Utc::now().timestamp();
-                self.requeue_expired_processing::<T>(partition, now, limit.max(50), &tx)
-                    .await?;
-
                 let start = format!(
                     "queue:pending:{:0pwidth$}:{}",
                     partition,
@@ -159,139 +220,32 @@ impl<E: TitoEngine> Queue<E> {
                     pwidth = PARTITION_DIGITS,
                 );
 
-                let events = tx
+                let entries = tx
                     .scan(start.as_bytes()..end.as_bytes(), limit)
                     .await
-                    .map_err(|e| TitoError::QueryFailed(format!("Scan failed: {}", e)))?;
+                    .map_err(|e| TitoError::QueryFailed(format!("Scan pending queue: {}", e)))?;
 
-                let mut jobs: Vec<(String, QueueEvent<T>)> = Vec::new();
-                for (pending_key, canonical_key_bytes) in events.into_iter() {
-                    let canonical_key = String::from_utf8(canonical_key_bytes).map_err(|_| {
-                        TitoError::DeserializationFailed("Invalid queue index".to_string())
-                    })?;
-                    let Some(value) = tx
-                        .get(canonical_key.as_bytes())
-                        .await
-                        .map_err(|e| TitoError::QueryFailed(format!("Get queue event: {}", e)))?
+                let mut jobs = Vec::new();
+                for (storage_key, value) in entries {
+                    let Some((event, _)) = Self::read_event_from_value::<T>(&tx, &value).await?
                     else {
-                        tx.delete(pending_key.as_slice()).await.map_err(|e| {
+                        tx.delete(storage_key.as_slice()).await.map_err(|e| {
                             TitoError::DeleteFailed(format!("Delete orphan queue index: {}", e))
                         })?;
                         continue;
                     };
 
-                    let mut event: QueueEvent<T> = serde_json::from_slice(&value)
-                        .map_err(|e| TitoError::DeserializationFailed(e.to_string()))?;
-
-                    if event.state != QueueEventState::Pending || event.timestamp > now {
-                        continue;
-                    }
-
-                    tx.delete(pending_key.as_slice()).await.map_err(|e| {
-                        TitoError::DeleteFailed(format!("Delete pending queue index: {}", e))
-                    })?;
-
-                    let locked_until = now + DEFAULT_LOCK_SECS;
-                    event.state = QueueEventState::Processing;
-                    event.locked_until = Some(locked_until);
-                    event.locked_by = Some(format!("partition:{}", partition));
-                    event.processed_at = None;
-
-                    let bytes = serde_json::to_vec(&event)
-                        .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
-                    tx.put(canonical_key.as_bytes(), bytes).await.map_err(|e| {
-                        TitoError::UpdateFailed(format!("Claim queue event: {}", e))
-                    })?;
-
-                    let processing_key = Self::processing_key(partition, locked_until, &event.id);
-                    tx.put(processing_key.as_bytes(), canonical_key.as_bytes())
-                        .await
-                        .map_err(|e| {
-                            TitoError::UpdateFailed(format!("Create processing index: {}", e))
+                    if event.state == QueueEventState::Pending && event.timestamp <= now {
+                        let key = String::from_utf8(storage_key).map_err(|_| {
+                            TitoError::DeserializationFailed("Invalid queue key".to_string())
                         })?;
-
-                    jobs.push((canonical_key, event));
+                        jobs.push((key, event));
+                    }
                 }
 
                 Ok::<_, TitoError>(jobs)
             })
             .await
-    }
-
-    async fn requeue_expired_processing<
-        T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    >(
-        &self,
-        partition: u32,
-        now: i64,
-        limit: u32,
-        tx: &E::Transaction,
-    ) -> Result<(), TitoError> {
-        let start = format!(
-            "queue:processing:{:0pwidth$}:{}",
-            partition,
-            0,
-            pwidth = PARTITION_DIGITS,
-        );
-        let end = format!(
-            "queue:processing:{:0pwidth$}:{}",
-            partition,
-            now + 1,
-            pwidth = PARTITION_DIGITS,
-        );
-
-        let expired = tx
-            .scan(start.as_bytes()..end.as_bytes(), limit)
-            .await
-            .map_err(|e| TitoError::QueryFailed(format!("Scan processing queue: {}", e)))?;
-
-        for (processing_key, canonical_key_bytes) in expired {
-            let canonical_key = String::from_utf8(canonical_key_bytes)
-                .map_err(|_| TitoError::DeserializationFailed("Invalid queue index".to_string()))?;
-            let Some(value) = tx
-                .get(canonical_key.as_bytes())
-                .await
-                .map_err(|e| TitoError::QueryFailed(format!("Get queue event: {}", e)))?
-            else {
-                tx.delete(processing_key.as_slice()).await.map_err(|e| {
-                    TitoError::DeleteFailed(format!("Delete orphan processing index: {}", e))
-                })?;
-                continue;
-            };
-
-            let mut event: QueueEvent<T> = serde_json::from_slice(&value)
-                .map_err(|e| TitoError::DeserializationFailed(e.to_string()))?;
-
-            if event.state != QueueEventState::Processing
-                || event
-                    .locked_until
-                    .map_or(false, |locked_until| locked_until > now)
-            {
-                continue;
-            }
-
-            tx.delete(processing_key.as_slice()).await.map_err(|e| {
-                TitoError::DeleteFailed(format!("Delete expired processing index: {}", e))
-            })?;
-
-            event.state = QueueEventState::Pending;
-            event.locked_until = None;
-            event.locked_by = None;
-            event.timestamp = now;
-
-            let bytes = serde_json::to_vec(&event)
-                .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
-            tx.put(canonical_key.as_bytes(), bytes)
-                .await
-                .map_err(|e| TitoError::UpdateFailed(format!("Requeue event: {}", e)))?;
-
-            let pending_key = Self::pending_key(partition, event.timestamp, &event.id);
-            tx.put(pending_key.as_bytes(), canonical_key.as_bytes())
-                .await
-                .map_err(|e| TitoError::UpdateFailed(format!("Create pending index: {}", e)))?;
-        }
-
-        Ok(())
     }
 
     pub async fn clear_by_key_in_tx<T: DeserializeOwned + Clone + Send + Sync + 'static>(
@@ -301,25 +255,34 @@ impl<E: TitoEngine> Queue<E> {
     ) -> Result<u32, TitoError> {
         let mut deleted = 0u32;
 
-        let events = tx
-            .scan(
-                b"queue:event:".as_slice()..b"queue:event:\xff".as_slice(),
-                1000,
-            )
-            .await
-            .map_err(|e| TitoError::QueryFailed(format!("Scan failed: {}", e)))?;
+        for prefix in [
+            "queue:pending:",
+            "queue:completed:",
+            "queue:failed:",
+            "queue:dlq:",
+        ] {
+            let entries = tx
+                .scan(prefix.as_bytes()..Self::prefix_end(prefix).as_slice(), 1000)
+                .await
+                .map_err(|e| TitoError::QueryFailed(format!("Scan queue: {}", e)))?;
 
-        for (storage_key, value) in events {
-            if let Ok(event) = serde_json::from_slice::<QueueEvent<T>>(&value) {
+            for (storage_key, value) in entries {
+                let Some((event, pointer_key)) =
+                    Self::read_event_from_value::<T>(tx, &value).await?
+                else {
+                    tx.delete(storage_key.as_slice()).await.map_err(|e| {
+                        TitoError::DeleteFailed(format!("Delete orphan queue index: {}", e))
+                    })?;
+                    continue;
+                };
+
                 if event.key == key {
-                    self.delete_indexes_for_event(&event, tx).await?;
-                    tx.delete(storage_key.as_slice())
-                        .await
-                        .map_err(|e| TitoError::DeleteFailed(format!("Delete event: {}", e)))?;
+                    Self::delete_entry(tx, storage_key.as_slice(), pointer_key).await?;
                     deleted += 1;
                 }
             }
         }
+
         Ok(deleted)
     }
 
@@ -349,48 +312,36 @@ impl<E: TitoEngine> Queue<E> {
                         return Ok::<_, TitoError>(());
                     };
 
-                    let mut value: Value = serde_json::from_slice(&bytes)
-                        .map_err(|e| TitoError::DeserializationFailed(e.to_string()))?;
-                    let event_id = value
+                    let Some((mut event, pointer_key)) =
+                        Self::read_value_from_entry(&tx, &bytes).await?
+                    else {
+                        tx.delete(key.as_bytes()).await.map_err(|e| {
+                            TitoError::DeleteFailed(format!("Delete orphan queue index: {}", e))
+                        })?;
+                        return Ok::<_, TitoError>(());
+                    };
+
+                    let event_id = event
                         .get("id")
                         .and_then(Value::as_str)
                         .ok_or_else(|| {
                             TitoError::DeserializationFailed("Queue event missing id".to_string())
                         })?
                         .to_string();
-                    let event_key = value
-                        .get("key")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| {
-                            TitoError::DeserializationFailed("Queue event missing key".to_string())
-                        })?
-                        .to_string();
-                    let partition = self.partition_for_key(&event_key);
-                    if let Some(locked_until) = value.get("lockedUntil").and_then(Value::as_i64) {
-                        let processing_key =
-                            Self::processing_key(partition, locked_until, &event_id);
-                        tx.delete(processing_key.as_bytes()).await.map_err(|e| {
-                            TitoError::DeleteFailed(format!("Delete processing index: {}", e))
-                        })?;
-                    }
-
                     let processed_at = Utc::now().timestamp();
-                    value["state"] = Value::String("completed".to_string());
-                    value["processedAt"] = Value::Number(processed_at.into());
-                    value["lockedUntil"] = Value::Null;
-                    value["lockedBy"] = Value::Null;
-
-                    let updated = serde_json::to_vec(&value)
-                        .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
-                    tx.put(key.as_bytes(), updated).await.map_err(|e| {
-                        TitoError::UpdateFailed(format!("Complete queue event: {}", e))
-                    })?;
+                    event["state"] =
+                        Value::String(Self::state_value(QueueEventState::Completed).to_string());
+                    event["processedAt"] = Value::Number(processed_at.into());
 
                     let completed_key = Self::completed_key(processed_at, &event_id);
-                    tx.put(completed_key.as_bytes(), key.as_bytes())
+                    let completed_bytes = serde_json::to_vec(&event)
+                        .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
+
+                    Self::delete_entry(&tx, key.as_bytes(), pointer_key).await?;
+                    tx.put(completed_key.as_bytes(), completed_bytes)
                         .await
                         .map_err(|e| {
-                            TitoError::UpdateFailed(format!("Create completed index: {}", e))
+                            TitoError::UpdateFailed(format!("Create completed event: {}", e))
                         })?;
 
                     Ok::<_, TitoError>(())
@@ -401,44 +352,41 @@ impl<E: TitoEngine> Queue<E> {
 
     pub async fn reschedule<T: Serialize + Clone + Send + Sync + 'static>(
         &self,
-        mut event: QueueEvent<T>,
+        event: QueueEvent<T>,
         storage_key: &str,
         new_timestamp: i64,
     ) -> Result<(), TitoError> {
-        let canonical_key = storage_key.to_string();
+        let storage_key = storage_key.to_string();
 
         self.engine
             .transaction(|tx| {
-                let canonical_key = canonical_key.clone();
+                let storage_key = storage_key.clone();
+                let mut event = event.clone();
 
                 async move {
-                    let partition = self.partition_for_key(&event.key);
-                    if let Some(locked_until) = event.locked_until {
-                        let processing_key =
-                            Self::processing_key(partition, locked_until, &event.id);
-                        tx.delete(processing_key.as_bytes()).await.map_err(|e| {
-                            TitoError::DeleteFailed(format!("Delete processing index: {}", e))
-                        })?;
-                    }
+                    let pointer_key = tx
+                        .get(storage_key.as_bytes())
+                        .await
+                        .map_err(|e| TitoError::QueryFailed(format!("Get queue event: {}", e)))?
+                        .and_then(|value| {
+                            String::from_utf8(value)
+                                .ok()
+                                .filter(|key| key.starts_with(LEGACY_EVENT_PREFIX))
+                                .map(String::into_bytes)
+                        });
+
+                    Self::delete_entry(&tx, storage_key.as_bytes(), pointer_key).await?;
 
                     event.timestamp = new_timestamp;
                     event.state = QueueEventState::Pending;
                     event.processed_at = None;
-                    event.locked_until = None;
-                    event.locked_by = None;
 
-                    let new_key = format!(
-                        "{}",
-                        Self::pending_key(partition, event.timestamp, &event.id)
-                    );
-
+                    let partition = self.partition_for_key(&event.key);
+                    let new_key = Self::pending_key(partition, event.timestamp, &event.id);
                     let bytes = serde_json::to_vec(&event)
                         .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
 
-                    tx.put(canonical_key.as_bytes(), bytes)
-                        .await
-                        .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
-                    tx.put(new_key.as_bytes(), canonical_key.as_bytes())
+                    tx.put(new_key.as_bytes(), bytes)
                         .await
                         .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
 
@@ -449,43 +397,55 @@ impl<E: TitoEngine> Queue<E> {
     }
 
     pub async fn clear(&self) -> Result<(), TitoError> {
+        for prefix in [
+            "queue:pending:",
+            "queue:completed:",
+            "queue:failed:",
+            "queue:dlq:",
+            LEGACY_EVENT_PREFIX,
+        ] {
+            self.engine
+                .delete_range(prefix.as_bytes(), Self::prefix_end(prefix).as_slice())
+                .await?;
+        }
         Ok(())
     }
 
-    pub async fn move_to_dlq<T: Serialize + Clone + Send + Sync + 'static>(
+    pub async fn move_to_failed<T: Serialize + Clone + Send + Sync + 'static>(
         &self,
         event: QueueEvent<T>,
         storage_key: &str,
     ) -> Result<(), TitoError> {
         let partition = self.partition_for_key(&event.key);
         let failed_at = Utc::now().timestamp();
-        let dlq_key = Self::dlq_key(partition, failed_at, &event.id);
+        let failed_key = Self::failed_key(partition, failed_at, &event.id);
 
         self.engine
             .transaction(|tx| {
-                let canonical_key = storage_key.to_string();
-                let dlq_key = dlq_key.clone();
+                let storage_key = storage_key.to_string();
+                let failed_key = failed_key.clone();
                 let mut event = event.clone();
-                async move {
-                    if let Some(locked_until) = event.locked_until {
-                        let processing_key =
-                            Self::processing_key(partition, locked_until, &event.id);
-                        tx.delete(processing_key.as_bytes()).await.map_err(|e| {
-                            TitoError::DeleteFailed(format!("Delete processing index: {}", e))
-                        })?;
-                    }
 
-                    event.state = QueueEventState::DeadLetter;
+                async move {
+                    let pointer_key = tx
+                        .get(storage_key.as_bytes())
+                        .await
+                        .map_err(|e| TitoError::QueryFailed(format!("Get queue event: {}", e)))?
+                        .and_then(|value| {
+                            String::from_utf8(value)
+                                .ok()
+                                .filter(|key| key.starts_with(LEGACY_EVENT_PREFIX))
+                                .map(String::into_bytes)
+                        });
+
+                    Self::delete_entry(&tx, storage_key.as_bytes(), pointer_key).await?;
+
+                    event.state = QueueEventState::Failed;
                     event.processed_at = Some(failed_at);
-                    event.locked_until = None;
-                    event.locked_by = None;
 
                     let bytes = serde_json::to_vec(&event)
                         .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
-                    tx.put(canonical_key.as_bytes(), bytes)
-                        .await
-                        .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
-                    tx.put(dlq_key.as_bytes(), canonical_key.as_bytes())
+                    tx.put(failed_key.as_bytes(), bytes)
                         .await
                         .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
 
@@ -495,16 +455,21 @@ impl<E: TitoEngine> Queue<E> {
             .await
     }
 
+    pub async fn move_to_dlq<T: Serialize + Clone + Send + Sync + 'static>(
+        &self,
+        event: QueueEvent<T>,
+        storage_key: &str,
+    ) -> Result<(), TitoError> {
+        self.move_to_failed(event, storage_key).await
+    }
+
     pub async fn delete_by_state_before(
         &self,
         state: QueueEventState,
         cutoff: i64,
         limit: u32,
     ) -> Result<usize, TitoError> {
-        if !matches!(
-            state,
-            QueueEventState::Completed | QueueEventState::DeadLetter
-        ) {
+        if state == QueueEventState::Pending {
             return Err(TitoError::InvalidInput(format!(
                 "Refusing to delete non-terminal queue state {}",
                 Self::state_value(state)
@@ -513,60 +478,50 @@ impl<E: TitoEngine> Queue<E> {
 
         self.engine
             .transaction(|tx| async move {
-                let prefix = Self::state_index_prefix(state);
-                let entries = if state == QueueEventState::Completed {
-                    let start = "queue:completed:00000000000000000000".to_string();
-                    let end = format!("queue:completed:{:020}:", cutoff.saturating_add(1));
-                    tx.scan(start.as_bytes()..end.as_bytes(), limit)
+                let mut deleted = 0usize;
+                for prefix in Self::state_prefixes(state) {
+                    if deleted >= limit as usize {
+                        break;
+                    }
+
+                    let entries = if state == QueueEventState::Completed {
+                        let start = format!("queue:completed:{:020}:", cutoff.saturating_add(1));
+                        tx.scan(
+                            "queue:completed:00000000000000000000".as_bytes()..start.as_bytes(),
+                            limit.saturating_sub(deleted as u32),
+                        )
                         .await
                         .map_err(|e| {
                             TitoError::QueryFailed(format!("Scan completed queue: {}", e))
                         })?
-                } else {
-                    let start = prefix.as_bytes();
-                    let mut end = prefix.as_bytes().to_vec();
-                    end.push(0xff);
-                    tx.scan(start..end.as_slice(), limit).await.map_err(|e| {
-                        TitoError::QueryFailed(format!(
-                            "Scan {} queue: {}",
-                            Self::state_value(state),
-                            e
-                        ))
-                    })?
-                };
-
-                let mut deleted = 0usize;
-                for (index_key, canonical_key_bytes) in entries {
-                    let Some(bytes) =
-                        tx.get(canonical_key_bytes.as_slice()).await.map_err(|e| {
-                            TitoError::QueryFailed(format!("Get queue event for delete: {}", e))
-                        })?
-                    else {
-                        tx.delete(index_key.as_slice()).await.map_err(|e| {
-                            TitoError::DeleteFailed(format!("Delete orphan queue index: {}", e))
-                        })?;
-                        continue;
+                    } else {
+                        tx.scan(
+                            prefix.as_bytes()..Self::prefix_end(prefix).as_slice(),
+                            limit.saturating_sub(deleted as u32),
+                        )
+                        .await
+                        .map_err(|e| TitoError::QueryFailed(format!("Scan failed queue: {}", e)))?
                     };
 
-                    let value: Value = serde_json::from_slice(&bytes)
-                        .map_err(|e| TitoError::DeserializationFailed(e.to_string()))?;
-                    let row_state = value.get("state").and_then(Value::as_str);
-                    let processed_at = value.get("processedAt").and_then(Value::as_i64);
-                    if row_state != Some(Self::state_value(state))
-                        || !processed_at.map_or(false, |processed_at| processed_at <= cutoff)
-                    {
-                        continue;
-                    }
+                    for (storage_key, value) in entries {
+                        let Some((event, pointer_key)) =
+                            Self::read_event_from_value::<Value>(&tx, &value).await?
+                        else {
+                            tx.delete(storage_key.as_slice()).await.map_err(|e| {
+                                TitoError::DeleteFailed(format!("Delete orphan queue index: {}", e))
+                            })?;
+                            continue;
+                        };
 
-                    tx.delete(index_key.as_slice()).await.map_err(|e| {
-                        TitoError::DeleteFailed(format!("Delete queue index: {}", e))
-                    })?;
-                    tx.delete(canonical_key_bytes.as_slice())
-                        .await
-                        .map_err(|e| {
-                            TitoError::DeleteFailed(format!("Delete queue event: {}", e))
-                        })?;
-                    deleted += 1;
+                        if event.state == state
+                            && event
+                                .processed_at
+                                .map_or(false, |processed_at| processed_at <= cutoff)
+                        {
+                            Self::delete_entry(&tx, storage_key.as_slice(), pointer_key).await?;
+                            deleted += 1;
+                        }
+                    }
                 }
 
                 Ok::<_, TitoError>(deleted)
@@ -574,9 +529,7 @@ impl<E: TitoEngine> Queue<E> {
             .await
     }
 
-    pub async fn find_by_state_after<
-        T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    >(
+    pub async fn find_by_state_after<T: DeserializeOwned + Clone + Send + Sync + 'static>(
         &self,
         state: QueueEventState,
         cutoff: i64,
@@ -584,104 +537,56 @@ impl<E: TitoEngine> Queue<E> {
     ) -> Result<Vec<(String, QueueEvent<T>)>, TitoError> {
         self.engine
             .transaction(|tx| async move {
-                let prefix = Self::state_index_prefix(state);
-                let entries = if state == QueueEventState::Completed {
-                    let start = format!("queue:completed:{:020}:", cutoff.saturating_add(1));
-                    let end = b"queue:completed:\xff".to_vec();
-                    tx.scan(start.as_bytes()..end.as_slice(), limit)
+                let mut events = Vec::new();
+                for prefix in Self::state_prefixes(state) {
+                    if events.len() >= limit as usize {
+                        break;
+                    }
+
+                    let entries = if state == QueueEventState::Completed {
+                        let start = format!("queue:completed:{:020}:", cutoff.saturating_add(1));
+                        tx.scan(
+                            start.as_bytes()..Self::prefix_end("queue:completed:").as_slice(),
+                            limit.saturating_sub(events.len() as u32),
+                        )
                         .await
                         .map_err(|e| {
                             TitoError::QueryFailed(format!("Scan completed queue: {}", e))
                         })?
-                } else {
-                    let start = prefix.as_bytes();
-                    let mut end = prefix.as_bytes().to_vec();
-                    end.push(0xff);
-                    tx.scan(start..end.as_slice(), limit).await.map_err(|e| {
-                        TitoError::QueryFailed(format!(
-                            "Scan {} queue: {}",
-                            Self::state_value(state),
-                            e
-                        ))
-                    })?
-                };
-
-                let mut events = Vec::new();
-                for (index_key, canonical_key_bytes) in entries {
-                    let canonical_key = String::from_utf8(canonical_key_bytes).map_err(|_| {
-                        TitoError::DeserializationFailed("Invalid queue index".to_string())
-                    })?;
-                    let Some(bytes) = tx
-                        .get(canonical_key.as_bytes())
+                    } else {
+                        tx.scan(
+                            prefix.as_bytes()..Self::prefix_end(prefix).as_slice(),
+                            limit.saturating_sub(events.len() as u32),
+                        )
                         .await
-                        .map_err(|e| TitoError::QueryFailed(format!("Get queue event: {}", e)))?
-                    else {
-                        tx.delete(index_key.as_slice()).await.map_err(|e| {
-                            TitoError::DeleteFailed(format!("Delete orphan queue index: {}", e))
-                        })?;
-                        continue;
+                        .map_err(|e| TitoError::QueryFailed(format!("Scan queue: {}", e)))?
                     };
 
-                    let event: QueueEvent<T> = serde_json::from_slice(&bytes)
-                        .map_err(|e| TitoError::DeserializationFailed(e.to_string()))?;
-                    let state_timestamp = match state {
-                        QueueEventState::Pending => Some(event.timestamp),
-                        QueueEventState::Processing => event.locked_until,
-                        QueueEventState::Completed | QueueEventState::DeadLetter => {
-                            event.processed_at
+                    for (storage_key, value) in entries {
+                        let Some((event, _)) =
+                            Self::read_event_from_value::<T>(&tx, &value).await?
+                        else {
+                            tx.delete(storage_key.as_slice()).await.map_err(|e| {
+                                TitoError::DeleteFailed(format!("Delete orphan queue index: {}", e))
+                            })?;
+                            continue;
+                        };
+
+                        if event.state == state
+                            && Self::state_timestamp(&event, state)
+                                .map_or(false, |timestamp| timestamp > cutoff)
+                        {
+                            let key = String::from_utf8(storage_key).map_err(|_| {
+                                TitoError::DeserializationFailed("Invalid queue key".to_string())
+                            })?;
+                            events.push((key, event));
                         }
-                    };
-                    if event.state == state
-                        && state_timestamp.map_or(false, |timestamp| timestamp > cutoff)
-                    {
-                        events.push((canonical_key, event));
                     }
                 }
 
                 Ok::<_, TitoError>(events)
             })
             .await
-    }
-
-    async fn delete_indexes_for_event<T: DeserializeOwned + Clone + Send + Sync + 'static>(
-        &self,
-        event: &QueueEvent<T>,
-        tx: &E::Transaction,
-    ) -> Result<(), TitoError> {
-        let partition = self.partition_for_key(&event.key);
-        match event.state {
-            QueueEventState::Pending => {
-                let key = Self::pending_key(partition, event.timestamp, &event.id);
-                tx.delete(key.as_bytes())
-                    .await
-                    .map_err(|e| TitoError::DeleteFailed(format!("Delete pending index: {}", e)))?;
-            }
-            QueueEventState::Processing => {
-                if let Some(locked_until) = event.locked_until {
-                    let key = Self::processing_key(partition, locked_until, &event.id);
-                    tx.delete(key.as_bytes()).await.map_err(|e| {
-                        TitoError::DeleteFailed(format!("Delete processing index: {}", e))
-                    })?;
-                }
-            }
-            QueueEventState::Completed => {
-                if let Some(processed_at) = event.processed_at {
-                    let key = Self::completed_key(processed_at, &event.id);
-                    tx.delete(key.as_bytes()).await.map_err(|e| {
-                        TitoError::DeleteFailed(format!("Delete completed index: {}", e))
-                    })?;
-                }
-            }
-            QueueEventState::DeadLetter => {
-                if let Some(processed_at) = event.processed_at {
-                    let key = Self::dlq_key(partition, processed_at, &event.id);
-                    tx.delete(key.as_bytes())
-                        .await
-                        .map_err(|e| TitoError::DeleteFailed(format!("Delete DLQ index: {}", e)))?;
-                }
-            }
-        }
-        Ok(())
     }
 }
 
@@ -832,7 +737,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queue_completion_is_durable() {
+    async fn ack_moves_pending_row_to_completed_row() {
         let engine = TestEngine::default();
         let queue = Queue::new(engine.clone(), QueueConfig::new(4));
         let event = QueueEvent::new(
@@ -841,7 +746,6 @@ mod tests {
                 value: "created".to_string(),
             },
         );
-        let event_id = event.id.clone();
 
         queue.publish(event).await.unwrap();
 
@@ -850,16 +754,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].1.state, QueueEventState::Processing);
+        assert_eq!(jobs[0].1.state, QueueEventState::Pending);
 
         queue.ack(&jobs[0].0).await.unwrap();
 
         let store = engine.store.lock().await;
-        let canonical_key = Queue::<TestEngine>::canonical_key(&event_id);
-        let bytes = store
-            .get(canonical_key.as_bytes())
+        assert!(store
+            .keys()
+            .all(|key| !key.starts_with(LEGACY_EVENT_PREFIX.as_bytes())));
+        assert!(store.keys().all(|key| !key.starts_with(b"queue:pending:")));
+        let completed = store
+            .iter()
+            .find(|(key, _)| key.starts_with(b"queue:completed:"))
+            .map(|(_, value)| value)
             .expect("completed queue event should remain durable");
-        let completed: QueueEvent<TestPayload> = serde_json::from_slice(bytes).unwrap();
+        let completed: QueueEvent<TestPayload> = serde_json::from_slice(completed).unwrap();
         assert_eq!(completed.state, QueueEventState::Completed);
         assert!(completed.processed_at.is_some());
     }
@@ -874,7 +783,6 @@ mod tests {
                 value: "updated".to_string(),
             },
         );
-        let event_id = event.id.clone();
 
         queue.publish(event).await.unwrap();
         let jobs = queue.pull::<TestPayload>(0, 10).await.unwrap();
@@ -889,8 +797,7 @@ mod tests {
         );
 
         let store = engine.store.lock().await;
-        let canonical_key = Queue::<TestEngine>::canonical_key(&event_id);
-        assert!(!store.contains_key(canonical_key.as_bytes()));
+        assert!(store.is_empty());
     }
 
     #[tokio::test]
@@ -905,6 +812,12 @@ mod tests {
         );
 
         queue.publish(event).await.unwrap();
+        let pending = queue
+            .find_by_state_after::<TestPayload>(QueueEventState::Pending, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+
         let jobs = queue.pull::<TestPayload>(0, 10).await.unwrap();
         queue.ack(&jobs[0].0).await.unwrap();
 
@@ -921,6 +834,36 @@ mod tests {
             .await
             .unwrap();
         assert!(completed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_events_are_terminal_without_a_dlq_row() {
+        let engine = TestEngine::default();
+        let queue = Queue::new(engine.clone(), QueueConfig::new(1));
+        let event = QueueEvent::new(
+            "store:store-1",
+            TestPayload {
+                value: "failed".to_string(),
+            },
+        );
+
+        queue.publish(event).await.unwrap();
+        let jobs = queue.pull::<TestPayload>(0, 10).await.unwrap();
+        queue
+            .move_to_failed(jobs[0].1.clone(), &jobs[0].0)
+            .await
+            .unwrap();
+
+        let failed = queue
+            .find_by_state_after::<TestPayload>(QueueEventState::Failed, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].1.state, QueueEventState::Failed);
+
+        let store = engine.store.lock().await;
+        assert!(store.keys().all(|key| !key.starts_with(b"queue:dlq:")));
+        assert!(store.keys().any(|key| key.starts_with(b"queue:failed:")));
     }
 
     #[tokio::test]

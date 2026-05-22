@@ -108,37 +108,33 @@ let mut query = posts.query_by_index("by_author");
 let results = query.value(&author_id).relationship("tags").execute().await?;
 ```
 
-## Event Processing
+## Queue Processing
 
-Events are written in the same transaction as data. Workers process them later.
+Queue events are partitioned by their business key, can be scheduled for a future timestamp, and are retained as completed rows after `ack` so downstream systems can replay recent work.
 
 ```rust
-let queue = Arc::new(TitoQueue { engine: db });
+use std::sync::Arc;
+use futures::FutureExt;
+use tito::{Queue, QueueConfig, QueueEvent, WorkerConfig};
+use tito::queue::run_worker;
+
+let queue = Arc::new(Queue::new(db.clone(), QueueConfig::new(4)));
+
+queue
+    .publish(QueueEvent::new("user:123", UserCreated { id: "123".into() }))
+    .await?;
 
 run_worker(
     queue,
-    "user".to_string(),
-    |event| async move {
-        match event.action.as_str() {
-            "INSERT" => handle_create(&event.entity_id()).await,
-            "UPDATE" => handle_update(&event.entity_id()).await,
-            "DELETE" => handle_delete(&event.entity_id()).await,
-            _ => Ok(()),
-        }
-    }.boxed(),
-    PartitionConfig::new(0),
-    is_leader,
+    WorkerConfig {
+        partition_range: 0..4,
+    },
+    |event: QueueEvent<UserCreated>| async move {
+        handle_user_created(event.payload).await
+    }
+    .boxed(),
     shutdown_rx,
 ).await;
-```
-
-## Scaling
-
-```rust
-PartitionConfig::new(0)
-PartitionConfig::new(1)
-PartitionConfig::new(2)
-PartitionConfig::new(3)
 ```
 
 ## Scheduled Events

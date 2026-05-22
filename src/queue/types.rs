@@ -3,10 +3,11 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum QueueEventState {
+    #[serde(alias = "processing")]
     Pending,
-    Processing,
     Completed,
-    DeadLetter,
+    #[serde(alias = "dead_letter")]
+    Failed,
 }
 
 impl Default for QueueEventState {
@@ -25,13 +26,7 @@ pub struct QueueEvent<T> {
     #[serde(default)]
     pub state: QueueEventState,
     #[serde(default)]
-    pub created_at: i64,
-    #[serde(default)]
     pub processed_at: Option<i64>,
-    #[serde(default)]
-    pub locked_until: Option<i64>,
-    #[serde(default)]
-    pub locked_by: Option<String>,
     pub retry_count: u32,
     pub max_retries: u32,
     pub errors: Vec<String>,
@@ -46,10 +41,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent
             payload,
             timestamp: now,
             state: QueueEventState::Pending,
-            created_at: now,
             processed_at: None,
-            locked_until: None,
-            locked_by: None,
             retry_count: 0,
             max_retries: 0,
             errors: Vec::new(),

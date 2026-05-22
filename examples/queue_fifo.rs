@@ -66,7 +66,6 @@ async fn main() -> Result<(), TitoError> {
     let worker_handle = run_worker(
         queue.clone(),
         WorkerConfig {
-            consumer: String::from("example-consumer"),
             partition_range: 0..1,
         },
         handler,
