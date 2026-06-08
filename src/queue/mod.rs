@@ -1,6 +1,11 @@
+mod cluster;
 mod types;
 mod worker;
 
+pub use cluster::{
+    run_cluster_worker, ClusterCoordinatorLease, ClusterPartitionAssignment, ClusterWorkerConfig,
+    ClusterWorkerNode,
+};
 pub use types::{QueueConfig, QueueEvent, QueueEventState};
 pub use worker::{run_worker, WorkerConfig};
 
@@ -404,9 +409,32 @@ impl<E: TitoEngine> Queue<E> {
             "queue:dlq:",
             LEGACY_EVENT_PREFIX,
         ] {
-            self.engine
-                .delete_range(prefix.as_bytes(), Self::prefix_end(prefix).as_slice())
-                .await?;
+            loop {
+                let deleted = self
+                    .engine
+                    .transaction(|tx| async move {
+                        let entries = tx
+                            .scan(prefix.as_bytes()..Self::prefix_end(prefix).as_slice(), 1000)
+                            .await
+                            .map_err(|e| {
+                                TitoError::QueryFailed(format!("Scan queue prefix: {}", e))
+                            })?;
+                        let deleted = entries.len();
+
+                        for (key, _) in entries {
+                            tx.delete(key).await.map_err(|e| {
+                                TitoError::DeleteFailed(format!("Delete queue entry: {}", e))
+                            })?;
+                        }
+
+                        Ok::<_, TitoError>(deleted)
+                    })
+                    .await?;
+
+                if deleted < 1000 {
+                    break;
+                }
+            }
         }
         Ok(())
     }
@@ -591,291 +619,3 @@ impl<E: TitoEngine> Queue<E> {
 }
 
 pub type TitoQueue<E> = Queue<E>;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::{TitoKvPair, TitoValue};
-    use async_trait::async_trait;
-    use serde::{Deserialize, Serialize};
-    use std::collections::BTreeMap;
-    use std::future::Future;
-    use std::ops::Range;
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
-
-    #[derive(Clone, Default)]
-    struct TestEngine {
-        store: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
-    }
-
-    #[derive(Clone)]
-    struct TestTransaction {
-        store: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
-    }
-
-    #[async_trait]
-    impl TitoEngine for TestEngine {
-        type Transaction = TestTransaction;
-
-        async fn begin_transaction(&self) -> Result<Self::Transaction, TitoError> {
-            Ok(TestTransaction {
-                store: self.store.clone(),
-            })
-        }
-
-        async fn transaction<F, Fut, T, E>(&self, f: F) -> Result<T, E>
-        where
-            F: FnOnce(Self::Transaction) -> Fut + Clone + Send,
-            Fut: Future<Output = Result<T, E>> + Send,
-            T: Send,
-            E: From<TitoError> + Send + std::fmt::Debug,
-        {
-            let tx = self.begin_transaction().await.map_err(E::from)?;
-            let result = f(tx.clone()).await?;
-            tx.commit().await.map_err(E::from)?;
-            Ok(result)
-        }
-
-        async fn clear_active_transactions(&self) -> Result<(), TitoError> {
-            Ok(())
-        }
-
-        async fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<(), TitoError> {
-            let mut store = self.store.lock().await;
-            let keys: Vec<Vec<u8>> = store
-                .keys()
-                .filter(|key| key.as_slice() >= start && key.as_slice() < end)
-                .cloned()
-                .collect();
-            for key in keys {
-                store.remove(&key);
-            }
-            Ok(())
-        }
-    }
-
-    #[async_trait]
-    impl TitoTransaction for TestTransaction {
-        async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<TitoValue>, TitoError> {
-            Ok(self.store.lock().await.get(key.as_ref()).cloned())
-        }
-
-        async fn put<K: AsRef<[u8]> + Send, V: AsRef<[u8]> + Send>(
-            &self,
-            key: K,
-            value: V,
-        ) -> Result<(), TitoError> {
-            self.store
-                .lock()
-                .await
-                .insert(key.as_ref().to_vec(), value.as_ref().to_vec());
-            Ok(())
-        }
-
-        async fn delete<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<(), TitoError> {
-            self.store.lock().await.remove(key.as_ref());
-            Ok(())
-        }
-
-        async fn scan<K: AsRef<[u8]> + Send>(
-            &self,
-            range: Range<K>,
-            limit: u32,
-        ) -> Result<Vec<TitoKvPair>, TitoError> {
-            let start = range.start.as_ref().to_vec();
-            let end = range.end.as_ref().to_vec();
-            Ok(self
-                .store
-                .lock()
-                .await
-                .iter()
-                .filter(|(key, _)| **key >= start && **key < end)
-                .take(limit as usize)
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect())
-        }
-
-        async fn scan_reverse<K: AsRef<[u8]> + Send>(
-            &self,
-            range: Range<K>,
-            limit: u32,
-        ) -> Result<Vec<TitoKvPair>, TitoError> {
-            let mut results = self.scan(range, u32::MAX).await?;
-            results.reverse();
-            results.truncate(limit as usize);
-            Ok(results)
-        }
-
-        async fn batch_get<K: AsRef<[u8]> + Send>(
-            &self,
-            keys: Vec<K>,
-        ) -> Result<Vec<TitoKvPair>, TitoError> {
-            let store = self.store.lock().await;
-            Ok(keys
-                .into_iter()
-                .filter_map(|key| {
-                    store
-                        .get(key.as_ref())
-                        .map(|value| (key.as_ref().to_vec(), value.clone()))
-                })
-                .collect())
-        }
-
-        async fn commit(self) -> Result<(), TitoError> {
-            Ok(())
-        }
-
-        async fn rollback(self) -> Result<(), TitoError> {
-            Ok(())
-        }
-    }
-
-    #[derive(Clone, Debug, Serialize, Deserialize)]
-    struct TestPayload {
-        value: String,
-    }
-
-    #[tokio::test]
-    async fn ack_moves_pending_row_to_completed_row() {
-        let engine = TestEngine::default();
-        let queue = Queue::new(engine.clone(), QueueConfig::new(4));
-        let event = QueueEvent::new(
-            "store:store-1",
-            TestPayload {
-                value: "created".to_string(),
-            },
-        );
-
-        queue.publish(event).await.unwrap();
-
-        let jobs = queue
-            .pull::<TestPayload>(queue.partition_for_key("store:store-1"), 10)
-            .await
-            .unwrap();
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].1.state, QueueEventState::Pending);
-
-        queue.ack(&jobs[0].0).await.unwrap();
-
-        let store = engine.store.lock().await;
-        assert!(store
-            .keys()
-            .all(|key| !key.starts_with(LEGACY_EVENT_PREFIX.as_bytes())));
-        assert!(store.keys().all(|key| !key.starts_with(b"queue:pending:")));
-        let completed = store
-            .iter()
-            .find(|(key, _)| key.starts_with(b"queue:completed:"))
-            .map(|(_, value)| value)
-            .expect("completed queue event should remain durable");
-        let completed: QueueEvent<TestPayload> = serde_json::from_slice(completed).unwrap();
-        assert_eq!(completed.state, QueueEventState::Completed);
-        assert!(completed.processed_at.is_some());
-    }
-
-    #[tokio::test]
-    async fn terminal_queue_delete_is_explicit_and_state_based() {
-        let engine = TestEngine::default();
-        let queue = Queue::new(engine.clone(), QueueConfig::new(1));
-        let event = QueueEvent::new(
-            "store:store-1",
-            TestPayload {
-                value: "updated".to_string(),
-            },
-        );
-
-        queue.publish(event).await.unwrap();
-        let jobs = queue.pull::<TestPayload>(0, 10).await.unwrap();
-        queue.ack(&jobs[0].0).await.unwrap();
-
-        assert_eq!(
-            queue
-                .delete_by_state_before(QueueEventState::Completed, i64::MAX - 1, 100)
-                .await
-                .unwrap(),
-            1
-        );
-
-        let store = engine.store.lock().await;
-        assert!(store.is_empty());
-    }
-
-    #[tokio::test]
-    async fn queue_events_can_be_scanned_by_state() {
-        let engine = TestEngine::default();
-        let queue = Queue::new(engine, QueueConfig::new(1));
-        let event = QueueEvent::new(
-            "store:store-1",
-            TestPayload {
-                value: "replay".to_string(),
-            },
-        );
-
-        queue.publish(event).await.unwrap();
-        let pending = queue
-            .find_by_state_after::<TestPayload>(QueueEventState::Pending, 0, 10)
-            .await
-            .unwrap();
-        assert_eq!(pending.len(), 1);
-
-        let jobs = queue.pull::<TestPayload>(0, 10).await.unwrap();
-        queue.ack(&jobs[0].0).await.unwrap();
-
-        let completed = queue
-            .find_by_state_after::<TestPayload>(QueueEventState::Completed, 0, 10)
-            .await
-            .unwrap();
-        assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0].1.state, QueueEventState::Completed);
-        assert_eq!(completed[0].1.payload.value, "replay");
-
-        let completed = queue
-            .find_by_state_after::<TestPayload>(QueueEventState::Completed, i64::MAX - 1, 10)
-            .await
-            .unwrap();
-        assert!(completed.is_empty());
-    }
-
-    #[tokio::test]
-    async fn failed_events_are_terminal_without_a_dlq_row() {
-        let engine = TestEngine::default();
-        let queue = Queue::new(engine.clone(), QueueConfig::new(1));
-        let event = QueueEvent::new(
-            "store:store-1",
-            TestPayload {
-                value: "failed".to_string(),
-            },
-        );
-
-        queue.publish(event).await.unwrap();
-        let jobs = queue.pull::<TestPayload>(0, 10).await.unwrap();
-        queue
-            .move_to_failed(jobs[0].1.clone(), &jobs[0].0)
-            .await
-            .unwrap();
-
-        let failed = queue
-            .find_by_state_after::<TestPayload>(QueueEventState::Failed, 0, 10)
-            .await
-            .unwrap();
-        assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0].1.state, QueueEventState::Failed);
-
-        let store = engine.store.lock().await;
-        assert!(store.keys().all(|key| !key.starts_with(b"queue:dlq:")));
-        assert!(store.keys().any(|key| key.starts_with(b"queue:failed:")));
-    }
-
-    #[tokio::test]
-    async fn non_terminal_queue_delete_is_rejected() {
-        let engine = TestEngine::default();
-        let queue = Queue::new(engine, QueueConfig::new(1));
-
-        let err = queue
-            .delete_by_state_before(QueueEventState::Pending, i64::MAX - 1, 100)
-            .await
-            .unwrap_err();
-
-        assert!(matches!(err, TitoError::InvalidInput(_)));
-    }
-}

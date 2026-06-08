@@ -28,6 +28,9 @@ pub mod relationship;
 pub use error::TitoError;
 pub use types::{PartitionConfig, TitoEngine, TitoModelOptions, TitoModelTrait, PARTITION_DIGITS};
 
-pub use queue::{Queue, QueueConfig, QueueEvent, QueueEventState, TitoQueue, WorkerConfig};
+pub use queue::{
+    run_cluster_worker, ClusterCoordinatorLease, ClusterPartitionAssignment, ClusterWorkerConfig,
+    ClusterWorkerNode, Queue, QueueConfig, QueueEvent, QueueEventState, TitoQueue, WorkerConfig,
+};
 
 pub use utils::next_string_lexicographically;
