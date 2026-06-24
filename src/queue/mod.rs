@@ -20,8 +20,6 @@ use serde_json::Value;
 use crate::types::{TitoEngine, TitoTransaction, PARTITION_DIGITS};
 use crate::TitoError;
 
-const LEGACY_EVENT_PREFIX: &str = "queue:event:";
-
 #[derive(Clone)]
 pub struct Queue<E: TitoEngine> {
     pub engine: E,
@@ -94,81 +92,31 @@ impl<E: TitoEngine> Queue<E> {
     }
 
     async fn read_event_from_value<T: DeserializeOwned + Clone + Send + Sync + 'static>(
-        tx: &E::Transaction,
         value: &[u8],
-    ) -> Result<Option<(QueueEvent<T>, Option<Vec<u8>>)>, TitoError> {
-        if let Ok(event) = serde_json::from_slice::<QueueEvent<T>>(value) {
-            return Ok(Some((event, None)));
-        }
-
-        let pointer = String::from_utf8(value.to_vec()).map_err(|_| {
-            TitoError::DeserializationFailed("Invalid queue event bytes".to_string())
-        })?;
-        if !pointer.starts_with(LEGACY_EVENT_PREFIX) {
-            return Err(TitoError::DeserializationFailed(
-                "Invalid queue event bytes".to_string(),
-            ));
-        }
-
-        let Some(bytes) = tx
-            .get(pointer.as_bytes())
-            .await
-            .map_err(|e| TitoError::QueryFailed(format!("Get legacy queue event: {}", e)))?
-        else {
-            return Ok(None);
-        };
-
-        let event = serde_json::from_slice::<QueueEvent<T>>(&bytes)
-            .map_err(|e| TitoError::DeserializationFailed(e.to_string()))?;
-        Ok(Some((event, Some(pointer.into_bytes()))))
+    ) -> Result<QueueEvent<T>, TitoError> {
+        serde_json::from_slice::<QueueEvent<T>>(value)
+            .map_err(|e| TitoError::DeserializationFailed(e.to_string()))
     }
 
-    async fn read_value_from_entry(
-        tx: &E::Transaction,
-        value: &[u8],
-    ) -> Result<Option<(Value, Option<Vec<u8>>)>, TitoError> {
+    async fn read_value_from_entry(value: &[u8]) -> Result<Value, TitoError> {
         if let Ok(event) = serde_json::from_slice::<Value>(value) {
             if event.get("id").is_some() && event.get("key").is_some() {
-                return Ok(Some((event, None)));
+                return Ok(event);
             }
         }
 
-        let pointer = String::from_utf8(value.to_vec()).map_err(|_| {
-            TitoError::DeserializationFailed("Invalid queue event bytes".to_string())
-        })?;
-        if !pointer.starts_with(LEGACY_EVENT_PREFIX) {
-            return Err(TitoError::DeserializationFailed(
-                "Invalid queue event bytes".to_string(),
-            ));
-        }
-
-        let Some(bytes) = tx
-            .get(pointer.as_bytes())
-            .await
-            .map_err(|e| TitoError::QueryFailed(format!("Get legacy queue event: {}", e)))?
-        else {
-            return Ok(None);
-        };
-
-        let event = serde_json::from_slice::<Value>(&bytes)
-            .map_err(|e| TitoError::DeserializationFailed(e.to_string()))?;
-        Ok(Some((event, Some(pointer.into_bytes()))))
+        Err(TitoError::DeserializationFailed(
+            "Invalid queue event bytes".to_string(),
+        ))
     }
 
     async fn delete_entry(
         tx: &E::Transaction,
         storage_key: &[u8],
-        pointer_key: Option<Vec<u8>>,
     ) -> Result<(), TitoError> {
         tx.delete(storage_key)
             .await
-            .map_err(|e| TitoError::DeleteFailed(format!("Delete queue event: {}", e)))?;
-        if let Some(pointer_key) = pointer_key {
-            tx.delete(pointer_key.as_slice()).await.map_err(|e| {
-                TitoError::DeleteFailed(format!("Delete legacy queue event: {}", e))
-            })?;
-        }
-        Ok(())
+            .map_err(|e| TitoError::DeleteFailed(format!("Delete queue event: {}", e)))
     }
 
     pub async fn publish_in_tx<T: Serialize + Clone + Send + Sync + 'static>(
@@ -232,8 +180,7 @@ impl<E: TitoEngine> Queue<E> {
 
                 let mut jobs = Vec::new();
                 for (storage_key, value) in entries {
-                    let Some((event, _)) = Self::read_event_from_value::<T>(&tx, &value).await?
-                    else {
+                    let Ok(event) = Self::read_event_from_value::<T>(&value).await else {
                         tx.delete(storage_key.as_slice()).await.map_err(|e| {
                             TitoError::DeleteFailed(format!("Delete orphan queue index: {}", e))
                         })?;
@@ -272,9 +219,7 @@ impl<E: TitoEngine> Queue<E> {
                 .map_err(|e| TitoError::QueryFailed(format!("Scan queue: {}", e)))?;
 
             for (storage_key, value) in entries {
-                let Some((event, pointer_key)) =
-                    Self::read_event_from_value::<T>(tx, &value).await?
-                else {
+                let Ok(event) = Self::read_event_from_value::<T>(&value).await else {
                     tx.delete(storage_key.as_slice()).await.map_err(|e| {
                         TitoError::DeleteFailed(format!("Delete orphan queue index: {}", e))
                     })?;
@@ -282,7 +227,7 @@ impl<E: TitoEngine> Queue<E> {
                 };
 
                 if event.key == key {
-                    Self::delete_entry(tx, storage_key.as_slice(), pointer_key).await?;
+                    Self::delete_entry(tx, storage_key.as_slice()).await?;
                     deleted += 1;
                 }
             }
@@ -317,9 +262,7 @@ impl<E: TitoEngine> Queue<E> {
                         return Ok::<_, TitoError>(());
                     };
 
-                    let Some((mut event, pointer_key)) =
-                        Self::read_value_from_entry(&tx, &bytes).await?
-                    else {
+                    let Ok(mut event) = Self::read_value_from_entry(&bytes).await else {
                         tx.delete(key.as_bytes()).await.map_err(|e| {
                             TitoError::DeleteFailed(format!("Delete orphan queue index: {}", e))
                         })?;
@@ -342,7 +285,7 @@ impl<E: TitoEngine> Queue<E> {
                     let completed_bytes = serde_json::to_vec(&event)
                         .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
 
-                    Self::delete_entry(&tx, key.as_bytes(), pointer_key).await?;
+                    Self::delete_entry(&tx, key.as_bytes()).await?;
                     tx.put(completed_key.as_bytes(), completed_bytes)
                         .await
                         .map_err(|e| {
@@ -369,18 +312,7 @@ impl<E: TitoEngine> Queue<E> {
                 let mut event = event.clone();
 
                 async move {
-                    let pointer_key = tx
-                        .get(storage_key.as_bytes())
-                        .await
-                        .map_err(|e| TitoError::QueryFailed(format!("Get queue event: {}", e)))?
-                        .and_then(|value| {
-                            String::from_utf8(value)
-                                .ok()
-                                .filter(|key| key.starts_with(LEGACY_EVENT_PREFIX))
-                                .map(String::into_bytes)
-                        });
-
-                    Self::delete_entry(&tx, storage_key.as_bytes(), pointer_key).await?;
+                    Self::delete_entry(&tx, storage_key.as_bytes()).await?;
 
                     event.timestamp = new_timestamp;
                     event.state = QueueEventState::Pending;
@@ -407,7 +339,6 @@ impl<E: TitoEngine> Queue<E> {
             "queue:completed:",
             "queue:failed:",
             "queue:dlq:",
-            LEGACY_EVENT_PREFIX,
         ] {
             loop {
                 let deleted = self
@@ -455,18 +386,7 @@ impl<E: TitoEngine> Queue<E> {
                 let mut event = event.clone();
 
                 async move {
-                    let pointer_key = tx
-                        .get(storage_key.as_bytes())
-                        .await
-                        .map_err(|e| TitoError::QueryFailed(format!("Get queue event: {}", e)))?
-                        .and_then(|value| {
-                            String::from_utf8(value)
-                                .ok()
-                                .filter(|key| key.starts_with(LEGACY_EVENT_PREFIX))
-                                .map(String::into_bytes)
-                        });
-
-                    Self::delete_entry(&tx, storage_key.as_bytes(), pointer_key).await?;
+                    Self::delete_entry(&tx, storage_key.as_bytes()).await?;
 
                     event.state = QueueEventState::Failed;
                     event.processed_at = Some(failed_at);
@@ -532,9 +452,7 @@ impl<E: TitoEngine> Queue<E> {
                     };
 
                     for (storage_key, value) in entries {
-                        let Some((event, pointer_key)) =
-                            Self::read_event_from_value::<Value>(&tx, &value).await?
-                        else {
+                        let Ok(event) = Self::read_event_from_value::<Value>(&value).await else {
                             tx.delete(storage_key.as_slice()).await.map_err(|e| {
                                 TitoError::DeleteFailed(format!("Delete orphan queue index: {}", e))
                             })?;
@@ -546,7 +464,7 @@ impl<E: TitoEngine> Queue<E> {
                                 .processed_at
                                 .map_or(false, |processed_at| processed_at <= cutoff)
                         {
-                            Self::delete_entry(&tx, storage_key.as_slice(), pointer_key).await?;
+                            Self::delete_entry(&tx, storage_key.as_slice()).await?;
                             deleted += 1;
                         }
                     }
@@ -591,9 +509,7 @@ impl<E: TitoEngine> Queue<E> {
                     };
 
                     for (storage_key, value) in entries {
-                        let Some((event, _)) =
-                            Self::read_event_from_value::<T>(&tx, &value).await?
-                        else {
+                        let Ok(event) = Self::read_event_from_value::<T>(&value).await else {
                             tx.delete(storage_key.as_slice()).await.map_err(|e| {
                                 TitoError::DeleteFailed(format!("Delete orphan queue index: {}", e))
                             })?;
