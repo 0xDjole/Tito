@@ -32,6 +32,12 @@ pub struct QueueEvent<T> {
     pub errors: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct QueueScanPage<T> {
+    pub events: Vec<(String, QueueEvent<T>)>,
+    pub next_cursor: Option<Vec<u8>>,
+}
+
 impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent<T> {
     pub fn new(key: impl Into<String>, payload: T) -> Self {
         let now = chrono::Utc::now().timestamp();

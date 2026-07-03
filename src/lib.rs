@@ -30,7 +30,8 @@ pub use types::{PartitionConfig, TitoEngine, TitoModelOptions, TitoModelTrait, P
 
 pub use queue::{
     run_cluster_worker, ClusterCoordinatorLease, ClusterPartitionAssignment, ClusterWorkerConfig,
-    ClusterWorkerNode, Queue, QueueConfig, QueueEvent, QueueEventState, TitoQueue, WorkerConfig,
+    ClusterWorkerNode, Queue, QueueConfig, QueueEvent, QueueEventState, QueueScanPage, TitoQueue,
+    WorkerConfig,
 };
 
 pub use utils::next_string_lexicographically;
