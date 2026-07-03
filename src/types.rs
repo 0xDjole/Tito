@@ -192,9 +192,11 @@ impl TitoId {
             r#type: r#type.to_string(),
         }
     }
+}
 
-    pub fn to_string(&self) -> String {
-        format!("{}:{}", self.r#type, self.id)
+impl std::fmt::Display for TitoId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}:{}", self.r#type, self.id)
     }
 }
 
@@ -261,7 +263,7 @@ pub struct TitoCursor {
 impl TitoCursor {
     pub fn first_id(&self) -> Result<String, TitoError> {
         self.ids
-            .get(0)
+            .first()
             .and_then(|id_option| id_option.as_ref())
             .map(|id| id.to_string())
             .ok_or(TitoError::InvalidInput(

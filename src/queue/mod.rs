@@ -470,7 +470,7 @@ impl<E: TitoEngine> Queue<E> {
                         if event.state == state
                             && event
                                 .processed_at
-                                .map_or(false, |processed_at| processed_at <= cutoff)
+                                .is_some_and(|processed_at| processed_at <= cutoff)
                         {
                             Self::delete_entry(&tx, storage_key.as_slice()).await?;
                             deleted += 1;
@@ -526,7 +526,7 @@ impl<E: TitoEngine> Queue<E> {
 
                         if event.state == state
                             && Self::state_timestamp(&event, state)
-                                .map_or(false, |timestamp| timestamp > cutoff)
+                                .is_some_and(|timestamp| timestamp > cutoff)
                         {
                             let key = String::from_utf8(storage_key).map_err(|_| {
                                 TitoError::DeserializationFailed("Invalid queue key".to_string())
@@ -602,154 +602,8 @@ pub type TitoQueue<E> = Queue<E>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
+    use crate::test_support::MemoryEngine;
     use serde::{Deserialize, Serialize};
-    use std::collections::BTreeMap;
-    use std::future::Future;
-    use std::ops::Range;
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
-
-    #[derive(Clone, Default)]
-    struct MemoryEngine {
-        data: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
-    }
-
-    #[derive(Clone)]
-    struct MemoryTransaction {
-        data: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
-    }
-
-    impl MemoryEngine {
-        async fn put_raw(&self, key: &str, value: Vec<u8>) {
-            self.data
-                .lock()
-                .await
-                .insert(key.as_bytes().to_vec(), value);
-        }
-
-        async fn contains_key(&self, key: &str) -> bool {
-            self.data.lock().await.contains_key(key.as_bytes())
-        }
-    }
-
-    #[async_trait]
-    impl TitoEngine for MemoryEngine {
-        type Transaction = MemoryTransaction;
-
-        async fn begin_transaction(&self) -> Result<Self::Transaction, TitoError> {
-            Ok(MemoryTransaction {
-                data: self.data.clone(),
-            })
-        }
-
-        async fn transaction<F, Fut, T, E>(&self, f: F) -> Result<T, E>
-        where
-            F: FnOnce(Self::Transaction) -> Fut + Clone + Send,
-            Fut: Future<Output = Result<T, E>> + Send,
-            T: Send,
-            E: From<TitoError> + Send + std::fmt::Debug,
-        {
-            f(self.begin_transaction().await.map_err(E::from)?).await
-        }
-
-        async fn clear_active_transactions(&self) -> Result<(), TitoError> {
-            Ok(())
-        }
-
-        async fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<(), TitoError> {
-            let mut data = self.data.lock().await;
-            let keys: Vec<Vec<u8>> = data
-                .range(start.to_vec()..end.to_vec())
-                .map(|(key, _)| key.clone())
-                .collect();
-            for key in keys {
-                data.remove(&key);
-            }
-            Ok(())
-        }
-    }
-
-    #[async_trait]
-    impl TitoTransaction for MemoryTransaction {
-        async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<Vec<u8>>, TitoError> {
-            Ok(self.data.lock().await.get(key.as_ref()).cloned())
-        }
-
-        async fn put<K: AsRef<[u8]> + Send, V: AsRef<[u8]> + Send>(
-            &self,
-            key: K,
-            value: V,
-        ) -> Result<(), TitoError> {
-            self.data
-                .lock()
-                .await
-                .insert(key.as_ref().to_vec(), value.as_ref().to_vec());
-            Ok(())
-        }
-
-        async fn delete<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<(), TitoError> {
-            self.data.lock().await.remove(key.as_ref());
-            Ok(())
-        }
-
-        async fn scan<K: AsRef<[u8]> + Send>(
-            &self,
-            range: Range<K>,
-            limit: u32,
-        ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TitoError> {
-            let start = range.start.as_ref().to_vec();
-            let end = range.end.as_ref().to_vec();
-            Ok(self
-                .data
-                .lock()
-                .await
-                .range(start..end)
-                .take(limit as usize)
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect())
-        }
-
-        async fn scan_reverse<K: AsRef<[u8]> + Send>(
-            &self,
-            range: Range<K>,
-            limit: u32,
-        ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TitoError> {
-            let start = range.start.as_ref().to_vec();
-            let end = range.end.as_ref().to_vec();
-            Ok(self
-                .data
-                .lock()
-                .await
-                .range(start..end)
-                .rev()
-                .take(limit as usize)
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect())
-        }
-
-        async fn batch_get<K: AsRef<[u8]> + Send>(
-            &self,
-            keys: Vec<K>,
-        ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TitoError> {
-            let data = self.data.lock().await;
-            Ok(keys
-                .into_iter()
-                .filter_map(|key| {
-                    let bytes = key.as_ref().to_vec();
-                    data.get(&bytes).map(|value| (bytes, value.clone()))
-                })
-                .collect())
-        }
-
-        async fn commit(self) -> Result<(), TitoError> {
-            Ok(())
-        }
-
-        async fn rollback(self) -> Result<(), TitoError> {
-            Ok(())
-        }
-    }
 
     #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
     struct Payload {

@@ -87,9 +87,9 @@ impl ClusterPartitionAssignment {
     }
 
     fn owner_is_active(&self, active_nodes: &BTreeSet<String>, now: i64) -> bool {
-        self.owner_node_id.as_ref().map_or(false, |owner| {
-            active_nodes.contains(owner) && self.lease_until > now
-        })
+        self.owner_node_id
+            .as_ref()
+            .is_some_and(|owner| active_nodes.contains(owner) && self.lease_until > now)
     }
 }
 

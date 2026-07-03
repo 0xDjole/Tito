@@ -107,7 +107,7 @@ impl<
         &self,
         items: &Vec<(String, Value)>,
         rels_config: &[TitoRelationshipConfig],
-        rels: &Vec<String>,
+        rels: &[String],
     ) -> Vec<(TitoRelationshipConfig, String)> {
         let mut relationship_keys_to_fetch = Vec::new();
 

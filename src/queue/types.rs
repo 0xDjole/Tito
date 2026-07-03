@@ -1,19 +1,14 @@
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum QueueEventState {
     #[serde(alias = "processing")]
+    #[default]
     Pending,
     Completed,
     #[serde(alias = "dead_letter")]
     Failed,
-}
-
-impl Default for QueueEventState {
-    fn default() -> Self {
-        Self::Pending
-    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

@@ -59,7 +59,7 @@ impl<
                                 match value.as_str() {
                                     Some("") => Some(format!("{}:{}.__null__", field.name, key)),
                                     Some(s) => {
-                                        Some(format!("{}:{}.{}", field.name, key, safe_encode(&s)))
+                                        Some(format!("{}:{}.{}", field.name, key, safe_encode(s)))
                                     }
                                     None => Some(format!("{}:{}.__null__", field.name, key)),
                                 }
@@ -73,7 +73,7 @@ impl<
                             TitoIndexBlockType::String | TitoIndexBlockType::Custom(_) => {
                                 match value.as_str() {
                                     Some("") => Some(format!("{}:__null__", field.name)),
-                                    Some(s) => Some(format!("{}:{}", field.name, safe_encode(&s))),
+                                    Some(s) => Some(format!("{}:{}", field.name, safe_encode(s))),
                                     None => Some(format!("{}:__null__", field.name)),
                                 }
                             }
@@ -339,7 +339,7 @@ impl<
             )
             .await?;
 
-        if let Some(value) = items.get(0) {
+        if let Some(value) = items.first() {
             match serde_json::from_value::<T>(value.1.clone()) {
                 Ok(item) => Ok(item),
                 Err(e) => Err(TitoError::NotFound(format!(

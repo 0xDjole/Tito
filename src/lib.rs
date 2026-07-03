@@ -25,6 +25,12 @@ pub mod index;
 
 pub mod relationship;
 
+#[cfg(test)]
+mod test_support;
+
+#[cfg(test)]
+mod tito_tests;
+
 pub use error::TitoError;
 pub use types::{PartitionConfig, TitoEngine, TitoModelOptions, TitoModelTrait, PARTITION_DIGITS};
 

@@ -113,9 +113,9 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         if let Ok(value) = serde_json::from_slice::<TitoCursor>(&cursor) {
             return Ok(value);
         }
-        return Err(TitoError::DeserializationFailed(
+        Err(TitoError::DeserializationFailed(
             "Failed to deserialize cursor".to_string(),
-        ));
+        ))
     }
 
     fn encode_cursors(&self, ids: Vec<Option<String>>) -> Result<String, TitoError> {
@@ -204,10 +204,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             if let serde_json::Value::Object(ref mut map) = value {
                 let now = Utc::now().timestamp();
 
-                let is_new = match tx.get(&key).await {
-                    Ok(Some(_)) => false,
-                    _ => true,
-                };
+                let is_new = !matches!(tx.get(&key).await, Ok(Some(_)));
                 if is_new {
                     map.insert("created_at".to_string(), serde_json::json!(now));
                 }
@@ -426,7 +423,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             }
         };
 
-        if let Some(value) = items.get(0) {
+        if let Some(value) = items.first() {
             serde_json::from_value(value.1.clone()).map_err(|err| {
                 TitoError::NotFound(format!(
                     "Failed to deserialize record with id '{}': {}",
@@ -480,7 +477,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     where
         T: DeserializeOwned,
     {
-        let mut start_bound = format!("{}", payload.start);
+        let mut start_bound = payload.start.clone();
         if let Some(cursor) = payload.cursor.clone() {
             let cursor = self.decode_cursor(cursor)?.first_id()?;
             let after_cursor = next_string_lexicographically(cursor);
@@ -598,7 +595,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     where
         T: DeserializeOwned,
     {
-        let start_bound = format!("{}", payload.start.clone());
+        let start_bound = payload.start.clone();
 
         let mut end_bound = if let Some(end) = payload.end {
             end
@@ -668,7 +665,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         tx: &E::Transaction,
     ) -> Result<Vec<(String, Value)>, TitoError> {
         match tx.batch_get(keys).await {
-            Ok(res) => self.to_results(res.into_iter()),
+            Ok(res) => self.to_results(res),
             Err(e) => Err(e),
         }
     }
