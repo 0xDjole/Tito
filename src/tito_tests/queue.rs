@@ -10,6 +10,7 @@ fn queue_event_helpers_parse_key_and_update_builder_fields() {
     assert_eq!(event.key_value(), "entry-1");
     assert_eq!(event.event().name, "payload");
     assert_eq!(event.timestamp, 123);
+    assert_eq!(event.original_scheduled_at(), 123);
     assert_eq!(event.max_retries, 5);
 }
 
@@ -34,14 +35,14 @@ async fn queue_ack_deletes_orphan_event_bytes() {
 }
 
 #[tokio::test]
-async fn queue_reschedule_moves_pulled_event_to_new_pending_timestamp() {
+async fn queue_reschedule_updates_due_time_but_preserves_original_schedule() {
     let engine = engine();
     let queue = queue(engine.clone(), 1);
     let now = Utc::now().timestamp();
-    queue
-        .publish(queue_event("event-1", "entry:1", now - 10))
-        .await
-        .unwrap();
+    let original_timestamp = now - 10;
+    let mut legacy_event = queue_event("event-1", "entry:1", original_timestamp);
+    legacy_event.original_scheduled_at = None;
+    queue.publish(legacy_event).await.unwrap();
 
     let pulled = queue.pull::<QueuePayload>(0, 10).await.unwrap();
     assert_eq!(pulled.len(), 1);
@@ -61,6 +62,45 @@ async fn queue_reschedule_moves_pulled_event_to_new_pending_timestamp() {
         .unwrap();
     assert_eq!(page.events.len(), 1);
     assert_eq!(page.events[0].1.timestamp, future_timestamp);
+    assert_eq!(page.events[0].1.original_scheduled_at(), original_timestamp);
+    assert!(
+        page.events[0].0.contains(&format!(":{future_timestamp}:")),
+        "retry not-before time belongs in the pending storage key"
+    );
+    let scheduled_after_now = queue
+        .find_by_state_after::<QueuePayload>(QueueEventState::Pending, now, 10)
+        .await
+        .unwrap();
+    assert_eq!(scheduled_after_now.len(), 1);
+    assert_eq!(scheduled_after_now[0].1.id, "event-1");
+}
+
+#[test]
+fn queue_event_without_original_schedule_falls_back_to_timestamp() {
+    let legacy = serde_json::json!({
+        "id": "legacy-event",
+        "key": "entry:legacy",
+        "payload": { "name": "legacy" },
+        "timestamp": 123,
+        "state": "pending",
+        "processedAt": null,
+        "retryCount": 0,
+        "maxRetries": 3,
+        "errors": []
+    });
+    let event: QueueEvent<QueuePayload> = serde_json::from_value(legacy).unwrap();
+
+    assert_eq!(event.original_scheduled_at, None);
+    assert_eq!(event.original_scheduled_at(), 123);
+}
+
+#[test]
+fn queue_retry_backoff_is_exponential_and_capped() {
+    assert_eq!(retry_backoff_seconds(1), 2);
+    assert_eq!(retry_backoff_seconds(7), 128);
+    assert_eq!(retry_backoff_seconds(8), 256);
+    assert_eq!(retry_backoff_seconds(9), 300);
+    assert_eq!(retry_backoff_seconds(u32::MAX), 300);
 }
 
 #[tokio::test]

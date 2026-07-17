@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
 use futures::future::BoxFuture;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -53,20 +52,22 @@ where
                                     for (storage_key, event) in jobs {
                                         match h(event.clone()).await {
                                             Ok(_) => {
-                                                let _ = q.ack(&storage_key).await;
+                                                if let Err(error) = q.ack(&storage_key).await {
+                                                    log::error!(
+                                                        "Failed to acknowledge queue event {} at {}: {}",
+                                                        event.id,
+                                                        storage_key,
+                                                        error
+                                                    );
+                                                }
                                             }
                                             Err(err) => {
-                                                let mut retry_event = event.clone();
-                                                retry_event.retry_count += 1;
-                                                retry_event.errors.push(err.to_string());
-
-                                                if retry_event.retry_count > retry_event.max_retries {
-                                                    let _ = q.move_to_dlq(retry_event, &storage_key).await;
-                                                } else {
-                                                    let backoff = 2_i64.pow(retry_event.retry_count);
-                                                    let new_timestamp = Utc::now().timestamp() + backoff;
-                                                    let _ = q.reschedule(retry_event, &storage_key, new_timestamp).await;
-                                                }
+                                                q.retry_after_handler_error(
+                                                    event,
+                                                    &storage_key,
+                                                    err.to_string(),
+                                                )
+                                                .await;
                                             }
                                         }
                                     }

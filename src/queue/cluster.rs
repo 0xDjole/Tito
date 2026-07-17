@@ -766,29 +766,26 @@ where
                                 .await,
                             Ok(true)
                         ) {
-                            let _ = queue.ack(&storage_key).await;
+                            if let Err(error) = queue.ack(&storage_key).await {
+                                log::error!(
+                                    "Failed to acknowledge queue event {} at {}: {}",
+                                    event.id,
+                                    storage_key,
+                                    error
+                                );
+                            }
                         }
                     }
                     Err(err) => {
-                        let mut retry_event = event.clone();
-                        retry_event.retry_count += 1;
-                        retry_event.errors.push(err.to_string());
-
                         if matches!(
                             queue
                                 .cluster_partition_lease_is_current(&config, partition, generation)
                                 .await,
                             Ok(true)
                         ) {
-                            if retry_event.retry_count > retry_event.max_retries {
-                                let _ = queue.move_to_dlq(retry_event, &storage_key).await;
-                            } else {
-                                let backoff = 2_i64.pow(retry_event.retry_count);
-                                let new_timestamp = Utc::now().timestamp() + backoff;
-                                let _ = queue
-                                    .reschedule(retry_event, &storage_key, new_timestamp)
-                                    .await;
-                            }
+                            queue
+                                .retry_after_handler_error(event, &storage_key, err.to_string())
+                                .await;
                         }
                     }
                 }

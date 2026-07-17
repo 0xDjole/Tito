@@ -1,5 +1,8 @@
 use crate::key_encoder::safe_encode;
-use crate::queue::{run_worker, Queue, QueueConfig, QueueEvent, QueueEventState, WorkerConfig};
+use crate::queue::{
+    retry_backoff_seconds, run_worker, Queue, QueueConfig, QueueEvent, QueueEventState,
+    WorkerConfig,
+};
 use crate::test_support::MemoryEngine;
 use crate::types::{
     PartitionConfig, TitoCursor, TitoEngine, TitoFindByIndexPayload, TitoFindOneByIndexPayload,
@@ -333,6 +336,7 @@ fn queue_event(id: &str, key: &str, timestamp: i64) -> QueueEvent<QueuePayload> 
         key: key.to_string(),
         payload: queue_payload(id),
         timestamp,
+        original_scheduled_at: Some(timestamp),
         state: QueueEventState::Pending,
         processed_at: None,
         retry_count: 0,

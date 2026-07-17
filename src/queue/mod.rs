@@ -9,6 +9,15 @@ pub use cluster::{
 pub use types::{QueueConfig, QueueEvent, QueueEventState, QueueScanPage};
 pub use worker::{run_worker, WorkerConfig};
 
+const MAX_RETRY_BACKOFF_SECONDS: i64 = 300;
+
+pub(crate) fn retry_backoff_seconds(retry_count: u32) -> i64 {
+    2_i64
+        .checked_pow(retry_count)
+        .unwrap_or(i64::MAX)
+        .min(MAX_RETRY_BACKOFF_SECONDS)
+}
+
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
@@ -322,6 +331,9 @@ impl<E: TitoEngine> Queue<E> {
                 async move {
                     Self::delete_entry(&tx, storage_key.as_bytes()).await?;
 
+                    if event.original_scheduled_at.is_none() {
+                        event.original_scheduled_at = Some(event.timestamp);
+                    }
                     event.timestamp = new_timestamp;
                     event.state = QueueEventState::Pending;
                     event.processed_at = None;
@@ -339,6 +351,56 @@ impl<E: TitoEngine> Queue<E> {
                 }
             })
             .await
+    }
+
+    pub(crate) async fn retry_after_handler_error<T: Serialize + Clone + Send + Sync + 'static>(
+        &self,
+        mut event: QueueEvent<T>,
+        storage_key: &str,
+        error_message: String,
+    ) {
+        event.retry_count = event.retry_count.saturating_add(1);
+        event.errors.push(error_message.clone());
+        log::warn!(
+            "Queue event {} ({}) failed attempt {}/{}: {}",
+            event.id,
+            event.key,
+            event.retry_count,
+            event.max_retries.saturating_add(1),
+            error_message
+        );
+
+        if event.retry_count > event.max_retries {
+            let event_id = event.id.clone();
+            let event_key = event.key.clone();
+            match self.move_to_dlq(event, storage_key).await {
+                Ok(()) => log::error!(
+                    "Queue event {} ({}) exhausted retries and moved to failed state",
+                    event_id,
+                    event_key
+                ),
+                Err(error) => log::error!(
+                    "Failed to move exhausted queue event {} ({}) to failed state: {}",
+                    event_id,
+                    event_key,
+                    error
+                ),
+            }
+            return;
+        }
+
+        let backoff = retry_backoff_seconds(event.retry_count);
+        let new_timestamp = Utc::now().timestamp() + backoff;
+        let event_id = event.id.clone();
+        let event_key = event.key.clone();
+        if let Err(error) = self.reschedule(event, storage_key, new_timestamp).await {
+            log::error!(
+                "Failed to reschedule queue event {} ({}) after handler error: {}",
+                event_id,
+                event_key,
+                error
+            );
+        }
     }
 
     pub async fn clear(&self) -> Result<(), TitoError> {
@@ -632,6 +694,7 @@ mod tests {
             key: key.to_string(),
             payload: payload(id),
             timestamp,
+            original_scheduled_at: Some(timestamp),
             state,
             processed_at,
             retry_count: 0,

@@ -13,11 +13,14 @@ pub enum QueueEventState {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct QueueEvent<T> {
     pub id: String,
     pub key: String,
     pub payload: T,
     pub timestamp: i64,
+    #[serde(default)]
+    pub(crate) original_scheduled_at: Option<i64>,
     #[serde(default)]
     pub state: QueueEventState,
     #[serde(default)]
@@ -41,6 +44,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent
             key: key.into(),
             payload,
             timestamp: now,
+            original_scheduled_at: Some(now),
             state: QueueEventState::Pending,
             processed_at: None,
             retry_count: 0,
@@ -51,7 +55,12 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent
 
     pub fn scheduled_for(mut self, timestamp: i64) -> Self {
         self.timestamp = timestamp;
+        self.original_scheduled_at = Some(timestamp);
         self
+    }
+
+    pub fn original_scheduled_at(&self) -> i64 {
+        self.original_scheduled_at.unwrap_or(self.timestamp)
     }
 
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
