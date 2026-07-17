@@ -65,7 +65,7 @@ where
                                                 q.retry_after_handler_error(
                                                     event,
                                                     &storage_key,
-                                                    err.to_string(),
+                                                    err,
                                                 )
                                                 .await;
                                             }

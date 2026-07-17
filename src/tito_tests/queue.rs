@@ -338,3 +338,46 @@ async fn queue_worker_moves_exhausted_retries_to_failed() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test]
+async fn queue_deferral_reschedules_without_spending_retry_budget() {
+    let engine = engine();
+    let queue = queue(engine, 1);
+    let original_schedule = Utc::now().timestamp() - 10;
+    let mut event = queue_event(
+        "worker-deferred",
+        "entry:worker-deferred",
+        original_schedule,
+    );
+    event.max_retries = 0;
+    queue.publish(event).await.unwrap();
+    let (storage_key, event) = queue
+        .pull::<QueuePayload>(0, 1)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let error = TitoError::Deferred("runtime fence is active".to_string());
+    queue
+        .retry_after_handler_error(event, &storage_key, error)
+        .await;
+
+    let pending = queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+        .await
+        .unwrap()
+        .events
+        .pop()
+        .unwrap()
+        .1;
+    assert_eq!(pending.state, QueueEventState::Pending);
+    assert!(pending.timestamp > original_schedule);
+    assert_eq!(pending.retry_count, 0);
+    assert!(pending.errors.is_empty());
+    assert_eq!(pending.original_scheduled_at(), original_schedule);
+    assert!(queue
+        .find_by_state_after::<QueuePayload>(QueueEventState::Failed, 0, 10)
+        .await
+        .unwrap()
+        .is_empty());
+}

@@ -14,6 +14,9 @@ pub enum TitoError {
     #[error("Retryable error: {0}")]
     Retryable(String),
 
+    #[error("Deferred: {0}")]
+    Deferred(String),
+
     #[error("Failed to create resource: {0}")]
     CreateFailed(String),
 

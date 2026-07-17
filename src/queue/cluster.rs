@@ -784,7 +784,7 @@ where
                             Ok(true)
                         ) {
                             queue
-                                .retry_after_handler_error(event, &storage_key, err.to_string())
+                                .retry_after_handler_error(event, &storage_key, err)
                                 .await;
                         }
                     }
