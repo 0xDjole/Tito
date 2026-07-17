@@ -159,24 +159,18 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     }
     async fn get_raw(&self, key: &str, tx: &E::Transaction) -> Result<(String, Value), TitoError> {
         let key = key.to_string();
+        let value = tx
+            .get(key.clone())
+            .await?
+            .ok_or_else(|| TitoError::NotFound(format!("Key '{}' not found in database", key)))?;
+        let value = serde_json::from_slice::<Value>(&value).map_err(|error| {
+            TitoError::DeserializationFailed(format!(
+                "Failed to deserialize value for key '{}': {}",
+                key, error
+            ))
+        })?;
 
-        match tx.get(key.clone()).await {
-            Ok(Some(value)) => match serde_json::from_slice::<Value>(&value) {
-                Ok(value) => Ok((key, value)),
-                Err(e) => Err(TitoError::NotFound(format!(
-                    "Failed to deserialize value for key '{}': {}",
-                    key, e
-                ))),
-            },
-            Ok(None) => Err(TitoError::NotFound(format!(
-                "Key '{}' not found in database",
-                key
-            ))),
-            Err(e) => Err(TitoError::NotFound(format!(
-                "Failed to get key '{}': {}",
-                key, e
-            ))),
-        }
+        Ok((key, value))
     }
     pub async fn get_key(&self, key: &str, tx: &E::Transaction) -> Result<Value, TitoError> {
         let result = tx.get(key.to_string()).await?;
@@ -400,32 +394,14 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     {
         let id = format!("{}:{}", self.get_table(), id);
 
-        let value = match self.get_raw(&id, tx).await {
-            Ok(value) => value,
-            Err(e) => {
-                return Err(TitoError::NotFound(format!(
-                    "Failed to get record with id '{}': {}",
-                    id, e
-                )));
-            }
-        };
-
-        let items = match self
+        let value = self.get_raw(&id, tx).await?;
+        let items = self
             .fetch_and_stitch_relationships(vec![value], rels.clone(), tx)
-            .await
-        {
-            Ok(value) => value,
-            Err(e) => {
-                return Err(TitoError::NotFound(format!(
-                    "Failed to fetch relationships for id '{}' with rels {:?}: {}",
-                    id, rels, e
-                )));
-            }
-        };
+            .await?;
 
         if let Some(value) = items.first() {
             serde_json::from_value(value.1.clone()).map_err(|err| {
-                TitoError::NotFound(format!(
+                TitoError::DeserializationFailed(format!(
                     "Failed to deserialize record with id '{}': {}",
                     id, err
                 ))

@@ -126,6 +126,49 @@ async fn get_missing_record_returns_not_found() {
 }
 
 #[tokio::test]
+async fn get_malformed_record_returns_deserialization_error() {
+    let engine = engine();
+    let model = engine.clone().model::<Author>(TitoModelOptions::default());
+    engine
+        .put_raw("table:authors:malformed", b"{".to_vec())
+        .await;
+
+    assert!(matches!(
+        model.get("malformed").execute(None).await.unwrap_err(),
+        TitoError::DeserializationFailed(_)
+    ));
+}
+
+#[tokio::test]
+async fn get_schema_incompatible_record_returns_deserialization_error() {
+    let engine = engine();
+    let model = engine.clone().model::<Author>(TitoModelOptions::default());
+    engine
+        .put_json(
+            "table:authors:incompatible",
+            &json!({ "id": "incompatible" }),
+        )
+        .await;
+
+    assert!(matches!(
+        model.get("incompatible").execute(None).await.unwrap_err(),
+        TitoError::DeserializationFailed(_)
+    ));
+}
+
+#[tokio::test]
+async fn get_preserves_backend_read_error() {
+    let engine = engine();
+    let model = engine.clone().model::<Author>(TitoModelOptions::default());
+    engine.fail_next_get("read failed").await;
+
+    assert_eq!(
+        model.get("a1").execute(None).await.unwrap_err(),
+        TitoError::QueryFailed("read failed".to_string())
+    );
+}
+
+#[tokio::test]
 async fn find_paginates_with_cursor() {
     let engine = engine();
     let model = engine.clone().model::<Author>(TitoModelOptions::default());

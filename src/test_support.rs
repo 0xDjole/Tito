@@ -11,12 +11,14 @@ use tokio::sync::Mutex;
 #[derive(Clone, Default)]
 pub(crate) struct MemoryEngine {
     data: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
+    next_get_error: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Clone)]
 pub(crate) struct MemoryTransaction {
     data: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
     local: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
+    next_get_error: Arc<Mutex<Option<String>>>,
 }
 
 impl MemoryEngine {
@@ -29,6 +31,10 @@ impl MemoryEngine {
 
     pub(crate) async fn put_json(&self, key: &str, value: &Value) {
         self.put_raw(key, serde_json::to_vec(value).unwrap()).await;
+    }
+
+    pub(crate) async fn fail_next_get(&self, message: &str) {
+        *self.next_get_error.lock().await = Some(message.to_string());
     }
 
     pub(crate) async fn raw_bytes(&self, key: &str) -> Option<Vec<u8>> {
@@ -65,6 +71,7 @@ impl TitoEngine for MemoryEngine {
         Ok(MemoryTransaction {
             data: self.data.clone(),
             local: Arc::new(Mutex::new(snapshot)),
+            next_get_error: self.next_get_error.clone(),
         })
     }
 
@@ -108,6 +115,9 @@ impl TitoEngine for MemoryEngine {
 #[async_trait]
 impl TitoTransaction for MemoryTransaction {
     async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<TitoValue>, TitoError> {
+        if let Some(message) = self.next_get_error.lock().await.take() {
+            return Err(TitoError::QueryFailed(message));
+        }
         Ok(self.local.lock().await.get(key.as_ref()).cloned())
     }
 
