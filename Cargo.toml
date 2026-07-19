@@ -6,7 +6,6 @@ description = "Database layer on TiKV with indexing, relationships, transactions
 license = "Apache-2.0"
 authors = ["0xDjole 0xdjole@gmail.com"]
 
-# GitHub metadata
 repository = "https://github.com/0xDjole/Tito"
 homepage = "https://github.com/0xDjole/Tito"
 documentation = "https://github.com/0xDjole/Tito"
