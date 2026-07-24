@@ -20,7 +20,7 @@ futures-util = "0.3"
 serde = { version = "1.0", features = ["rc", "derive"] }
 serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
-tikv-client = { git = "https://github.com/tikv/client-rust.git", rev = "dda06dbf58f34e9c7633b8a55dc7a1141683cafe", default-features = false }
+tikv-client = { git = "https://github.com/tikv/client-rust.git", rev = "2c0f2f3bdb05beb3cb69fd2d44187ba7285dd5e4", default-features = false }
 uuid = { version = "1.3.0", features = ["v4", "fast-rng", "macro-diagnostics"] }
 thiserror = "1.0"
 log = "0.4"

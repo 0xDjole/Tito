@@ -109,13 +109,14 @@ impl TitoEngine for TiKVBackend {
             let result = f_clone(tx.clone()).await;
 
             match result {
-                Ok(value) => match tx.commit().await {
+                Ok(value) => match tx.clone().commit().await {
                     Ok(_) => {
                         let mut active_transactions = self.active_transactions.lock().await;
                         active_transactions.remove(&tx_id);
                         return Ok(value);
                     }
                     Err(e) => {
+                        let _ = tx.rollback().await;
                         {
                             let mut active_transactions = self.active_transactions.lock().await;
                             active_transactions.remove(&tx_id);
