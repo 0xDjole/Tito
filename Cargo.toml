@@ -1,6 +1,6 @@
 [package]
 name = "tito"
-version = "0.9.1"
+version = "0.9.2"
 edition = "2021"
 description = "Database layer on TiKV with indexing, relationships, transactions, and a built-in partitioned scheduled outbox"
 license = "Apache-2.0"
@@ -20,7 +20,7 @@ futures-util = "0.3"
 serde = { version = "1.0", features = ["rc", "derive"] }
 serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
-tikv-client = "0.3"
+tikv-client = { git = "https://github.com/tikv/client-rust.git", rev = "2c0f2f3bdb05beb3cb69fd2d44187ba7285dd5e4", default-features = false }
 uuid = { version = "1.3.0", features = ["v4", "fast-rng", "macro-diagnostics"] }
 thiserror = "1.0"
 log = "0.4"
