@@ -6,11 +6,10 @@ pub use cluster::{
     run_cluster_worker, ClusterCoordinatorLease, ClusterPartitionAssignment, ClusterWorkerConfig,
     ClusterWorkerNode,
 };
-pub use types::{QueueConfig, QueueEvent, QueueEventState, QueueScanPage};
+pub use types::{QueueConfig, QueueEvent, QueueEventState, QueueHandlerOutcome, QueueScanPage};
 pub use worker::{run_worker, WorkerConfig};
 
 const MAX_RETRY_BACKOFF_SECONDS: i64 = 300;
-const DEFERRED_RETRY_DELAY_SECONDS: i64 = 30;
 
 pub(crate) fn retry_backoff_seconds(retry_count: u32) -> i64 {
     2_i64
@@ -354,28 +353,26 @@ impl<E: TitoEngine> Queue<E> {
             .await
     }
 
+    pub(crate) async fn apply_handler_outcome<T: Serialize + Clone + Send + Sync + 'static>(
+        &self,
+        event: QueueEvent<T>,
+        storage_key: &str,
+        outcome: QueueHandlerOutcome,
+    ) -> Result<(), TitoError> {
+        match outcome {
+            QueueHandlerOutcome::Done => self.ack(storage_key).await,
+            QueueHandlerOutcome::RescheduleAt(timestamp) => {
+                self.reschedule(event, storage_key, timestamp).await
+            }
+        }
+    }
+
     pub(crate) async fn retry_after_handler_error<T: Serialize + Clone + Send + Sync + 'static>(
         &self,
         mut event: QueueEvent<T>,
         storage_key: &str,
         error: TitoError,
     ) {
-        if let TitoError::Deferred(reason) = &error {
-            let new_timestamp = Utc::now().timestamp() + DEFERRED_RETRY_DELAY_SECONDS;
-            let event_id = event.id.clone();
-            let event_key = event.key.clone();
-            if let Err(error) = self.reschedule(event, storage_key, new_timestamp).await {
-                log::error!(
-                    "Failed to reschedule deferred queue event {} ({}) after {}: {}",
-                    event_id,
-                    event_key,
-                    reason,
-                    error
-                );
-            }
-            return;
-        }
-
         let error_message = error.to_string();
         event.retry_count = event.retry_count.saturating_add(1);
         event.errors.push(error_message.clone());

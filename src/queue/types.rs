@@ -11,6 +11,12 @@ pub enum QueueEventState {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueHandlerOutcome {
+    Done,
+    RescheduleAt(i64),
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]

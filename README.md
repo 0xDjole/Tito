@@ -115,7 +115,7 @@ Queue events are partitioned by their business key, can be scheduled for a futur
 ```rust
 use std::sync::Arc;
 use futures::FutureExt;
-use tito::{Queue, QueueConfig, QueueEvent, WorkerConfig};
+use tito::{Queue, QueueConfig, QueueEvent, QueueHandlerOutcome, WorkerConfig};
 use tito::queue::run_worker;
 
 let queue = Arc::new(Queue::new(db.clone(), QueueConfig::new(4)));
@@ -130,7 +130,8 @@ run_worker(
         partition_range: 0..4,
     },
     |event: QueueEvent<UserCreated>| async move {
-        handle_user_created(event.payload).await
+        handle_user_created(event.payload).await?;
+        Ok(QueueHandlerOutcome::Done)
     }
     .boxed(),
     shutdown_rx,

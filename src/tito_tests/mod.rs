@@ -1,7 +1,7 @@
 use crate::key_encoder::safe_encode;
 use crate::queue::{
     retry_backoff_seconds, run_worker, Queue, QueueConfig, QueueEvent, QueueEventState,
-    WorkerConfig,
+    QueueHandlerOutcome, WorkerConfig,
 };
 use crate::test_support::MemoryEngine;
 use crate::types::{

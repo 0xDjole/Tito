@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tito::{
-    queue::{run_worker, QueueConfig, QueueEvent},
+    queue::{run_worker, QueueConfig, QueueEvent, QueueHandlerOutcome},
     types::DBUuid,
     TiKV, TitoError, TitoQueue, WorkerConfig,
 };
@@ -59,8 +59,8 @@ async fn main() -> Result<(), TitoError> {
                 count, event.payload.action, event.payload.name, event.payload.email,
             );
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            Ok::<_, TitoError>(())
-        }) as BoxFuture<'static, Result<(), TitoError>>
+            Ok::<_, TitoError>(QueueHandlerOutcome::Done)
+        }) as BoxFuture<'static, Result<QueueHandlerOutcome, TitoError>>
     };
 
     let worker_handle = run_worker(

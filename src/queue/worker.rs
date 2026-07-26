@@ -7,7 +7,7 @@ use serde::Serialize;
 use tokio::sync::broadcast;
 use tokio::time::sleep;
 
-use super::{Queue, QueueEvent};
+use super::{Queue, QueueEvent, QueueHandlerOutcome};
 use crate::types::TitoEngine;
 use crate::TitoError;
 
@@ -25,7 +25,7 @@ pub async fn run_worker<E, T, H>(
 where
     E: TitoEngine + 'static,
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<(), TitoError>>
+    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<QueueHandlerOutcome, TitoError>>
         + Clone
         + Send
         + Sync
@@ -51,10 +51,17 @@ where
                                 Ok(jobs) => {
                                     for (storage_key, event) in jobs {
                                         match h(event.clone()).await {
-                                            Ok(_) => {
-                                                if let Err(error) = q.ack(&storage_key).await {
+                                            Ok(outcome) => {
+                                                if let Err(error) = q
+                                                    .apply_handler_outcome(
+                                                        event.clone(),
+                                                        &storage_key,
+                                                        outcome,
+                                                    )
+                                                    .await
+                                                {
                                                     log::error!(
-                                                        "Failed to acknowledge queue event {} at {}: {}",
+                                                        "Failed to apply queue handler outcome for event {} at {}: {}",
                                                         event.id,
                                                         storage_key,
                                                         error

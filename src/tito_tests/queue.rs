@@ -238,7 +238,7 @@ async fn queue_worker_acks_successful_jobs() {
             Box::pin(async move {
                 assert_eq!(event.id, "worker-success");
                 handler_processed.notify_one();
-                Ok(())
+                Ok(QueueHandlerOutcome::Done)
             })
         },
         shutdown_rx,
@@ -277,6 +277,80 @@ async fn queue_worker_acks_successful_jobs() {
         .unwrap()
         .events
         .is_empty());
+}
+
+#[tokio::test]
+async fn queue_worker_reschedules_to_exact_time_without_retry_or_error() {
+    let engine = engine();
+    let queue = Arc::new(queue(engine, 1));
+    let original_schedule = Utc::now().timestamp() - 10;
+    let rescheduled_at = Utc::now().timestamp() + 60;
+    queue
+        .publish(queue_event(
+            "worker-rescheduled",
+            "entry:worker-rescheduled",
+            original_schedule,
+        ))
+        .await
+        .unwrap();
+    let handled = Arc::new(Notify::new());
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let handled_by_handler = handled.clone();
+
+    let handle = run_worker::<_, QueuePayload, _>(
+        queue.clone(),
+        WorkerConfig {
+            partition_range: 0..1,
+        },
+        move |_event| {
+            let handled_by_handler = handled_by_handler.clone();
+            Box::pin(async move {
+                handled_by_handler.notify_one();
+                Ok(QueueHandlerOutcome::RescheduleAt(rescheduled_at))
+            })
+        },
+        shutdown_rx,
+    )
+    .await;
+
+    timeout(Duration::from_secs(2), handled.notified())
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let pending = queue
+                .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+                .await
+                .unwrap();
+            if pending.events.iter().any(|(_, event)| {
+                event.id == "worker-rescheduled" && event.timestamp == rescheduled_at
+            }) {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let _ = shutdown_tx.send(());
+    timeout(Duration::from_secs(2), handle)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let pending = queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+        .await
+        .unwrap()
+        .events
+        .into_iter()
+        .find(|(_, event)| event.id == "worker-rescheduled")
+        .unwrap()
+        .1;
+    assert_eq!(pending.original_scheduled_at(), original_schedule);
+    assert_eq!(pending.retry_count, 0);
+    assert!(pending.errors.is_empty());
 }
 
 #[tokio::test]
@@ -340,7 +414,7 @@ async fn queue_worker_moves_exhausted_retries_to_failed() {
 }
 
 #[tokio::test]
-async fn queue_deferral_reschedules_without_spending_retry_budget() {
+async fn queue_handler_reschedule_preserves_event_without_spending_retry_budget() {
     let engine = engine();
     let queue = queue(engine, 1);
     let original_schedule = Utc::now().timestamp() - 10;
@@ -357,10 +431,15 @@ async fn queue_deferral_reschedules_without_spending_retry_budget() {
         .unwrap()
         .pop()
         .unwrap();
-    let error = TitoError::Deferred("runtime fence is active".to_string());
+    let rescheduled_at = Utc::now().timestamp() + 17;
     queue
-        .retry_after_handler_error(event, &storage_key, error)
-        .await;
+        .apply_handler_outcome(
+            event,
+            &storage_key,
+            QueueHandlerOutcome::RescheduleAt(rescheduled_at),
+        )
+        .await
+        .unwrap();
 
     let pending = queue
         .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
@@ -371,7 +450,7 @@ async fn queue_deferral_reschedules_without_spending_retry_budget() {
         .unwrap()
         .1;
     assert_eq!(pending.state, QueueEventState::Pending);
-    assert!(pending.timestamp > original_schedule);
+    assert_eq!(pending.timestamp, rescheduled_at);
     assert_eq!(pending.retry_count, 0);
     assert!(pending.errors.is_empty());
     assert_eq!(pending.original_scheduled_at(), original_schedule);

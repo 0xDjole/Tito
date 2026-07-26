@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch};
 use tokio::time::sleep;
 
-use super::{Queue, QueueEvent};
+use super::{Queue, QueueEvent, QueueHandlerOutcome};
 use crate::key_encoder::safe_encode;
 use crate::types::{TitoEngine, TitoTransaction, PARTITION_DIGITS};
 use crate::TitoError;
@@ -509,7 +509,7 @@ pub async fn run_cluster_worker<E, T, H>(
 where
     E: TitoEngine + 'static,
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<(), TitoError>>
+    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<QueueHandlerOutcome, TitoError>>
         + Clone
         + Send
         + Sync
@@ -568,7 +568,7 @@ async fn reconcile_partition_workers<E, T, H>(
 ) where
     E: TitoEngine + 'static,
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<(), TitoError>>
+    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<QueueHandlerOutcome, TitoError>>
         + Clone
         + Send
         + Sync
@@ -662,7 +662,7 @@ async fn run_partition_worker<E, T, H>(
 ) where
     E: TitoEngine + 'static,
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<(), TitoError>>
+    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<QueueHandlerOutcome, TitoError>>
         + Clone
         + Send
         + Sync
@@ -739,7 +739,7 @@ async fn process_partition_once<E, T, H>(
 where
     E: TitoEngine + 'static,
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<(), TitoError>>
+    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<QueueHandlerOutcome, TitoError>>
         + Clone
         + Send
         + Sync
@@ -759,16 +759,19 @@ where
                 }
 
                 match handler(event.clone()).await {
-                    Ok(_) => {
+                    Ok(outcome) => {
                         if matches!(
                             queue
                                 .cluster_partition_lease_is_current(&config, partition, generation)
                                 .await,
                             Ok(true)
                         ) {
-                            if let Err(error) = queue.ack(&storage_key).await {
+                            if let Err(error) = queue
+                                .apply_handler_outcome(event.clone(), &storage_key, outcome)
+                                .await
+                            {
                                 log::error!(
-                                    "Failed to acknowledge queue event {} at {}: {}",
+                                    "Failed to apply queue handler outcome for event {} at {}: {}",
                                     event.id,
                                     storage_key,
                                     error
