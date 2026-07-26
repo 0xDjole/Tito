@@ -146,6 +146,14 @@ Workers supervise each handler with a ten-minute timeout by default. Configure `
 
 Partition polling is fair across due rows. Each worker keeps an in-memory cursor for one bounded pass, advances that cursor by raw storage row (including malformed rows), and then wraps to the oldest due key. The pass keeps a fixed due-time horizon, so continuously arriving work cannot prevent the wrap. The cursor is executor state only: it is not persisted, does not lease a queue row, and does not encode retry policy.
 
+Completed invocation history has one fixed retention policy: standalone workers and the elected
+cluster coordinator delete rows older than three days in bounded passes. A full pass yields and
+continues immediately until the expired range is caught up; the 30-second interval applies only
+after a short pass. Maintenance uses the completed-state/processed-time key range directly, never
+inspects pending work, and has no retry, recovery, or provider semantics. Malformed values inside an
+expired completed-row key are also removed so corrupt terminal history cannot pin newer cleanup
+work.
+
 ### Transaction retry safety
 
 Tito may replay a transaction closure after an explicitly retryable, determined datastore failure. TiKV's `UndeterminedError` is different: the commit may already be durable. Tito returns `TitoError::CommitOutcomeUnknown` and never replays that closure. The caller must reconcile against authoritative stored state; queue acknowledgement and `ScheduleAt` operations naturally converge when a still-pending row is pulled again.

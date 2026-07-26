@@ -14,6 +14,7 @@ pub use worker::{run_worker, WorkerConfig};
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::time::Duration;
 
 use chrono::Utc;
 use serde::de::DeserializeOwned;
@@ -22,6 +23,11 @@ use serde_json::Value;
 
 use crate::types::{TitoEngine, TitoTransaction, PARTITION_DIGITS};
 use crate::TitoError;
+
+pub(crate) const COMPLETED_EVENT_RETENTION_SECONDS: i64 = 3 * 24 * 60 * 60;
+pub(crate) const COMPLETED_EVENT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
+pub(crate) const COMPLETED_EVENT_MAINTENANCE_BATCH_SIZE: u32 = 1_000;
+pub(crate) const COMPLETED_EVENT_MAINTENANCE_MAX_BATCHES: usize = 4;
 
 #[derive(Clone)]
 pub struct Queue<E: TitoEngine> {
@@ -419,32 +425,45 @@ impl<E: TitoEngine> Queue<E> {
 
         self.engine
             .transaction(|tx| async move {
-                let mut deleted = 0usize;
                 let start = format!("queue:completed:{:020}:", cutoff.saturating_add(1));
                 let entries = tx
                     .scan(
                         "queue:completed:00000000000000000000".as_bytes()..start.as_bytes(),
-                        limit,
+                        limit.max(1),
                     )
                     .await
                     .map_err(|e| TitoError::QueryFailed(format!("Scan completed queue: {}", e)))?;
 
-                for (storage_key, value) in entries {
-                    let event = Self::read_event_from_value::<Value>(&value).await?;
-
-                    if event.state == QueueEventState::Completed
-                        && event
-                            .processed_at
-                            .is_some_and(|processed_at| processed_at <= cutoff)
-                    {
-                        Self::delete_entry(&tx, storage_key.as_slice()).await?;
-                        deleted += 1;
-                    }
+                let deleted = entries.len();
+                for (storage_key, _) in entries {
+                    Self::delete_entry(&tx, storage_key.as_slice()).await?;
                 }
 
                 Ok::<_, TitoError>(deleted)
             })
             .await
+    }
+
+    pub(crate) async fn maintain_completed_event_retention(
+        &self,
+        now: i64,
+    ) -> Result<bool, TitoError> {
+        let cutoff = now.saturating_sub(COMPLETED_EVENT_RETENTION_SECONDS);
+
+        for _ in 0..COMPLETED_EVENT_MAINTENANCE_MAX_BATCHES {
+            let batch = self
+                .delete_by_state_before(
+                    QueueEventState::Completed,
+                    cutoff,
+                    COMPLETED_EVENT_MAINTENANCE_BATCH_SIZE,
+                )
+                .await?;
+            if batch < COMPLETED_EVENT_MAINTENANCE_BATCH_SIZE as usize {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
     }
 
     pub async fn find_by_state_after<T: DeserializeOwned + Clone + Send + Sync + 'static>(

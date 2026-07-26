@@ -9,7 +9,9 @@ use serde::Serialize;
 use tokio::sync::broadcast;
 use tokio::time::{sleep, timeout};
 
-use super::{Queue, QueueEvent, QueueHandlerOutcome, QueuePullCursor};
+use super::{
+    Queue, QueueEvent, QueueHandlerOutcome, QueuePullCursor, COMPLETED_EVENT_MAINTENANCE_INTERVAL,
+};
 use crate::types::TitoEngine;
 use crate::TitoError;
 
@@ -80,6 +82,33 @@ where
 {
     tokio::spawn(async move {
         let mut handles = Vec::new();
+        let maintenance_queue = queue.clone();
+        let mut maintenance_shutdown = shutdown.resubscribe();
+        handles.push(tokio::spawn(async move {
+            let mut wait = Duration::ZERO;
+
+            loop {
+                tokio::select! {
+                    _ = maintenance_shutdown.recv() => break,
+                    _ = sleep(wait) => {
+                        wait = match maintenance_queue
+                            .maintain_completed_event_retention(chrono::Utc::now().timestamp())
+                            .await
+                        {
+                            Ok(true) => {
+                                tokio::task::yield_now().await;
+                                Duration::ZERO
+                            }
+                            Ok(false) => COMPLETED_EVENT_MAINTENANCE_INTERVAL,
+                            Err(error) => {
+                                log::error!("Completed queue retention maintenance failed: {error}");
+                                COMPLETED_EVENT_MAINTENANCE_INTERVAL
+                            }
+                        };
+                    }
+                }
+            }
+        }));
 
         for partition in config.partition_range.clone() {
             let q = queue.clone();

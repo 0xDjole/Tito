@@ -341,6 +341,18 @@ fn queue_event(id: &str, key: &str, timestamp: i64) -> QueueEvent<QueuePayload> 
     }
 }
 
+async fn put_completed_queue_event(engine: &MemoryEngine, id: &str, processed_at: i64) -> String {
+    let scheduled_at = processed_at.saturating_sub(1);
+    let storage_key = format!("queue:completed:{processed_at:020}:{scheduled_at:020}:{id}");
+    let mut event = queue_event(id, &format!("entry:{id}"), scheduled_at);
+    event.state = QueueEventState::Completed;
+    event.processed_at = Some(processed_at);
+    engine
+        .put_raw(&storage_key, serde_json::to_vec(&event).unwrap())
+        .await;
+    storage_key
+}
+
 fn queue(engine: MemoryEngine, partitions: u32) -> Queue<MemoryEngine> {
     Queue::new(engine, QueueConfig::new(partitions))
 }

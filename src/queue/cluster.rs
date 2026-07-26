@@ -7,10 +7,12 @@ use futures::future::BoxFuture;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch};
-use tokio::time::sleep;
+use tokio::time::{sleep, Instant};
 
 use super::worker::{execute_handler, HandlerExecution, DEFAULT_HANDLER_TIMEOUT};
-use super::{Queue, QueueEvent, QueueHandlerOutcome, QueuePullCursor};
+use super::{
+    Queue, QueueEvent, QueueHandlerOutcome, QueuePullCursor, COMPLETED_EVENT_MAINTENANCE_INTERVAL,
+};
 use crate::key_encoder::safe_encode;
 use crate::types::{TitoEngine, TitoTransaction, PARTITION_DIGITS};
 use crate::TitoError;
@@ -709,6 +711,7 @@ async fn maintain_cluster_worker<E>(
     E: TitoEngine + 'static,
 {
     let mut rx = shutdown.resubscribe();
+    let mut next_completed_event_maintenance = Instant::now();
 
     loop {
         if shutdown_requested(&mut rx) {
@@ -716,11 +719,50 @@ async fn maintain_cluster_worker<E>(
         }
 
         if queue.heartbeat_cluster_worker(&config).await.is_ok() {
-            if matches!(
+            let is_coordinator = matches!(
                 queue.try_acquire_cluster_coordinator(&config).await,
                 Ok(true)
-            ) {
+            );
+            if is_coordinator {
                 let _ = queue.rebalance_cluster_partitions(&config).await;
+                let now = Instant::now();
+                if now >= next_completed_event_maintenance {
+                    loop {
+                        match queue
+                            .maintain_completed_event_retention(Utc::now().timestamp())
+                            .await
+                        {
+                            Ok(true) => {
+                                tokio::task::yield_now().await;
+                                if shutdown_requested(&mut rx) {
+                                    return;
+                                }
+                                if queue.heartbeat_cluster_worker(&config).await.is_err() {
+                                    break;
+                                }
+                                if !matches!(
+                                    queue.try_acquire_cluster_coordinator(&config).await,
+                                    Ok(true)
+                                ) {
+                                    break;
+                                }
+                                let _ = queue.rebalance_cluster_partitions(&config).await;
+                                if queue.sync_cluster_partition_leases(&config).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Ok(false) => break,
+                            Err(error) => {
+                                log::error!(
+                                    "Completed queue retention maintenance failed: {error}"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    next_completed_event_maintenance =
+                        Instant::now() + COMPLETED_EVENT_MAINTENANCE_INTERVAL;
+                }
             }
             let _ = queue.sync_cluster_partition_leases(&config).await;
         }

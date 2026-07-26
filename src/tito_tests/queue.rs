@@ -393,6 +393,79 @@ async fn queue_delete_by_state_before_rejects_pending_state() {
 }
 
 #[tokio::test]
+async fn queue_completed_retention_uses_the_terminal_time_index_not_value_decoding() {
+    let engine = engine();
+    let queue = queue(engine.clone(), 1);
+    let cutoff = Utc::now().timestamp() - 1;
+    let malformed_key = format!(
+        "queue:completed:{:020}:00000000000000000000:malformed",
+        cutoff - 1
+    );
+    engine.put_raw(&malformed_key, b"not-json".to_vec()).await;
+
+    let deleted = queue
+        .delete_by_state_before(QueueEventState::Completed, cutoff, 10)
+        .await
+        .unwrap();
+
+    assert_eq!(deleted, 1);
+    assert!(!engine.contains_key(&malformed_key).await);
+}
+
+#[tokio::test]
+async fn standalone_worker_enforces_fixed_completed_history_retention() {
+    const THREE_DAYS_SECONDS: i64 = 3 * 24 * 60 * 60;
+
+    let engine = engine();
+    let queue = Arc::new(queue(engine.clone(), 1));
+    let now = Utc::now().timestamp();
+    let expired_count = crate::queue::COMPLETED_EVENT_MAINTENANCE_BATCH_SIZE as usize
+        * crate::queue::COMPLETED_EVENT_MAINTENANCE_MAX_BATCHES
+        + 1;
+    let mut last_expired_key = String::new();
+    for index in 0..expired_count {
+        last_expired_key = put_completed_queue_event(
+            &engine,
+            &format!("expired-{index:05}"),
+            now - THREE_DAYS_SECONDS - 1,
+        )
+        .await;
+    }
+    let retained_key =
+        put_completed_queue_event(&engine, "retained", now - THREE_DAYS_SECONDS + 60).await;
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+
+    let handle = run_worker(
+        queue,
+        WorkerConfig::new(0..1),
+        |_event: QueueEvent<QueuePayload>| {
+            Box::pin(async move { Ok(QueueHandlerOutcome::Acknowledge) })
+        },
+        shutdown_rx,
+    )
+    .await;
+
+    timeout(Duration::from_secs(5), async {
+        while engine.contains_key(&last_expired_key).await {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        engine.keys_with_prefix("queue:completed:").await,
+        vec![retained_key.clone()]
+    );
+    assert!(engine.contains_key(&retained_key).await);
+
+    let _ = shutdown_tx.send(());
+    timeout(Duration::from_secs(2), handle)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn queue_scan_cursor_continues_after_previous_page() {
     let engine = engine();
     let queue = queue(engine, 1);
