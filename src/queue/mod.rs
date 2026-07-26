@@ -243,45 +243,6 @@ impl<E: TitoEngine> Queue<E> {
             .await
     }
 
-    pub async fn clear_by_key_in_tx<T: DeserializeOwned + Clone + Send + Sync + 'static>(
-        &self,
-        key: &str,
-        tx: &E::Transaction,
-    ) -> Result<u32, TitoError> {
-        let mut deleted = 0u32;
-
-        for prefix in ["queue:pending:", "queue:completed:"] {
-            let entries = tx
-                .scan(prefix.as_bytes()..Self::prefix_end(prefix).as_slice(), 1000)
-                .await
-                .map_err(|e| TitoError::QueryFailed(format!("Scan queue: {}", e)))?;
-
-            for (storage_key, value) in entries {
-                let event = Self::read_event_from_value::<T>(&value).await?;
-
-                if event.key == key {
-                    Self::delete_entry(tx, storage_key.as_slice()).await?;
-                    deleted += 1;
-                }
-            }
-        }
-
-        Ok(deleted)
-    }
-
-    pub async fn clear_by_key<T: DeserializeOwned + Clone + Send + Sync + 'static>(
-        &self,
-        key: &str,
-    ) -> Result<u32, TitoError> {
-        let key_owned = key.to_string();
-        self.engine
-            .transaction(|tx| {
-                let key_owned = key_owned.clone();
-                async move { self.clear_by_key_in_tx::<T>(&key_owned, &tx).await }
-            })
-            .await
-    }
-
     pub async fn ack(&self, key: &str) -> Result<(), TitoError> {
         if !key.starts_with(Self::state_prefix(QueueEventState::Pending)) {
             return Err(TitoError::InvalidInput(
@@ -836,36 +797,5 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, TitoError::InvalidInput(_)));
-    }
-
-    #[tokio::test]
-    async fn clear_by_key_removes_matching_rows_across_queue_states() {
-        let queue = queue(MemoryEngine::default());
-
-        for name in ["pending", "completed"] {
-            queue
-                .publish(QueueEvent::new("entry:same", payload(name)))
-                .await
-                .unwrap();
-        }
-        let jobs = queue.pull::<Payload>(0, None, 10).await.unwrap().events;
-        assert_eq!(jobs.len(), 2);
-        queue.ack(&jobs[0].0).await.unwrap();
-
-        let deleted = queue.clear_by_key::<Payload>("entry:same").await.unwrap();
-
-        assert_eq!(deleted, 2);
-        assert!(queue
-            .scan_by_state::<Payload>(QueueEventState::Pending, None, 10)
-            .await
-            .unwrap()
-            .events
-            .is_empty());
-        assert!(queue
-            .scan_by_state::<Payload>(QueueEventState::Completed, None, 10)
-            .await
-            .unwrap()
-            .events
-            .is_empty());
     }
 }
