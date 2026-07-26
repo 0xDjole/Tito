@@ -1,7 +1,6 @@
 use crate::key_encoder::safe_encode;
 use crate::queue::{
-    retry_backoff_seconds, run_worker, Queue, QueueConfig, QueueEvent, QueueEventState,
-    WorkerConfig,
+    run_worker, Queue, QueueConfig, QueueEvent, QueueEventState, QueueHandlerOutcome, WorkerConfig,
 };
 use crate::test_support::MemoryEngine;
 use crate::types::{
@@ -339,9 +338,6 @@ fn queue_event(id: &str, key: &str, timestamp: i64) -> QueueEvent<QueuePayload> 
         original_scheduled_at: Some(timestamp),
         state: QueueEventState::Pending,
         processed_at: None,
-        retry_count: 0,
-        max_retries: 3,
-        errors: Vec::new(),
     }
 }
 
@@ -354,6 +350,7 @@ fn cluster_config(node_id: &str) -> ClusterWorkerConfig {
         node_id: node_id.to_string(),
         heartbeat_interval: Duration::from_millis(10),
         poll_interval: Duration::from_millis(10),
+        handler_timeout: Duration::from_secs(10 * 60),
         lease_ttl: Duration::from_secs(60),
         stale_node_ttl: Duration::from_secs(120),
     }

@@ -3,12 +3,25 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum QueueEventState {
-    #[serde(alias = "processing")]
     #[default]
     Pending,
     Completed,
-    #[serde(alias = "dead_letter")]
-    Failed,
+}
+
+/// The durable action Tito takes after a queue handler finishes successfully.
+///
+/// Returning an error performs no queue mutation, so the current pending
+/// invocation remains eligible for redelivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueHandlerOutcome {
+    /// Complete the current invocation.
+    Acknowledge,
+    /// Atomically replace the current pending invocation with a successor
+    /// pending invocation at the exact Unix timestamp.
+    ///
+    /// The successor preserves the logical queue event ID. Its exact pending
+    /// storage key identifies the new scheduled invocation.
+    ScheduleAt(i64),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -25,15 +38,29 @@ pub struct QueueEvent<T> {
     pub state: QueueEventState,
     #[serde(default)]
     pub processed_at: Option<i64>,
-    pub retry_count: u32,
-    pub max_retries: u32,
-    pub errors: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct QueueScanPage<T> {
     pub events: Vec<(String, QueueEvent<T>)>,
     pub next_cursor: Option<Vec<u8>>,
+}
+
+/// An opaque, in-memory cursor for one fair pass over a partition's due rows.
+///
+/// The cursor is deliberately not serializable or durable queue state. Pass it
+/// back to [`Queue::pull`](super::Queue::pull) to continue the same bounded
+/// pass; pass `None` to begin a new pass from the oldest due storage key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuePullCursor {
+    pub(crate) next_start: Vec<u8>,
+    pub(crate) cycle_end: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueuePullPage<T> {
+    pub events: Vec<(String, QueueEvent<T>)>,
+    pub next_cursor: Option<QueuePullCursor>,
 }
 
 impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent<T> {
@@ -47,9 +74,6 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent
             original_scheduled_at: Some(now),
             state: QueueEventState::Pending,
             processed_at: None,
-            retry_count: 0,
-            max_retries: 0,
-            errors: Vec::new(),
         }
     }
 
@@ -63,11 +87,6 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent
         self.original_scheduled_at.unwrap_or(self.timestamp)
     }
 
-    pub fn with_max_retries(mut self, max_retries: u32) -> Self {
-        self.max_retries = max_retries;
-        self
-    }
-
     pub fn key_type(&self) -> &str {
         self.key.split(':').next().unwrap_or(&self.key)
     }
@@ -78,6 +97,18 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent
 
     pub fn event(&self) -> &T {
         &self.payload
+    }
+
+    pub(crate) fn successor_at(&self, timestamp: i64) -> Self {
+        Self {
+            id: self.id.clone(),
+            key: self.key.clone(),
+            payload: self.payload.clone(),
+            timestamp,
+            original_scheduled_at: Some(self.original_scheduled_at()),
+            state: QueueEventState::Pending,
+            processed_at: None,
+        }
     }
 }
 

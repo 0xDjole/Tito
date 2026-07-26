@@ -1,6 +1,6 @@
 # Tito
 
-A database layer on TiKV with indexing, relationships, transactions, and a built-in transactional outbox with partitioned scheduled pub/sub.
+A database layer on TiKV with indexing, relationships, transactions, and a built-in partitioned scheduled queue.
 
 ## Features
 
@@ -9,8 +9,8 @@ A database layer on TiKV with indexing, relationships, transactions, and a built
 - **Relationships**: Embedded relationship hydration
 - **Transactions**: Full ACID transactions
 - **Query Builder**: Fluent API for querying by index
-- **Transactional Outbox**: Events written atomically with data
-- **Partitioned Pub/Sub**: Horizontal scaling via partitions
+- **Transactional Publication**: Queue events can be written atomically with application data
+- **Partitioned Queue**: Horizontal scaling via stable business-key partitions
 - **Scheduled Events**: Set timestamp for when events should fire
 
 ## Connection
@@ -110,12 +110,16 @@ let results = query.value(&author_id).relationship("tags").execute().await?;
 
 ## Queue Processing
 
-Queue events are partitioned by their business key, can be scheduled for a future timestamp, and are retained as completed rows after `ack` so downstream systems can replay recent work.
+Queue events are partitioned by their business key, can be scheduled for a future timestamp, and remain pending until the handler explicitly acknowledges them. Tito has no automatic retry policy, retry counter, backoff, failed state, or DLQ:
+
+- `Ok(QueueHandlerOutcome::Acknowledge)` completes the current invocation.
+- `Ok(QueueHandlerOutcome::ScheduleAt(timestamp))` atomically replaces the current pending invocation with a pending successor carrying the same logical event ID, key, and payload at that exact timestamp.
+- `Err(_)`, a handler panic, or the executor timeout leaves the current invocation unchanged and pending for redelivery at the worker's normal poll cadence.
 
 ```rust
 use std::sync::Arc;
 use futures::FutureExt;
-use tito::{Queue, QueueConfig, QueueEvent, WorkerConfig};
+use tito::{Queue, QueueConfig, QueueEvent, QueueHandlerOutcome, WorkerConfig};
 use tito::queue::run_worker;
 
 let queue = Arc::new(Queue::new(db.clone(), QueueConfig::new(4)));
@@ -126,16 +130,31 @@ queue
 
 run_worker(
     queue,
-    WorkerConfig {
-        partition_range: 0..4,
-    },
+    WorkerConfig::new(0..4),
     |event: QueueEvent<UserCreated>| async move {
-        handle_user_created(event.payload).await
+        handle_user_created(event.payload).await?;
+        Ok(QueueHandlerOutcome::Acknowledge)
     }
     .boxed(),
     shutdown_rx,
 ).await;
 ```
+
+`ScheduleAt` is an atomic pending-to-pending handoff, not a queue retry policy. Tito checks that the exact current pending storage key still exists, then deletes that key and writes one successor in the same transaction. The timestamp must produce a different due key. The event ID remains the permanent logical identity; the due timestamp in each pending storage key distinguishes scheduled invocations. Only `Acknowledge` creates a completed row. If concurrent consumers process the same invocation, only the winner can create the successor. Application handlers should choose one of these two outcomes rather than mutating queue state directly.
+
+Workers supervise each handler with a ten-minute timeout by default. Configure `handler_timeout` when a workload has a different bounded execution contract; the timeout is executor protection and never changes queue state or provider policy.
+
+Partition polling is fair across due rows. Each worker keeps an in-memory cursor for one bounded pass, advances that cursor by raw storage row (including malformed rows), and then wraps to the oldest due key. The pass keeps a fixed due-time horizon, so continuously arriving work cannot prevent the wrap. The cursor is executor state only: it is not persisted, does not lease a queue row, and does not encode retry policy.
+
+### Transaction retry safety
+
+Tito may replay a transaction closure after an explicitly retryable, determined datastore failure. TiKV's `UndeterminedError` is different: the commit may already be durable. Tito returns `TitoError::CommitOutcomeUnknown` and never replays that closure. The caller must reconcile against authoritative stored state; queue acknowledgement and `ScheduleAt` operations naturally converge when a still-pending row is pulled again.
+
+### Upgrade contract
+
+This release intentionally removes the former retry/DLQ metadata and is not wire-compatible with workers using that queue protocol. Do not run the old and new queue protocols together.
+
+For the prelaunch cutover, stop publishers and workers, use the old release to drain Pending and clear its Failed/DLQ keyspaces, verify Pending is empty, deploy the replacement environment, and then restart publication and processing. If a future nonempty production environment requires migration, build and deploy a separately named bridge release first; compatibility scaffolding is not part of this queue contract.
 
 ## Scheduled Events
 

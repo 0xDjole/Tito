@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch};
 use tokio::time::sleep;
 
-use super::{Queue, QueueEvent};
+use super::worker::{execute_handler, HandlerExecution, DEFAULT_HANDLER_TIMEOUT};
+use super::{Queue, QueueEvent, QueueHandlerOutcome, QueuePullCursor};
 use crate::key_encoder::safe_encode;
 use crate::types::{TitoEngine, TitoTransaction, PARTITION_DIGITS};
 use crate::TitoError;
@@ -19,6 +20,7 @@ pub struct ClusterWorkerConfig {
     pub node_id: String,
     pub heartbeat_interval: Duration,
     pub poll_interval: Duration,
+    pub handler_timeout: Duration,
     pub lease_ttl: Duration,
     pub stale_node_ttl: Duration,
 }
@@ -29,6 +31,7 @@ impl ClusterWorkerConfig {
             node_id: node_id.into(),
             heartbeat_interval: Duration::from_secs(5),
             poll_interval: Duration::from_millis(500),
+            handler_timeout: DEFAULT_HANDLER_TIMEOUT,
             lease_ttl: Duration::from_secs(30),
             stale_node_ttl: Duration::from_secs(300),
         }
@@ -509,7 +512,7 @@ pub async fn run_cluster_worker<E, T, H>(
 where
     E: TitoEngine + 'static,
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<(), TitoError>>
+    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<QueueHandlerOutcome, TitoError>>
         + Clone
         + Send
         + Sync
@@ -568,7 +571,7 @@ async fn reconcile_partition_workers<E, T, H>(
 ) where
     E: TitoEngine + 'static,
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<(), TitoError>>
+    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<QueueHandlerOutcome, TitoError>>
         + Clone
         + Send
         + Sync
@@ -585,7 +588,11 @@ async fn reconcile_partition_workers<E, T, H>(
     let stale_partitions = partition_workers
         .iter()
         .filter_map(|(partition, worker)| match owned.get(partition) {
-            Some(assignment) if assignment.generation == worker.generation => None,
+            Some(assignment)
+                if assignment.generation == worker.generation && !worker.handle.is_finished() =>
+            {
+                None
+            }
             _ => Some(*partition),
         })
         .collect::<Vec<_>>();
@@ -662,31 +669,34 @@ async fn run_partition_worker<E, T, H>(
 ) where
     E: TitoEngine + 'static,
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<(), TitoError>>
+    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<QueueHandlerOutcome, TitoError>>
         + Clone
         + Send
         + Sync
         + 'static,
 {
+    let mut cursor: Option<QueuePullCursor> = None;
+
     loop {
         if *stop.borrow() {
             break;
         }
 
-        let processed = process_partition_once(
-            queue.clone(),
-            config.clone(),
-            partition,
-            generation,
-            handler.clone(),
-        )
-        .await;
+        tokio::select! {
+            _ = stop.changed() => break,
+            _ = process_partition_once(
+                queue.clone(),
+                config.clone(),
+                partition,
+                generation,
+                handler.clone(),
+                &mut cursor,
+            ) => {}
+        }
 
-        if !processed {
-            tokio::select! {
-                _ = stop.changed() => break,
-                _ = sleep(config.poll_interval) => {}
-            }
+        tokio::select! {
+            _ = stop.changed() => break,
+            _ = sleep(config.poll_interval) => {}
         }
     }
 }
@@ -735,20 +745,25 @@ async fn process_partition_once<E, T, H>(
     partition: u32,
     generation: u64,
     handler: H,
+    cursor: &mut Option<QueuePullCursor>,
 ) -> bool
 where
     E: TitoEngine + 'static,
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<(), TitoError>>
+    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<QueueHandlerOutcome, TitoError>>
         + Clone
         + Send
         + Sync
         + 'static,
 {
-    match queue.pull::<T>(partition, 50).await {
-        Ok(jobs) if jobs.is_empty() => false,
-        Ok(jobs) => {
-            for (storage_key, event) in jobs {
+    match queue.pull::<T>(partition, cursor.clone(), 50).await {
+        Ok(page) => {
+            *cursor = page.next_cursor;
+            if page.events.is_empty() {
+                return false;
+            }
+
+            for (storage_key, event) in page.events {
                 if !matches!(
                     queue
                         .cluster_partition_lease_is_current(&config, partition, generation)
@@ -758,17 +773,24 @@ where
                     continue;
                 }
 
-                match handler(event.clone()).await {
-                    Ok(_) => {
+                match execute_handler(&handler, event.clone(), config.handler_timeout).await {
+                    HandlerExecution::Finished(Ok(outcome)) => {
                         if matches!(
                             queue
                                 .cluster_partition_lease_is_current(&config, partition, generation)
                                 .await,
                             Ok(true)
                         ) {
-                            if let Err(error) = queue.ack(&storage_key).await {
+                            let result = match outcome {
+                                QueueHandlerOutcome::Acknowledge => queue.ack(&storage_key).await,
+                                QueueHandlerOutcome::ScheduleAt(timestamp) => queue
+                                    .schedule_at::<T>(&storage_key, timestamp)
+                                    .await
+                                    .map(|_| ()),
+                            };
+                            if let Err(error) = result {
                                 log::error!(
-                                    "Failed to acknowledge queue event {} at {}: {}",
+                                    "Failed to apply queue outcome for event {} at {}: {}",
                                     event.id,
                                     storage_key,
                                     error
@@ -776,17 +798,28 @@ where
                             }
                         }
                     }
-                    Err(err) => {
-                        if matches!(
-                            queue
-                                .cluster_partition_lease_is_current(&config, partition, generation)
-                                .await,
-                            Ok(true)
-                        ) {
-                            queue
-                                .retry_after_handler_error(event, &storage_key, err)
-                                .await;
-                        }
+                    HandlerExecution::Finished(Err(error)) => {
+                        log::error!(
+                            "Queue handler failed for event {} ({}); leaving it pending for redelivery: {}",
+                            event.id,
+                            event.key,
+                            error
+                        );
+                    }
+                    HandlerExecution::Panicked => {
+                        log::error!(
+                            "Queue handler panicked for event {} ({}); leaving it pending for redelivery",
+                            event.id,
+                            event.key
+                        );
+                    }
+                    HandlerExecution::TimedOut => {
+                        log::error!(
+                            "Queue handler timed out after {:?} for event {} ({}); leaving it pending for redelivery",
+                            config.handler_timeout,
+                            event.id,
+                            event.key
+                        );
                     }
                 }
             }

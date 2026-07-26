@@ -11,12 +11,29 @@ use std::sync::Arc;
 use tikv_client::{ColumnFamily, RawClient, Transaction, TransactionClient};
 use tokio::time::{sleep, Duration};
 
+const MAX_TRANSACTION_RETRIES: u32 = 10;
+
+fn contains_undetermined_error(error: &tikv_client::Error) -> bool {
+    match error {
+        tikv_client::Error::UndeterminedError(_) => true,
+        tikv_client::Error::MultipleKeyErrors(errors)
+        | tikv_client::Error::ExtractedErrors(errors) => {
+            errors.iter().any(contains_undetermined_error)
+        }
+        _ => false,
+    }
+}
+
 fn classify_tikv_error(
     e: tikv_client::Error,
     context: &str,
     retryable_flag: &AtomicBool,
 ) -> TitoError {
     let msg = format!("{}: {}", context, e);
+    if contains_undetermined_error(&e) {
+        return TitoError::CommitOutcomeUnknown(msg);
+    }
+
     let is_retryable = match &e {
         tikv_client::Error::RegionError(_)
         | tikv_client::Error::RegionForKeyNotFound { .. }
@@ -26,7 +43,6 @@ fn classify_tikv_error(
         | tikv_client::Error::ResolveLockError(_)
         | tikv_client::Error::NoCurrentRegions
         | tikv_client::Error::EntryNotFoundInRegionCache
-        | tikv_client::Error::UndeterminedError(_)
         | tikv_client::Error::PessimisticLockError { .. } => true,
         tikv_client::Error::KeyError(ke) => {
             ke.locked.is_some() || ke.conflict.is_some() || !ke.retryable.is_empty()
@@ -50,6 +66,20 @@ fn classify_tikv_error(
         TitoError::Retryable(msg)
     } else {
         TitoError::TransactionFailed(msg)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitFailureAction {
+    Retry,
+    Return,
+}
+
+fn commit_failure_action(error: &TitoError, retries: u32) -> CommitFailureAction {
+    if error.is_retryable() && retries < MAX_TRANSACTION_RETRIES {
+        CommitFailureAction::Retry
+    } else {
+        CommitFailureAction::Return
     }
 }
 
@@ -85,7 +115,6 @@ impl TitoEngine for TiKVBackend {
         T: Send,
         E: From<TitoError> + Send + std::fmt::Debug,
     {
-        const MAX_RETRIES: u32 = 10;
         let mut retries = 0;
         let mut base_delay_ms = 50u64;
 
@@ -116,13 +145,19 @@ impl TitoEngine for TiKVBackend {
                         return Ok(value);
                     }
                     Err(e) => {
-                        let _ = tx.rollback().await;
+                        // An undetermined commit may already be durable.
+                        // Rolling it back cannot resolve that ambiguity, and
+                        // replaying the closure could create a second logical
+                        // write (for example, a queue row with a fresh ID).
+                        if !e.is_commit_outcome_unknown() {
+                            let _ = tx.rollback().await;
+                        }
                         {
                             let mut active_transactions = self.active_transactions.lock().await;
                             active_transactions.remove(&tx_id);
                         }
 
-                        if e.is_retryable() && retries < MAX_RETRIES {
+                        if commit_failure_action(&e, retries) == CommitFailureAction::Retry {
                             retries += 1;
                             let jitter = rand::thread_rng().gen_range(0..base_delay_ms / 2);
                             let delay = base_delay_ms + jitter;
@@ -141,7 +176,7 @@ impl TitoEngine for TiKVBackend {
                         active_transactions.remove(&tx_id);
                     }
 
-                    if is_retryable && retries < MAX_RETRIES {
+                    if is_retryable && retries < MAX_TRANSACTION_RETRIES {
                         retries += 1;
                         let jitter = rand::thread_rng().gen_range(0..base_delay_ms / 2);
                         let delay = base_delay_ms + jitter;
@@ -194,6 +229,50 @@ impl TitoEngine for TiKVBackend {
             })?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn undetermined_commit_is_classified_as_unknown_and_never_retried() {
+        let retryable_flag = AtomicBool::new(false);
+        let error = classify_tikv_error(
+            tikv_client::Error::UndeterminedError(Box::new(tikv_client::Error::Unimplemented)),
+            "Transaction commit failed",
+            &retryable_flag,
+        );
+
+        assert!(matches!(error, TitoError::CommitOutcomeUnknown(_)));
+        assert!(!error.is_retryable());
+        assert!(!retryable_flag.load(Ordering::Relaxed));
+        assert_eq!(
+            commit_failure_action(&error, 0),
+            CommitFailureAction::Return
+        );
+    }
+
+    #[test]
+    fn commit_retry_policy_only_retries_explicit_retryable_errors_within_budget() {
+        let retryable = TitoError::Retryable("conflict".to_string());
+
+        assert_eq!(
+            commit_failure_action(&retryable, 0),
+            CommitFailureAction::Retry
+        );
+        assert_eq!(
+            commit_failure_action(&retryable, MAX_TRANSACTION_RETRIES),
+            CommitFailureAction::Return
+        );
+        assert_eq!(
+            commit_failure_action(
+                &TitoError::TransactionFailed("determined failure".to_string()),
+                0
+            ),
+            CommitFailureAction::Return
+        );
     }
 }
 

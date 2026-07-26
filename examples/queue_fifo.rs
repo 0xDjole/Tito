@@ -3,9 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tito::{
-    queue::{run_worker, QueueConfig, QueueEvent},
+    queue::{run_worker, QueueConfig, QueueEvent, QueueHandlerOutcome},
     types::DBUuid,
-    TiKV, TitoError, TitoQueue, WorkerConfig,
+    Queue, TiKV, TitoError, WorkerConfig,
 };
 use tokio::sync::broadcast;
 
@@ -23,7 +23,7 @@ async fn main() -> Result<(), TitoError> {
 
     let tito_db = TiKV::connect(vec!["127.0.0.1:2379"]).await?;
 
-    let queue = Arc::new(TitoQueue::new(tito_db.clone(), QueueConfig::new(1)));
+    let queue = Arc::new(Queue::new(tito_db.clone(), QueueConfig::new(1)));
 
     println!("Publishing 5 events...\n");
 
@@ -59,19 +59,12 @@ async fn main() -> Result<(), TitoError> {
                 count, event.payload.action, event.payload.name, event.payload.email,
             );
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            Ok::<_, TitoError>(())
-        }) as BoxFuture<'static, Result<(), TitoError>>
+            Ok::<_, TitoError>(QueueHandlerOutcome::Acknowledge)
+        }) as BoxFuture<'static, Result<QueueHandlerOutcome, TitoError>>
     };
 
-    let worker_handle = run_worker(
-        queue.clone(),
-        WorkerConfig {
-            partition_range: 0..1,
-        },
-        handler,
-        shutdown_rx,
-    )
-    .await;
+    let worker_handle =
+        run_worker(queue.clone(), WorkerConfig::new(0..1), handler, shutdown_rx).await;
 
     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
