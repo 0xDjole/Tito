@@ -138,6 +138,20 @@ run_worker(
 ).await;
 ```
 
+Handlers return an explicit outcome:
+
+- `QueueHandlerOutcome::Done` acknowledges the event and moves it to completed history.
+- `QueueHandlerOutcome::RescheduleAt(timestamp)` moves the same event back to pending at
+  the exact not-before timestamp. This is application scheduling, so it preserves the
+  event identity, payload, retry count, and error history and does not spend the retry
+  budget.
+- Returning `Err(...)` is a processing failure. Tito increments the retry count, records
+  the error, and applies the configured retry/dead-letter behavior.
+
+Use `RescheduleAt` when the domain deliberately wants another observation later—for
+example, while a live lease may still be owned or while an external provider result is
+not yet observable. It is not a substitute for failure retries.
+
 ## Scheduled Events
 
 ```rust
