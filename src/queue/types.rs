@@ -27,6 +27,9 @@ pub struct QueueEvent<T> {
     pub timestamp: i64,
     #[serde(default)]
     pub(crate) original_scheduled_at: Option<i64>,
+    /// Monotonic compare-and-transition fence; independent of the retry budget.
+    #[serde(default)]
+    pub(crate) delivery_generation: u64,
     #[serde(default)]
     pub state: QueueEventState,
     #[serde(default)]
@@ -51,6 +54,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent
             payload,
             timestamp: now,
             original_scheduled_at: Some(now),
+            delivery_generation: 0,
             state: QueueEventState::Pending,
             processed_at: None,
             retry_count: 0,

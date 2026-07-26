@@ -2,15 +2,18 @@ use crate::types::{TitoEngine, TitoKvPair, TitoTransaction, TitoValue};
 use crate::TitoError;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 #[derive(Clone, Default)]
 pub(crate) struct MemoryEngine {
     data: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
+    key_versions: Arc<Mutex<BTreeMap<Vec<u8>, u64>>>,
+    next_version: Arc<AtomicU64>,
     next_get_error: Arc<Mutex<Option<String>>>,
 }
 
@@ -18,15 +21,21 @@ pub(crate) struct MemoryEngine {
 pub(crate) struct MemoryTransaction {
     data: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
     local: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
+    key_versions: Arc<Mutex<BTreeMap<Vec<u8>, u64>>>,
+    snapshot_key_versions: Arc<BTreeMap<Vec<u8>, u64>>,
+    next_version: Arc<AtomicU64>,
+    write_keys: Arc<Mutex<BTreeSet<Vec<u8>>>>,
     next_get_error: Arc<Mutex<Option<String>>>,
 }
 
 impl MemoryEngine {
     pub(crate) async fn put_raw(&self, key: &str, value: Vec<u8>) {
-        self.data
-            .lock()
-            .await
-            .insert(key.as_bytes().to_vec(), value);
+        let key = key.as_bytes().to_vec();
+        let mut data = self.data.lock().await;
+        let mut key_versions = self.key_versions.lock().await;
+        data.insert(key.clone(), value);
+        let version = self.next_version.fetch_add(1, Ordering::Relaxed) + 1;
+        key_versions.insert(key, version);
     }
 
     pub(crate) async fn put_json(&self, key: &str, value: &Value) {
@@ -67,10 +76,17 @@ impl TitoEngine for MemoryEngine {
     type Transaction = MemoryTransaction;
 
     async fn begin_transaction(&self) -> Result<Self::Transaction, TitoError> {
-        let snapshot = self.data.lock().await.clone();
+        let data = self.data.lock().await;
+        let key_versions = self.key_versions.lock().await;
+        let snapshot = data.clone();
+        let snapshot_key_versions = key_versions.clone();
         Ok(MemoryTransaction {
             data: self.data.clone(),
             local: Arc::new(Mutex::new(snapshot)),
+            key_versions: self.key_versions.clone(),
+            snapshot_key_versions: Arc::new(snapshot_key_versions),
+            next_version: self.next_version.clone(),
+            write_keys: Arc::new(Mutex::new(BTreeSet::new())),
             next_get_error: self.next_get_error.clone(),
         })
     }
@@ -82,15 +98,24 @@ impl TitoEngine for MemoryEngine {
         T: Send,
         E: From<TitoError> + Send + std::fmt::Debug,
     {
-        let tx = self.begin_transaction().await.map_err(E::from)?;
-        match f(tx.clone()).await {
-            Ok(value) => {
-                tx.commit().await.map_err(E::from)?;
-                Ok(value)
-            }
-            Err(error) => {
-                let _ = tx.rollback().await;
-                Err(error)
+        const MAX_RETRIES: u32 = 10;
+        let mut retries = 0;
+
+        loop {
+            let tx = self.begin_transaction().await.map_err(E::from)?;
+            match f.clone()(tx.clone()).await {
+                Ok(value) => match tx.commit().await {
+                    Ok(()) => return Ok(value),
+                    Err(error) if error.is_retryable() && retries < MAX_RETRIES => {
+                        retries += 1;
+                        continue;
+                    }
+                    Err(error) => return Err(E::from(error)),
+                },
+                Err(error) => {
+                    let _ = tx.rollback().await;
+                    return Err(error);
+                }
             }
         }
     }
@@ -101,12 +126,15 @@ impl TitoEngine for MemoryEngine {
 
     async fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<(), TitoError> {
         let mut data = self.data.lock().await;
+        let mut key_versions = self.key_versions.lock().await;
         let keys: Vec<Vec<u8>> = data
             .range(start.to_vec()..end.to_vec())
             .map(|(key, _)| key.clone())
             .collect();
         for key in keys {
             data.remove(&key);
+            let version = self.next_version.fetch_add(1, Ordering::Relaxed) + 1;
+            key_versions.insert(key, version);
         }
         Ok(())
     }
@@ -126,6 +154,7 @@ impl TitoTransaction for MemoryTransaction {
         key: K,
         value: V,
     ) -> Result<(), TitoError> {
+        self.write_keys.lock().await.insert(key.as_ref().to_vec());
         self.local
             .lock()
             .await
@@ -134,6 +163,7 @@ impl TitoTransaction for MemoryTransaction {
     }
 
     async fn delete<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<(), TitoError> {
+        self.write_keys.lock().await.insert(key.as_ref().to_vec());
         self.local.lock().await.remove(key.as_ref());
         Ok(())
     }
@@ -188,7 +218,35 @@ impl TitoTransaction for MemoryTransaction {
     }
 
     async fn commit(self) -> Result<(), TitoError> {
-        *self.data.lock().await = self.local.lock().await.clone();
+        let write_keys = self.write_keys.lock().await;
+        let local = self.local.lock().await;
+        let mut data = self.data.lock().await;
+        let mut key_versions = self.key_versions.lock().await;
+
+        for key in write_keys.iter() {
+            let snapshot_version = self
+                .snapshot_key_versions
+                .get(key)
+                .copied()
+                .unwrap_or_default();
+            let current_version = key_versions.get(key).copied().unwrap_or_default();
+            if current_version != snapshot_version {
+                return Err(TitoError::Retryable(format!(
+                    "Memory transaction write conflict for {}",
+                    String::from_utf8_lossy(key)
+                )));
+            }
+        }
+
+        for key in write_keys.iter() {
+            if let Some(value) = local.get(key) {
+                data.insert(key.clone(), value.clone());
+            } else {
+                data.remove(key);
+            }
+            let version = self.next_version.fetch_add(1, Ordering::Relaxed) + 1;
+            key_versions.insert(key.clone(), version);
+        }
         Ok(())
     }
 

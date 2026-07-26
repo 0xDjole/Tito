@@ -266,6 +266,78 @@ impl<E: TitoEngine> Queue<E> {
             .await
     }
 
+    async fn current_pending_source<T>(
+        tx: &E::Transaction,
+        storage_key: &str,
+        expected: &QueueEvent<T>,
+    ) -> Result<Option<QueueEvent<Value>>, TitoError> {
+        // The delivery generation distinguishes a newer delivery even when an
+        // application deliberately reschedules to the same storage key.
+        let Some(bytes) = tx
+            .get(storage_key.as_bytes())
+            .await
+            .map_err(|e| TitoError::QueryFailed(format!("Get queue event: {}", e)))?
+        else {
+            return Ok(None);
+        };
+
+        let Ok(current) = Self::read_event_from_value::<Value>(&bytes).await else {
+            tx.delete(storage_key.as_bytes()).await.map_err(|e| {
+                TitoError::DeleteFailed(format!("Delete orphan queue index: {}", e))
+            })?;
+            return Ok(None);
+        };
+
+        if current.state != QueueEventState::Pending
+            || current.id != expected.id
+            || current.key != expected.key
+            || current.timestamp != expected.timestamp
+            || current.delivery_generation != expected.delivery_generation
+        {
+            return Ok(None);
+        }
+
+        Ok(Some(current))
+    }
+
+    async fn ack_value_in_tx(
+        tx: &E::Transaction,
+        storage_key: &str,
+        mut event: Value,
+    ) -> Result<(), TitoError> {
+        let event_id = event
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| TitoError::DeserializationFailed("Queue event missing id".to_string()))?
+            .to_string();
+        let processed_at = Utc::now().timestamp();
+        event["state"] = Value::String(Self::state_value(QueueEventState::Completed).to_string());
+        event["processedAt"] = Value::Number(processed_at.into());
+
+        let completed_key = Self::completed_key(processed_at, &event_id);
+        let completed_bytes = serde_json::to_vec(&event)
+            .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
+
+        Self::delete_entry(tx, storage_key.as_bytes()).await?;
+        tx.put(completed_key.as_bytes(), completed_bytes)
+            .await
+            .map_err(|e| TitoError::UpdateFailed(format!("Create completed event: {}", e)))
+    }
+
+    pub(super) async fn ack_event_in_tx<T>(
+        tx: &E::Transaction,
+        storage_key: &str,
+        expected: &QueueEvent<T>,
+    ) -> Result<bool, TitoError> {
+        let Some(current) = Self::current_pending_source(tx, storage_key, expected).await? else {
+            return Ok(false);
+        };
+        let event = serde_json::to_value(current)
+            .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
+        Self::ack_value_in_tx(tx, storage_key, event).await?;
+        Ok(true)
+    }
+
     pub async fn ack(&self, key: &str) -> Result<(), TitoError> {
         self.engine
             .transaction(|tx| {
@@ -279,40 +351,56 @@ impl<E: TitoEngine> Queue<E> {
                         return Ok::<_, TitoError>(());
                     };
 
-                    let Ok(mut event) = Self::read_value_from_entry(&bytes).await else {
+                    let Ok(event) = Self::read_value_from_entry(&bytes).await else {
                         tx.delete(key.as_bytes()).await.map_err(|e| {
                             TitoError::DeleteFailed(format!("Delete orphan queue index: {}", e))
                         })?;
                         return Ok::<_, TitoError>(());
                     };
 
-                    let event_id = event
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| {
-                            TitoError::DeserializationFailed("Queue event missing id".to_string())
-                        })?
-                        .to_string();
-                    let processed_at = Utc::now().timestamp();
-                    event["state"] =
-                        Value::String(Self::state_value(QueueEventState::Completed).to_string());
-                    event["processedAt"] = Value::Number(processed_at.into());
-
-                    let completed_key = Self::completed_key(processed_at, &event_id);
-                    let completed_bytes = serde_json::to_vec(&event)
-                        .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
-
-                    Self::delete_entry(&tx, key.as_bytes()).await?;
-                    tx.put(completed_key.as_bytes(), completed_bytes)
-                        .await
-                        .map_err(|e| {
-                            TitoError::UpdateFailed(format!("Create completed event: {}", e))
-                        })?;
+                    Self::ack_value_in_tx(&tx, &key, event).await?;
 
                     Ok::<_, TitoError>(())
                 }
             })
             .await
+    }
+
+    pub(super) async fn reschedule_in_tx<T: Serialize + Clone + Send + Sync + 'static>(
+        &self,
+        tx: &E::Transaction,
+        mut event: QueueEvent<T>,
+        storage_key: &str,
+        new_timestamp: i64,
+    ) -> Result<bool, TitoError> {
+        if Self::current_pending_source(tx, storage_key, &event)
+            .await?
+            .is_none()
+        {
+            return Ok(false);
+        }
+
+        Self::delete_entry(tx, storage_key.as_bytes()).await?;
+
+        if event.original_scheduled_at.is_none() {
+            event.original_scheduled_at = Some(event.timestamp);
+        }
+        event.timestamp = new_timestamp;
+        event.delivery_generation = event.delivery_generation.checked_add(1).ok_or_else(|| {
+            TitoError::UpdateFailed("Queue event delivery generation exhausted".to_string())
+        })?;
+        event.state = QueueEventState::Pending;
+        event.processed_at = None;
+
+        let partition = self.partition_for_key(&event.key);
+        let new_key = Self::pending_key(partition, event.timestamp, &event.id);
+        let bytes = serde_json::to_vec(&event)
+            .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
+
+        tx.put(new_key.as_bytes(), bytes)
+            .await
+            .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
+        Ok(true)
     }
 
     pub async fn reschedule<T: Serialize + Clone + Send + Sync + 'static>(
@@ -326,31 +414,33 @@ impl<E: TitoEngine> Queue<E> {
         self.engine
             .transaction(|tx| {
                 let storage_key = storage_key.clone();
-                let mut event = event.clone();
+                let event = event.clone();
 
                 async move {
-                    Self::delete_entry(&tx, storage_key.as_bytes()).await?;
-
-                    if event.original_scheduled_at.is_none() {
-                        event.original_scheduled_at = Some(event.timestamp);
-                    }
-                    event.timestamp = new_timestamp;
-                    event.state = QueueEventState::Pending;
-                    event.processed_at = None;
-
-                    let partition = self.partition_for_key(&event.key);
-                    let new_key = Self::pending_key(partition, event.timestamp, &event.id);
-                    let bytes = serde_json::to_vec(&event)
-                        .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
-
-                    tx.put(new_key.as_bytes(), bytes)
-                        .await
-                        .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
-
+                    self.reschedule_in_tx(&tx, event, &storage_key, new_timestamp)
+                        .await?;
                     Ok::<_, TitoError>(())
                 }
             })
             .await
+    }
+
+    pub(super) async fn apply_handler_outcome_in_tx<
+        T: Serialize + Clone + Send + Sync + 'static,
+    >(
+        &self,
+        tx: &E::Transaction,
+        event: QueueEvent<T>,
+        storage_key: &str,
+        outcome: QueueHandlerOutcome,
+    ) -> Result<bool, TitoError> {
+        match outcome {
+            QueueHandlerOutcome::Done => Self::ack_event_in_tx(tx, storage_key, &event).await,
+            QueueHandlerOutcome::RescheduleAt(timestamp) => {
+                self.reschedule_in_tx(tx, event, storage_key, timestamp)
+                    .await
+            }
+        }
     }
 
     pub(crate) async fn apply_handler_outcome<T: Serialize + Clone + Send + Sync + 'static>(
@@ -359,23 +449,54 @@ impl<E: TitoEngine> Queue<E> {
         storage_key: &str,
         outcome: QueueHandlerOutcome,
     ) -> Result<(), TitoError> {
-        match outcome {
-            QueueHandlerOutcome::Done => self.ack(storage_key).await,
-            QueueHandlerOutcome::RescheduleAt(timestamp) => {
-                self.reschedule(event, storage_key, timestamp).await
-            }
+        let storage_key = storage_key.to_string();
+        self.engine
+            .transaction(|tx| {
+                let event = event.clone();
+                let storage_key = storage_key.clone();
+                async move {
+                    self.apply_handler_outcome_in_tx(&tx, event, &storage_key, outcome)
+                        .await?;
+                    Ok::<_, TitoError>(())
+                }
+            })
+            .await
+    }
+
+    pub(super) fn event_after_handler_error<T: Clone>(
+        mut event: QueueEvent<T>,
+        error_message: &str,
+    ) -> QueueEvent<T> {
+        event.retry_count = event.retry_count.saturating_add(1);
+        event.errors.push(error_message.to_string());
+        event
+    }
+
+    pub(super) async fn apply_handler_error_in_tx<T: Serialize + Clone + Send + Sync + 'static>(
+        &self,
+        tx: &E::Transaction,
+        event: QueueEvent<T>,
+        storage_key: &str,
+        retry_at: i64,
+        failed_at: i64,
+    ) -> Result<bool, TitoError> {
+        if event.retry_count > event.max_retries {
+            self.move_to_failed_in_tx(tx, event, storage_key, failed_at)
+                .await
+        } else {
+            self.reschedule_in_tx(tx, event, storage_key, retry_at)
+                .await
         }
     }
 
     pub(crate) async fn retry_after_handler_error<T: Serialize + Clone + Send + Sync + 'static>(
         &self,
-        mut event: QueueEvent<T>,
+        event: QueueEvent<T>,
         storage_key: &str,
         error: TitoError,
     ) {
         let error_message = error.to_string();
-        event.retry_count = event.retry_count.saturating_add(1);
-        event.errors.push(error_message.clone());
+        let event = Self::event_after_handler_error(event, &error_message);
         log::warn!(
             "Queue event {} ({}) failed attempt {}/{}: {}",
             event.id,
@@ -385,36 +506,44 @@ impl<E: TitoEngine> Queue<E> {
             error_message
         );
 
-        if event.retry_count > event.max_retries {
-            let event_id = event.id.clone();
-            let event_key = event.key.clone();
-            match self.move_to_dlq(event, storage_key).await {
-                Ok(()) => log::error!(
-                    "Queue event {} ({}) exhausted retries and moved to failed state",
-                    event_id,
-                    event_key
-                ),
-                Err(error) => log::error!(
-                    "Failed to move exhausted queue event {} ({}) to failed state: {}",
-                    event_id,
-                    event_key,
-                    error
-                ),
-            }
-            return;
-        }
-
+        let exhausted = event.retry_count > event.max_retries;
         let backoff = retry_backoff_seconds(event.retry_count);
-        let new_timestamp = Utc::now().timestamp() + backoff;
+        let now = Utc::now().timestamp();
+        let retry_at = now + backoff;
         let event_id = event.id.clone();
         let event_key = event.key.clone();
-        if let Err(error) = self.reschedule(event, storage_key, new_timestamp).await {
-            log::error!(
+        let storage_key = storage_key.to_string();
+        let transition = self
+            .engine
+            .transaction(|tx| {
+                let event = event.clone();
+                let storage_key = storage_key.clone();
+                async move {
+                    self.apply_handler_error_in_tx(&tx, event, &storage_key, retry_at, now)
+                        .await
+                }
+            })
+            .await;
+
+        match transition {
+            Ok(true) if exhausted => log::error!(
+                "Queue event {} ({}) exhausted retries and moved to failed state",
+                event_id,
+                event_key
+            ),
+            Ok(_) => {}
+            Err(error) if exhausted => log::error!(
+                "Failed to move exhausted queue event {} ({}) to failed state: {}",
+                event_id,
+                event_key,
+                error
+            ),
+            Err(error) => log::error!(
                 "Failed to reschedule queue event {} ({}) after handler error: {}",
                 event_id,
                 event_key,
                 error
-            );
+            ),
         }
     }
 
@@ -455,33 +584,50 @@ impl<E: TitoEngine> Queue<E> {
         Ok(())
     }
 
+    pub(super) async fn move_to_failed_in_tx<T: Serialize + Clone + Send + Sync + 'static>(
+        &self,
+        tx: &E::Transaction,
+        mut event: QueueEvent<T>,
+        storage_key: &str,
+        failed_at: i64,
+    ) -> Result<bool, TitoError> {
+        if Self::current_pending_source(tx, storage_key, &event)
+            .await?
+            .is_none()
+        {
+            return Ok(false);
+        }
+
+        let partition = self.partition_for_key(&event.key);
+        let failed_key = Self::failed_key(partition, failed_at, &event.id);
+
+        Self::delete_entry(tx, storage_key.as_bytes()).await?;
+
+        event.state = QueueEventState::Failed;
+        event.processed_at = Some(failed_at);
+
+        let bytes = serde_json::to_vec(&event)
+            .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
+        tx.put(failed_key.as_bytes(), bytes)
+            .await
+            .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
+        Ok(true)
+    }
+
     pub async fn move_to_failed<T: Serialize + Clone + Send + Sync + 'static>(
         &self,
         event: QueueEvent<T>,
         storage_key: &str,
     ) -> Result<(), TitoError> {
-        let partition = self.partition_for_key(&event.key);
         let failed_at = Utc::now().timestamp();
-        let failed_key = Self::failed_key(partition, failed_at, &event.id);
-
         self.engine
             .transaction(|tx| {
                 let storage_key = storage_key.to_string();
-                let failed_key = failed_key.clone();
-                let mut event = event.clone();
+                let event = event.clone();
 
                 async move {
-                    Self::delete_entry(&tx, storage_key.as_bytes()).await?;
-
-                    event.state = QueueEventState::Failed;
-                    event.processed_at = Some(failed_at);
-
-                    let bytes = serde_json::to_vec(&event)
-                        .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
-                    tx.put(failed_key.as_bytes(), bytes)
-                        .await
-                        .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
-
+                    self.move_to_failed_in_tx(&tx, event, &storage_key, failed_at)
+                        .await?;
                     Ok::<_, TitoError>(())
                 }
             })
@@ -710,6 +856,7 @@ mod tests {
             payload: payload(id),
             timestamp,
             original_scheduled_at: Some(timestamp),
+            delivery_generation: 0,
             state,
             processed_at,
             retry_count: 0,

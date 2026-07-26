@@ -449,7 +449,69 @@ impl<E: TitoEngine> Queue<E> {
             .await
     }
 
-    async fn cluster_partition_lease_is_current(
+    async fn current_cluster_partition_assignment_in_tx(
+        tx: &E::Transaction,
+        node_id: &str,
+        partition: u32,
+        generation: u64,
+        now: i64,
+    ) -> Result<Option<ClusterPartitionAssignment>, TitoError> {
+        let key = Self::partition_key(partition);
+        let Some(assignment) = Self::read_json::<ClusterPartitionAssignment>(tx, &key).await?
+        else {
+            return Ok(None);
+        };
+
+        if assignment.generation == generation
+            && assignment.owner_node_id.as_deref() == Some(node_id)
+            && assignment.desired_node_id.as_deref() == Some(node_id)
+            && assignment.lease_until > now
+        {
+            Ok(Some(assignment))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn cluster_partition_lease_is_current_in_tx(
+        tx: &E::Transaction,
+        node_id: &str,
+        partition: u32,
+        generation: u64,
+        now: i64,
+    ) -> Result<bool, TitoError> {
+        Ok(Self::current_cluster_partition_assignment_in_tx(
+            tx, node_id, partition, generation, now,
+        )
+        .await?
+        .is_some())
+    }
+
+    pub(crate) async fn fence_cluster_partition_lease_in_tx(
+        tx: &E::Transaction,
+        node_id: &str,
+        partition: u32,
+        generation: u64,
+        now: i64,
+    ) -> Result<bool, TitoError> {
+        let Some(assignment) = Self::current_cluster_partition_assignment_in_tx(
+            tx, node_id, partition, generation, now,
+        )
+        .await?
+        else {
+            return Ok(false);
+        };
+
+        // TiKV optimistic transactions provide snapshot isolation: reading the
+        // assignment is not enough to conflict with a concurrent reassignment.
+        // Writing the observed value back makes both transactions contend on
+        // the assignment key. The loser retries and revalidates ownership.
+        let key = Self::partition_key(partition);
+        Self::put_json(tx, &key, &assignment).await?;
+        Ok(true)
+    }
+
+    pub(crate) async fn cluster_partition_lease_is_current(
         &self,
         config: &ClusterWorkerConfig,
         partition: u32,
@@ -461,20 +523,123 @@ impl<E: TitoEngine> Queue<E> {
                 let config = config.clone();
                 async move {
                     let now = Utc::now().timestamp();
-                    let key = Self::partition_key(partition);
-                    let Some(assignment) =
-                        Self::read_json::<ClusterPartitionAssignment>(&tx, &key).await?
-                    else {
-                        return Ok(false);
-                    };
-
-                    Ok(assignment.generation == generation
-                        && assignment.owner_node_id.as_ref() == Some(&config.node_id)
-                        && assignment.desired_node_id.as_ref() == Some(&config.node_id)
-                        && assignment.lease_until > now)
+                    Self::cluster_partition_lease_is_current_in_tx(
+                        &tx,
+                        &config.node_id,
+                        partition,
+                        generation,
+                        now,
+                    )
+                    .await
                 }
             })
             .await
+    }
+
+    pub(crate) async fn apply_cluster_handler_outcome<
+        T: Serialize + Clone + Send + Sync + 'static,
+    >(
+        &self,
+        config: &ClusterWorkerConfig,
+        partition: u32,
+        generation: u64,
+        event: QueueEvent<T>,
+        storage_key: &str,
+        outcome: QueueHandlerOutcome,
+    ) -> Result<bool, TitoError> {
+        let config = config.clone();
+        let storage_key = storage_key.to_string();
+        self.engine
+            .transaction(|tx| {
+                let config = config.clone();
+                let event = event.clone();
+                let storage_key = storage_key.clone();
+                async move {
+                    let now = Utc::now().timestamp();
+                    if !Self::fence_cluster_partition_lease_in_tx(
+                        &tx,
+                        &config.node_id,
+                        partition,
+                        generation,
+                        now,
+                    )
+                    .await?
+                    {
+                        return Ok(false);
+                    }
+
+                    self.apply_handler_outcome_in_tx(&tx, event, &storage_key, outcome)
+                        .await
+                }
+            })
+            .await
+    }
+
+    pub(crate) async fn retry_after_cluster_handler_error<
+        T: Serialize + Clone + Send + Sync + 'static,
+    >(
+        &self,
+        config: &ClusterWorkerConfig,
+        partition: u32,
+        generation: u64,
+        event: QueueEvent<T>,
+        storage_key: &str,
+        error: TitoError,
+    ) -> Result<bool, TitoError> {
+        let error_message = error.to_string();
+        let event = Self::event_after_handler_error(event, &error_message);
+        log::warn!(
+            "Queue event {} ({}) failed attempt {}/{}: {}",
+            event.id,
+            event.key,
+            event.retry_count,
+            event.max_retries.saturating_add(1),
+            error_message
+        );
+
+        let exhausted = event.retry_count > event.max_retries;
+        let retry_at = Utc::now().timestamp() + super::retry_backoff_seconds(event.retry_count);
+        let failed_at = Utc::now().timestamp();
+        let event_id = event.id.clone();
+        let event_key = event.key.clone();
+        let config = config.clone();
+        let storage_key = storage_key.to_string();
+        let applied = self
+            .engine
+            .transaction(|tx| {
+                let config = config.clone();
+                let event = event.clone();
+                let storage_key = storage_key.clone();
+                async move {
+                    let now = Utc::now().timestamp();
+                    // Handler failures can reschedule too, so they require the
+                    // same assignment fence as successful handler outcomes.
+                    if !Self::fence_cluster_partition_lease_in_tx(
+                        &tx,
+                        &config.node_id,
+                        partition,
+                        generation,
+                        now,
+                    )
+                    .await?
+                    {
+                        return Ok(false);
+                    }
+
+                    self.apply_handler_error_in_tx(&tx, event, &storage_key, retry_at, failed_at)
+                        .await
+                }
+            })
+            .await?;
+
+        if applied && exhausted {
+            log::error!(
+                "Queue event {} ({}) exhausted retries and moved to failed state",
+                event_id,
+                event_key
+            );
+        }
+        Ok(applied)
     }
 }
 
@@ -760,35 +925,43 @@ where
 
                 match handler(event.clone()).await {
                     Ok(outcome) => {
-                        if matches!(
-                            queue
-                                .cluster_partition_lease_is_current(&config, partition, generation)
-                                .await,
-                            Ok(true)
-                        ) {
-                            if let Err(error) = queue
-                                .apply_handler_outcome(event.clone(), &storage_key, outcome)
-                                .await
-                            {
-                                log::error!(
-                                    "Failed to apply queue handler outcome for event {} at {}: {}",
-                                    event.id,
-                                    storage_key,
-                                    error
-                                );
-                            }
+                        if let Err(error) = queue
+                            .apply_cluster_handler_outcome(
+                                &config,
+                                partition,
+                                generation,
+                                event.clone(),
+                                &storage_key,
+                                outcome,
+                            )
+                            .await
+                        {
+                            log::error!(
+                                "Failed to apply queue handler outcome for event {} at {}: {}",
+                                event.id,
+                                storage_key,
+                                error
+                            );
                         }
                     }
                     Err(err) => {
-                        if matches!(
-                            queue
-                                .cluster_partition_lease_is_current(&config, partition, generation)
-                                .await,
-                            Ok(true)
-                        ) {
-                            queue
-                                .retry_after_handler_error(event, &storage_key, err)
-                                .await;
+                        if let Err(error) = queue
+                            .retry_after_cluster_handler_error(
+                                &config,
+                                partition,
+                                generation,
+                                event.clone(),
+                                &storage_key,
+                                err,
+                            )
+                            .await
+                        {
+                            log::error!(
+                                "Failed to apply queue handler error for event {} at {}: {}",
+                                event.id,
+                                storage_key,
+                                error
+                            );
                         }
                     }
                 }

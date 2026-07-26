@@ -7,10 +7,10 @@ use crate::test_support::MemoryEngine;
 use crate::types::{
     PartitionConfig, TitoCursor, TitoEngine, TitoFindByIndexPayload, TitoFindOneByIndexPayload,
     TitoFindPayload, TitoId, TitoIndexBlockType, TitoIndexConfig, TitoIndexField, TitoModelOptions,
-    TitoModelTrait, TitoPaginated, TitoRelationshipConfig, TitoScanPayload,
+    TitoModelTrait, TitoPaginated, TitoRelationshipConfig, TitoScanPayload, TitoTransaction,
 };
 use crate::utils::{next_string_lexicographically, previous_string_lexicographically};
-use crate::{ClusterCoordinatorLease, ClusterWorkerConfig, TitoError};
+use crate::{ClusterCoordinatorLease, ClusterPartitionAssignment, ClusterWorkerConfig, TitoError};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -337,6 +337,7 @@ fn queue_event(id: &str, key: &str, timestamp: i64) -> QueueEvent<QueuePayload> 
         payload: queue_payload(id),
         timestamp,
         original_scheduled_at: Some(timestamp),
+        delivery_generation: 0,
         state: QueueEventState::Pending,
         processed_at: None,
         retry_count: 0,

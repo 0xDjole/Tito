@@ -75,6 +75,97 @@ async fn queue_reschedule_updates_due_time_but_preserves_original_schedule() {
     assert_eq!(scheduled_after_now[0].1.id, "event-1");
 }
 
+#[tokio::test]
+async fn queue_stale_reschedule_cannot_resurrect_an_acknowledged_event() {
+    let engine = engine();
+    let queue = queue(engine, 1);
+    let now = Utc::now().timestamp();
+    queue
+        .publish(queue_event("event-acked", "entry:acked", now - 10))
+        .await
+        .unwrap();
+
+    let (storage_key, stale_event) = queue
+        .pull::<QueuePayload>(0, 1)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    queue.ack(&storage_key).await.unwrap();
+    queue
+        .reschedule(stale_event, &storage_key, now + 3_600)
+        .await
+        .unwrap();
+
+    assert!(queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+        .await
+        .unwrap()
+        .events
+        .is_empty());
+    let completed = queue
+        .find_by_state_after::<QueuePayload>(QueueEventState::Completed, 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].1.id, "event-acked");
+}
+
+#[tokio::test]
+async fn queue_delivery_generation_fences_same_storage_key_reschedule_race() {
+    let engine = engine();
+    let queue = queue(engine.clone(), 1);
+    let due_at = Utc::now().timestamp() - 10;
+    queue
+        .publish(queue_event("event-same-key", "entry:same-key", due_at))
+        .await
+        .unwrap();
+
+    let (storage_key, first_delivery) = queue
+        .pull::<QueuePayload>(0, 1)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let stale_delivery = first_delivery.clone();
+    queue
+        .apply_handler_outcome(
+            first_delivery,
+            &storage_key,
+            QueueHandlerOutcome::RescheduleAt(due_at),
+        )
+        .await
+        .unwrap();
+    queue
+        .apply_handler_outcome(
+            stale_delivery,
+            &storage_key,
+            QueueHandlerOutcome::RescheduleAt(due_at + 3_600),
+        )
+        .await
+        .unwrap();
+
+    let pending = queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(pending.events.len(), 1);
+    assert_eq!(pending.events[0].0, storage_key);
+    assert_eq!(pending.events[0].1.timestamp, due_at);
+    assert_eq!(pending.events[0].1.id, "event-same-key");
+    assert_eq!(pending.events[0].1.retry_count, 0);
+    assert!(pending.events[0].1.errors.is_empty());
+    assert_eq!(
+        engine
+            .raw_json(&storage_key)
+            .await
+            .unwrap()
+            .get("deliveryGeneration")
+            .and_then(serde_json::Value::as_u64),
+        Some(1)
+    );
+}
+
 #[test]
 fn queue_event_without_original_schedule_falls_back_to_timestamp() {
     let legacy = serde_json::json!({

@@ -152,6 +152,13 @@ Use `RescheduleAt` when the domain deliberately wants another observation laterâ
 example, while a live lease may still be owned or while an external provider result is
 not yet observable. It is not a substitute for failure retries.
 
+Outcome application is compare-and-transition safe. Tito only acknowledges, retries, or
+reschedules the pending delivery that the handler actually received. A stale outcome is
+a no-op after another worker has already moved that delivery. Cluster workers additionally
+validate the node, partition generation, and live lease and write-fence the assignment key
+in the same transaction as the queue transition, so a reassigned worker cannot recreate an
+acknowledged event.
+
 ## Scheduled Events
 
 ```rust
