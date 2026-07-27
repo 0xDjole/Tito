@@ -115,6 +115,52 @@ async fn queue_schedule_next_at_transaction_failure_leaves_exact_current_invocat
 }
 
 #[tokio::test]
+async fn queue_rejects_negative_timestamps_without_creating_unreachable_rows() {
+    let engine = engine();
+    let queue = queue(engine.clone(), 1);
+    let error = queue
+        .publish(queue_event("negative-event", "entry:negative", -1))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, TitoError::InvalidInput(_)));
+    assert!(engine.keys_with_prefix("queue:").await.is_empty());
+
+    let timestamp = Utc::now().timestamp() - 10;
+    queue
+        .publish(queue_event("event-1", "entry:1", timestamp))
+        .await
+        .unwrap();
+    let (storage_key, current) = queue
+        .pull::<QueuePayload>(0, None, 10)
+        .await
+        .unwrap()
+        .events
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let error = queue
+        .schedule_next_at::<QueuePayload>(&storage_key, -1)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, TitoError::InvalidInput(_)));
+    let pending = queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(pending.events.len(), 1);
+    assert_eq!(pending.events[0].0, storage_key);
+    assert_eq!(pending.events[0].1.id, current.id);
+    assert!(queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
+        .await
+        .unwrap()
+        .events
+        .is_empty());
+}
+
+#[tokio::test]
 async fn queue_ack_indeterminate_commit_converges_to_one_of_the_two_atomic_states() {
     for after_apply in [false, true] {
         let engine = engine();

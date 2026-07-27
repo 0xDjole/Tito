@@ -78,6 +78,15 @@ impl<E: TitoEngine> Queue<E> {
         }
     }
 
+    fn validate_timestamp(timestamp: i64) -> Result<(), TitoError> {
+        if timestamp < 0 {
+            return Err(TitoError::InvalidInput(
+                "Queue timestamps must be non-negative Unix seconds".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn prefix_end(prefix: &str) -> Vec<u8> {
         let mut end = prefix.as_bytes().to_vec();
         end.push(0xff);
@@ -121,6 +130,7 @@ impl<E: TitoEngine> Queue<E> {
         mut event: QueueEvent<T>,
         tx: &E::Transaction,
     ) -> Result<(), TitoError> {
+        Self::validate_timestamp(event.timestamp)?;
         let partition = self.partition_for_key(&event.key);
         let pending_key = Self::pending_key(partition, event.timestamp, &event.id);
 
@@ -330,6 +340,7 @@ impl<E: TitoEngine> Queue<E> {
         storage_key: &str,
         timestamp: i64,
     ) -> Result<Option<QueueEvent<T>>, TitoError> {
+        Self::validate_timestamp(timestamp)?;
         if !storage_key.starts_with(Self::state_prefix(QueueEventState::Pending)) {
             return Err(TitoError::InvalidInput(
                 "Only pending queue events can schedule a successor".to_string(),

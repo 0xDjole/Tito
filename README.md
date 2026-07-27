@@ -110,7 +110,7 @@ let results = query.value(&author_id).relationship("tags").execute().await?;
 
 ## Queue Processing
 
-Queue events are partitioned by their business key, can be scheduled for a future timestamp, and remain pending until the handler explicitly acknowledges them. Tito has no automatic retry policy, retry counter, backoff, failed state, or DLQ:
+Queue events are partitioned by their business key, can be scheduled for a non-negative Unix timestamp, and remain pending until the handler explicitly acknowledges them. Tito rejects negative timestamps instead of storing an invocation that polling cannot reach. Tito has no automatic retry policy, retry counter, backoff, failed state, or DLQ:
 
 - `Ok(QueueHandlerOutcome::Acknowledge)` completes the current invocation.
 - `Ok(QueueHandlerOutcome::ScheduleNextAt(timestamp))` atomically completes the current invocation and creates a new pending invocation with a new event ID, the same business key, payload, and original schedule provenance, and that exact next timestamp.
