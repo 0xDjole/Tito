@@ -21,13 +21,19 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::types::{TitoEngine, TitoTransaction, PARTITION_DIGITS};
+use crate::types::{TitoEngine, TitoKvPair, TitoTransaction, PARTITION_DIGITS};
 use crate::TitoError;
 
 pub(crate) const COMPLETED_EVENT_RETENTION_SECONDS: i64 = 3 * 24 * 60 * 60;
 pub(crate) const COMPLETED_EVENT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
 pub(crate) const COMPLETED_EVENT_MAINTENANCE_BATCH_SIZE: u32 = 1_000;
 pub(crate) const COMPLETED_EVENT_MAINTENANCE_MAX_BATCHES: usize = 4;
+/// Maximum serialized size of one scheduler invocation.
+///
+/// Queue range reads use bounded transport pages, and Tito's TiKV client has
+/// explicit decoding headroom above the maximum aggregate page size.
+pub const MAX_QUEUE_EVENT_BYTES: usize = 1024 * 1024;
+pub(crate) const QUEUE_SCAN_RPC_LIMIT: u32 = 16;
 const KEY_NUMBER_DIGITS: usize = 20;
 
 #[derive(Clone)]
@@ -161,6 +167,53 @@ impl<E: TitoEngine> Queue<E> {
         ))
     }
 
+    fn serialize_new_event<T: Serialize>(event: &QueueEvent<T>) -> Result<Vec<u8>, TitoError> {
+        let bytes =
+            serde_json::to_vec(event).map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
+        if bytes.len() > MAX_QUEUE_EVENT_BYTES {
+            return Err(TitoError::InvalidInput(format!(
+                "Serialized queue event exceeds the {MAX_QUEUE_EVENT_BYTES}-byte limit"
+            )));
+        }
+        Ok(bytes)
+    }
+
+    async fn scan_queue_entries(
+        tx: &E::Transaction,
+        start: Vec<u8>,
+        end: Vec<u8>,
+        limit: u32,
+    ) -> Result<Vec<TitoKvPair>, TitoError> {
+        let limit = limit.max(1);
+        let mut entries = Vec::new();
+        let mut next_start = start;
+
+        while next_start < end && entries.len() < limit as usize {
+            let remaining = limit.saturating_sub(entries.len() as u32);
+            let rpc_limit = remaining.min(QUEUE_SCAN_RPC_LIMIT);
+            let page = tx.scan(next_start.clone()..end.clone(), rpc_limit).await?;
+            let scanned_full_page = page.len() == rpc_limit as usize;
+            let Some((last_key, _)) = page.last() else {
+                break;
+            };
+            let mut following_start = last_key.clone();
+            following_start.push(0);
+            if following_start <= next_start {
+                return Err(TitoError::QueryFailed(
+                    "Queue scan did not advance".to_string(),
+                ));
+            }
+
+            entries.extend(page);
+            next_start = following_start;
+            if !scanned_full_page {
+                break;
+            }
+        }
+
+        Ok(entries)
+    }
+
     async fn delete_entry(tx: &E::Transaction, storage_key: &[u8]) -> Result<(), TitoError> {
         tx.delete(storage_key)
             .await
@@ -181,8 +234,7 @@ impl<E: TitoEngine> Queue<E> {
         event.processed_at = None;
         event.completion_reason = None;
 
-        let bytes = serde_json::to_vec(&event)
-            .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
+        let bytes = Self::serialize_new_event(&event)?;
 
         tx.put(pending_key.as_bytes(), bytes)
             .await
@@ -238,8 +290,12 @@ impl<E: TitoEngine> Queue<E> {
                     });
                 }
 
-                let entries = tx
-                    .scan(start.clone()..cycle_end.clone(), limit)
+                let entries = Self::scan_queue_entries(
+                    &tx,
+                    start.clone(),
+                    cycle_end.clone(),
+                    limit,
+                )
                     .await
                     .map_err(|e| TitoError::QueryFailed(format!("Scan pending queue: {}", e)))?;
                 let scanned_full_page = entries.len() == limit as usize;
@@ -426,8 +482,7 @@ impl<E: TitoEngine> Queue<E> {
                         tx.start_version(),
                         &successor.id,
                     );
-                    let successor_bytes = serde_json::to_vec(&successor)
-                        .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
+                    let successor_bytes = Self::serialize_new_event(&successor)?;
 
                     Self::delete_entry(&tx, storage_key.as_bytes()).await?;
                     tx.put(completed_key.as_bytes(), completed_bytes)
@@ -451,12 +506,14 @@ impl<E: TitoEngine> Queue<E> {
                 let deleted = self
                     .engine
                     .transaction(|tx| async move {
-                        let entries = tx
-                            .scan(prefix.as_bytes()..Self::prefix_end(prefix).as_slice(), 1000)
-                            .await
-                            .map_err(|e| {
-                                TitoError::QueryFailed(format!("Scan queue prefix: {}", e))
-                            })?;
+                        let entries = Self::scan_queue_entries(
+                            &tx,
+                            prefix.as_bytes().to_vec(),
+                            Self::prefix_end(prefix),
+                            1000,
+                        )
+                        .await
+                        .map_err(|e| TitoError::QueryFailed(format!("Scan queue prefix: {}", e)))?;
                         let deleted = entries.len();
 
                         for (key, _) in entries {
@@ -497,13 +554,14 @@ impl<E: TitoEngine> Queue<E> {
                     cutoff.saturating_add(1),
                     width = KEY_NUMBER_DIGITS,
                 );
-                let entries = tx
-                    .scan(
-                        "queue:completed:00000000000000000000".as_bytes()..start.as_bytes(),
-                        limit.max(1),
-                    )
-                    .await
-                    .map_err(|e| TitoError::QueryFailed(format!("Scan completed queue: {}", e)))?;
+                let entries = Self::scan_queue_entries(
+                    &tx,
+                    "queue:completed:00000000000000000000".as_bytes().to_vec(),
+                    start.as_bytes().to_vec(),
+                    limit,
+                )
+                .await
+                .map_err(|e| TitoError::QueryFailed(format!("Scan completed queue: {}", e)))?;
 
                 let deleted = entries.len();
                 for (storage_key, _) in entries {
@@ -551,10 +609,10 @@ impl<E: TitoEngine> Queue<E> {
                 let cursor = cursor.clone();
                 async move {
                     let start = cursor.unwrap_or_else(|| prefix.as_bytes().to_vec());
-                    let entries = tx
-                        .scan(start..Self::prefix_end(prefix), limit)
-                        .await
-                        .map_err(|e| TitoError::QueryFailed(format!("Scan queue: {}", e)))?;
+                    let entries =
+                        Self::scan_queue_entries(&tx, start, Self::prefix_end(prefix), limit)
+                            .await
+                            .map_err(|e| TitoError::QueryFailed(format!("Scan queue: {}", e)))?;
 
                     let next_cursor = if entries.len() == limit as usize {
                         entries.last().map(|(key, _)| {
@@ -689,6 +747,65 @@ mod tests {
             completed.events[0].1.completion_reason(),
             Some(QueueCompletionReason::Acknowledged)
         );
+    }
+
+    #[tokio::test]
+    async fn publish_rejects_an_invocation_larger_than_the_transport_safe_limit() {
+        let engine = MemoryEngine::default();
+        let queue = queue(engine.clone());
+        let oversized = Payload {
+            name: "x".repeat(MAX_QUEUE_EVENT_BYTES),
+        };
+
+        let error = queue
+            .publish(QueueEvent::new(
+                "entry:oversized",
+                oversized,
+                Utc::now().timestamp(),
+            ))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, TitoError::InvalidInput(message)
+            if message.contains(&MAX_QUEUE_EVENT_BYTES.to_string())));
+        assert!(engine
+            .keys_with_prefix(Queue::<MemoryEngine>::state_prefix(
+                QueueEventState::Pending
+            ))
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn queue_reads_fulfill_logical_limits_through_bounded_rpc_pages() {
+        let engine = MemoryEngine::default();
+        let queue = queue(engine.clone());
+        let now = Utc::now().timestamp();
+
+        for index in 0..18 {
+            queue
+                .publish(QueueEvent::new(
+                    format!("entry:bounded-{index}"),
+                    payload(&format!("bounded-{index}")),
+                    now,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let page = queue.pull::<Payload>(0, None, 17).await.unwrap();
+
+        assert_eq!(page.events.len(), 17);
+        assert!(page.next_cursor.is_some());
+        assert_eq!(engine.pending_queue_scan_count(), 2);
+
+        let scanned = queue
+            .scan_by_state::<Payload>(QueueEventState::Pending, None, 17)
+            .await
+            .unwrap();
+        assert_eq!(scanned.events.len(), 17);
+        assert!(scanned.next_cursor.is_some());
+        assert_eq!(engine.pending_queue_scan_count(), 4);
     }
 
     #[tokio::test]

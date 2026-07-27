@@ -12,6 +12,7 @@ use tikv_client::{ColumnFamily, RawClient, TimestampExt, Transaction, Transactio
 use tokio::time::{sleep, Duration};
 
 const MAX_TRANSACTION_RETRIES: u32 = 10;
+const TIKV_GRPC_MAX_DECODING_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 
 fn contains_undetermined_error(error: &tikv_client::Error) -> bool {
     match error {
@@ -233,6 +234,18 @@ impl TitoEngine for TiKVBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::queue::{MAX_QUEUE_EVENT_BYTES, QUEUE_SCAN_RPC_LIMIT};
+
+    #[test]
+    fn queue_scan_pages_have_two_x_tikv_decode_headroom() {
+        let maximum_valid_invocation_bytes = MAX_QUEUE_EVENT_BYTES * QUEUE_SCAN_RPC_LIMIT as usize;
+
+        assert_eq!(maximum_valid_invocation_bytes, 16 * 1024 * 1024);
+        assert!(
+            TIKV_GRPC_MAX_DECODING_MESSAGE_BYTES >= maximum_valid_invocation_bytes * 2,
+            "TiKV decoding must leave headroom for terminal metadata, keys, and protobuf framing"
+        );
+    }
 
     #[test]
     fn undetermined_commit_is_classified_as_unknown_and_never_retried() {
@@ -407,15 +420,20 @@ impl TiKV {
     pub async fn connect<S: AsRef<str>>(endpoints: Vec<S>) -> Result<TiKVBackend, TitoError> {
         let endpoint_strings: Vec<String> =
             endpoints.iter().map(|s| s.as_ref().to_string()).collect();
-        let client = TransactionClient::new(endpoint_strings.clone())
+        let client_config = tikv_client::Config::default()
+            .with_grpc_max_decoding_message_size(TIKV_GRPC_MAX_DECODING_MESSAGE_BYTES);
+        let client =
+            TransactionClient::new_with_config(endpoint_strings.clone(), client_config.clone())
+                .await
+                .map_err(|e| {
+                    TitoError::ConnectionFailed(format!("Failed to connect to TiKV: {}", e))
+                })?;
+
+        let raw_client = RawClient::new_with_config(endpoint_strings, client_config)
             .await
             .map_err(|e| {
-                TitoError::ConnectionFailed(format!("Failed to connect to TiKV: {}", e))
+                TitoError::ConnectionFailed(format!("Failed to connect RawClient to TiKV: {}", e))
             })?;
-
-        let raw_client = RawClient::new(endpoint_strings).await.map_err(|e| {
-            TitoError::ConnectionFailed(format!("Failed to connect RawClient to TiKV: {}", e))
-        })?;
 
         Ok(TiKVBackend {
             client: Arc::new(client),

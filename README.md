@@ -116,6 +116,14 @@ Queue events are partitioned by their business key, can be scheduled for a non-n
 - `Ok(QueueHandlerOutcome::ScheduleNextAt(timestamp))` atomically completes the current invocation and creates a new pending invocation with a new event ID, the same business key, payload, and original schedule provenance, and that exact next timestamp.
 - `Err(_)`, a handler panic, or the executor timeout leaves the current invocation unchanged and pending for redelivery at the worker's normal poll cadence.
 
+Every new invocation must serialize to at most `MAX_QUEUE_EVENT_BYTES` (1 MiB). Publication rejects
+larger events before writing anything, and planned continuations enforce the same limit on their
+successor. Queue range reads preserve their public logical page size while fetching at most 16
+invocations per datastore scan. Tito configures both TiKV clients with a 32 MiB decoding budget, so
+the maximum 16 MiB of valid invocation bytes has at least 2x transport headroom for completed-state
+metadata, keys, and protobuf framing. This keeps one logical page from becoming one unbounded RPC
+without turning a 50-event worker pull into dozens of sequential datastore calls.
+
 ```rust
 use std::sync::Arc;
 use futures::FutureExt;
