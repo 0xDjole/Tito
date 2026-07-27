@@ -8,7 +8,7 @@ use std::future::Future;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tikv_client::{ColumnFamily, RawClient, Transaction, TransactionClient};
+use tikv_client::{ColumnFamily, RawClient, TimestampExt, Transaction, TransactionClient};
 use tokio::time::{sleep, Duration};
 
 const MAX_TRANSACTION_RETRIES: u32 = 10;
@@ -101,10 +101,12 @@ impl TitoEngine for TiKVBackend {
             .begin_optimistic()
             .await
             .map_err(|e| classify_tikv_error(e, "Failed to begin transaction", &no_flag))?;
+        let start_version = tx.start_timestamp().version();
         Ok(TiKVTransaction {
             id: DBUuid::new_v4().to_string(),
             inner: Arc::new(tokio::sync::Mutex::new(tx)),
             had_retryable_error: Arc::new(AtomicBool::new(false)),
+            start_version,
         })
     }
 
@@ -281,10 +283,15 @@ pub struct TiKVTransaction {
     pub id: String,
     pub inner: Arc<tokio::sync::Mutex<Transaction>>,
     pub had_retryable_error: Arc<AtomicBool>,
+    start_version: u64,
 }
 
 #[async_trait]
 impl TitoTransaction for TiKVTransaction {
+    fn start_version(&self) -> u64 {
+        self.start_version
+    }
+
     async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<TitoValue>, TitoError> {
         let tikv_key: tikv_client::Key = key.as_ref().to_vec().into();
         self.inner

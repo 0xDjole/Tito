@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch};
 use tokio::time::{sleep, Instant};
 
-use super::worker::{execute_handler, HandlerExecution, DEFAULT_HANDLER_TIMEOUT};
+use super::worker::{
+    apply_handler_outcome, execute_handler, handler_outcome_or_log, DEFAULT_HANDLER_TIMEOUT,
+};
 use super::{
     Queue, QueueEvent, QueueHandlerOutcome, QueuePullCursor, COMPLETED_EVENT_MAINTENANCE_INTERVAL,
 };
@@ -815,53 +817,18 @@ where
                     continue;
                 }
 
-                match execute_handler(&handler, event.clone(), config.handler_timeout).await {
-                    HandlerExecution::Finished(Ok(outcome)) => {
-                        if matches!(
-                            queue
-                                .cluster_partition_lease_is_current(&config, partition, generation)
-                                .await,
-                            Ok(true)
-                        ) {
-                            let result = match outcome {
-                                QueueHandlerOutcome::Acknowledge => queue.ack(&storage_key).await,
-                                QueueHandlerOutcome::ScheduleNextAt(timestamp) => queue
-                                    .schedule_next_at::<T>(&storage_key, timestamp)
-                                    .await
-                                    .map(|_| ()),
-                            };
-                            if let Err(error) = result {
-                                log::error!(
-                                    "Failed to apply queue outcome for event {} at {}: {}",
-                                    event.id,
-                                    storage_key,
-                                    error
-                                );
-                            }
-                        }
-                    }
-                    HandlerExecution::Finished(Err(error)) => {
-                        log::error!(
-                            "Queue handler failed for event {} ({}); leaving it pending for redelivery: {}",
-                            event.id,
-                            event.key,
-                            error
-                        );
-                    }
-                    HandlerExecution::Panicked => {
-                        log::error!(
-                            "Queue handler panicked for event {} ({}); leaving it pending for redelivery",
-                            event.id,
-                            event.key
-                        );
-                    }
-                    HandlerExecution::TimedOut => {
-                        log::error!(
-                            "Queue handler timed out after {:?} for event {} ({}); leaving it pending for redelivery",
-                            config.handler_timeout,
-                            event.id,
-                            event.key
-                        );
+                let execution =
+                    execute_handler(&handler, event.clone(), config.handler_timeout).await;
+                if let Some(outcome) =
+                    handler_outcome_or_log(execution, &event, config.handler_timeout)
+                {
+                    if matches!(
+                        queue
+                            .cluster_partition_lease_is_current(&config, partition, generation)
+                            .await,
+                        Ok(true)
+                    ) {
+                        apply_handler_outcome(&queue, &storage_key, &event, outcome).await;
                     }
                 }
             }

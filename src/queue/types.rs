@@ -68,6 +68,7 @@ pub struct QueueScanPage<T> {
 pub struct QueuePullCursor {
     pub(crate) next_start: Vec<u8>,
     pub(crate) cycle_end: Vec<u8>,
+    pub(crate) enqueue_horizon: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -77,24 +78,17 @@ pub struct QueuePullPage<T> {
 }
 
 impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent<T> {
-    pub fn new(key: impl Into<String>, payload: T) -> Self {
-        let now = chrono::Utc::now().timestamp();
+    pub fn new(key: impl Into<String>, payload: T, due_at: i64) -> Self {
         Self {
             id: queue_event_id(),
             key: key.into(),
             payload,
-            timestamp: now,
-            original_scheduled_at: Some(now),
+            timestamp: due_at,
+            original_scheduled_at: Some(due_at),
             state: QueueEventState::Pending,
             processed_at: None,
             completion_reason: None,
         }
-    }
-
-    pub fn scheduled_for(mut self, timestamp: i64) -> Self {
-        self.timestamp = timestamp;
-        self.original_scheduled_at = Some(timestamp);
-        self
     }
 
     pub fn original_scheduled_at(&self) -> i64 {

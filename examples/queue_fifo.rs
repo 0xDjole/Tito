@@ -37,6 +37,7 @@ async fn main() -> Result<(), TitoError> {
                 email: format!("user{}@example.com", i),
                 action: "created".to_string(),
             },
+            chrono::Utc::now().timestamp(),
         );
 
         queue.publish(event).await?;

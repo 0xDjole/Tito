@@ -5,6 +5,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -13,6 +14,7 @@ pub(crate) struct MemoryEngine {
     data: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
     next_get_error: Arc<Mutex<Option<String>>>,
     next_commit_unknown_after_apply: Arc<Mutex<Option<bool>>>,
+    next_transaction_version: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -21,6 +23,7 @@ pub(crate) struct MemoryTransaction {
     local: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
     next_get_error: Arc<Mutex<Option<String>>>,
     next_commit_unknown_after_apply: Arc<Mutex<Option<bool>>>,
+    start_version: u64,
 }
 
 impl MemoryEngine {
@@ -74,11 +77,16 @@ impl TitoEngine for MemoryEngine {
 
     async fn begin_transaction(&self) -> Result<Self::Transaction, TitoError> {
         let snapshot = self.data.lock().await.clone();
+        let start_version = self
+            .next_transaction_version
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1);
         Ok(MemoryTransaction {
             data: self.data.clone(),
             local: Arc::new(Mutex::new(snapshot)),
             next_get_error: self.next_get_error.clone(),
             next_commit_unknown_after_apply: self.next_commit_unknown_after_apply.clone(),
+            start_version,
         })
     }
 
@@ -121,6 +129,10 @@ impl TitoEngine for MemoryEngine {
 
 #[async_trait]
 impl TitoTransaction for MemoryTransaction {
+    fn start_version(&self) -> u64 {
+        self.start_version
+    }
+
     async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<TitoValue>, TitoError> {
         if let Some(message) = self.next_get_error.lock().await.take() {
             return Err(TitoError::QueryFailed(message));

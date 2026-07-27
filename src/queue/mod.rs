@@ -28,6 +28,7 @@ pub(crate) const COMPLETED_EVENT_RETENTION_SECONDS: i64 = 3 * 24 * 60 * 60;
 pub(crate) const COMPLETED_EVENT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
 pub(crate) const COMPLETED_EVENT_MAINTENANCE_BATCH_SIZE: u32 = 1_000;
 pub(crate) const COMPLETED_EVENT_MAINTENANCE_MAX_BATCHES: usize = 4;
+const KEY_NUMBER_DIGITS: usize = 20;
 
 #[derive(Clone)]
 pub struct Queue<E: TitoEngine> {
@@ -47,20 +48,68 @@ impl<E: TitoEngine> Queue<E> {
         (hasher.finish() % partition_count as u64) as u32
     }
 
-    fn pending_key(partition: u32, timestamp: i64, event_id: &str) -> String {
+    fn pending_key(partition: u32, timestamp: i64, enqueue_version: u64, event_id: &str) -> String {
         format!(
-            "queue:pending:{:0pwidth$}:{}:{}",
+            "queue:pending:{:0pwidth$}:{:0twidth$}:{:0vwidth$}:{}",
             partition,
             timestamp,
+            enqueue_version,
             event_id,
             pwidth = PARTITION_DIGITS,
+            twidth = KEY_NUMBER_DIGITS,
+            vwidth = KEY_NUMBER_DIGITS,
         )
+    }
+
+    fn pending_partition_start(partition: u32, timestamp: i64) -> Vec<u8> {
+        format!(
+            "queue:pending:{:0pwidth$}:{:0twidth$}",
+            partition,
+            timestamp,
+            pwidth = PARTITION_DIGITS,
+            twidth = KEY_NUMBER_DIGITS,
+        )
+        .into_bytes()
+    }
+
+    fn pending_key_generation(storage_key: &[u8], partition: u32) -> Option<(&str, u64)> {
+        let storage_key = std::str::from_utf8(storage_key).ok()?;
+        let prefix = format!(
+            "queue:pending:{partition:0width$}:",
+            width = PARTITION_DIGITS
+        );
+        let suffix = storage_key.strip_prefix(&prefix)?;
+        let mut fields = suffix.splitn(3, ':');
+        let due_at = fields.next()?;
+        let enqueue_version = fields.next()?;
+        fields.next()?;
+
+        if due_at.len() != KEY_NUMBER_DIGITS
+            || enqueue_version.len() != KEY_NUMBER_DIGITS
+            || !due_at.bytes().all(|byte| byte.is_ascii_digit())
+            || !enqueue_version.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+
+        Some((due_at, enqueue_version.parse().ok()?))
+    }
+
+    fn pending_due_bucket_end(partition: u32, due_at: &str) -> Vec<u8> {
+        let prefix = format!(
+            "queue:pending:{partition:0width$}:{due_at}:",
+            width = PARTITION_DIGITS
+        );
+        Self::prefix_end(&prefix)
     }
 
     fn completed_key(processed_at: i64, scheduled_at: i64, event_id: &str) -> String {
         format!(
-            "queue:completed:{:020}:{:020}:{}",
-            processed_at, scheduled_at, event_id
+            "queue:completed:{:0width$}:{:0width$}:{}",
+            processed_at,
+            scheduled_at,
+            event_id,
+            width = KEY_NUMBER_DIGITS,
         )
     }
 
@@ -93,21 +142,14 @@ impl<E: TitoEngine> Queue<E> {
         end
     }
 
-    fn state_timestamp<T>(event: &QueueEvent<T>, state: QueueEventState) -> Option<i64> {
-        match state {
-            QueueEventState::Pending => Some(event.timestamp),
-            QueueEventState::Completed => event.processed_at,
-        }
-    }
-
-    async fn read_event_from_value<T: DeserializeOwned + Clone + Send + Sync + 'static>(
+    fn read_event_from_value<T: DeserializeOwned + Clone + Send + Sync + 'static>(
         value: &[u8],
     ) -> Result<QueueEvent<T>, TitoError> {
         serde_json::from_slice::<QueueEvent<T>>(value)
             .map_err(|e| TitoError::DeserializationFailed(e.to_string()))
     }
 
-    async fn read_value_from_entry(value: &[u8]) -> Result<Value, TitoError> {
+    fn read_value_from_entry(value: &[u8]) -> Result<Value, TitoError> {
         if let Ok(event) = serde_json::from_slice::<Value>(value) {
             if event.get("id").is_some() && event.get("key").is_some() {
                 return Ok(event);
@@ -132,7 +174,8 @@ impl<E: TitoEngine> Queue<E> {
     ) -> Result<(), TitoError> {
         Self::validate_timestamp(event.timestamp)?;
         let partition = self.partition_for_key(&event.key);
-        let pending_key = Self::pending_key(partition, event.timestamp, &event.id);
+        let pending_key =
+            Self::pending_key(partition, event.timestamp, tx.start_version(), &event.id);
 
         event.state = QueueEventState::Pending;
         event.processed_at = None;
@@ -172,23 +215,21 @@ impl<E: TitoEngine> Queue<E> {
                 let cursor = cursor.clone();
                 async move {
                 let now = Utc::now().timestamp();
-                let partition_start = format!(
-                    "queue:pending:{:0pwidth$}:{}",
-                    partition,
-                    0,
-                    pwidth = PARTITION_DIGITS,
-                )
-                .into_bytes();
-                let due_end = format!(
-                    "queue:pending:{:0pwidth$}:{}",
-                    partition,
-                    now.saturating_add(1),
-                    pwidth = PARTITION_DIGITS,
-                )
-                .into_bytes();
-                let (start, cycle_end) = cursor
-                    .map(|cursor| (cursor.next_start, cursor.cycle_end))
-                    .unwrap_or((partition_start, due_end));
+                let (start, cycle_end, enqueue_horizon) = cursor
+                    .map(|cursor| {
+                        (
+                            cursor.next_start,
+                            cursor.cycle_end,
+                            cursor.enqueue_horizon,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        (
+                            Self::pending_partition_start(partition, 0),
+                            Self::pending_partition_start(partition, now.saturating_add(1)),
+                            tx.start_version(),
+                        )
+                    });
 
                 if start >= cycle_end {
                     return Ok::<_, TitoError>(QueuePullPage {
@@ -197,34 +238,35 @@ impl<E: TitoEngine> Queue<E> {
                     });
                 }
 
-                let mut entries = tx
-                    .scan(start..cycle_end.clone(), limit.saturating_add(1))
+                let entries = tx
+                    .scan(start.clone()..cycle_end.clone(), limit)
                     .await
                     .map_err(|e| TitoError::QueryFailed(format!("Scan pending queue: {}", e)))?;
-
-                // Advance by raw storage rows, not successfully decoded events.
-                // A malformed row therefore remains available for inspection
-                // without pinning every valid row behind it.
-                let has_more = entries.len() > limit as usize;
-                if has_more {
-                    entries.truncate(limit as usize);
-                }
-                let next_cursor = if has_more {
-                    entries.last().map(|(key, _)| {
-                        let mut next_start = key.clone();
-                        next_start.push(0);
-                        QueuePullCursor {
-                            next_start,
-                            cycle_end,
-                        }
-                    })
-                } else {
-                    None
-                };
+                let scanned_full_page = entries.len() == limit as usize;
 
                 let mut events = Vec::new();
+                let mut next_start = start.clone();
                 for (storage_key, value) in entries {
-                    let event = match Self::read_event_from_value::<T>(&value).await {
+                    if storage_key < next_start {
+                        continue;
+                    }
+
+                    if let Some((due_at, enqueue_version)) =
+                        Self::pending_key_generation(&storage_key, partition)
+                    {
+                        if enqueue_version >= enqueue_horizon {
+                            next_start = Self::pending_due_bucket_end(partition, due_at);
+                            continue;
+                        }
+                    }
+
+                    // Advance by raw storage rows, not successfully decoded
+                    // events. A malformed value therefore remains available
+                    // for inspection without pinning every valid row behind it.
+                    next_start = storage_key.clone();
+                    next_start.push(0);
+
+                    let event = match Self::read_event_from_value::<T>(&value) {
                         Ok(event) => event,
                         Err(error) => {
                             log::error!(
@@ -250,6 +292,21 @@ impl<E: TitoEngine> Queue<E> {
                         events.push((key, event));
                     }
                 }
+
+                // A full raw page keeps this pass alive. Outcomes are applied
+                // after this transaction closes and may enqueue same-time
+                // successors; the frozen transaction horizon lets the next
+                // pull jump past those fresh rows and continue to later
+                // due-time buckets. An underfull page is already exhausted, so
+                // it wraps without adding an idle poll to ordinary workloads.
+                let next_cursor =
+                    (scanned_full_page && next_start > start && next_start < cycle_end).then_some(
+                        QueuePullCursor {
+                            next_start,
+                            cycle_end,
+                            enqueue_horizon,
+                        },
+                    );
 
                 Ok::<_, TitoError>(QueuePullPage {
                     events,
@@ -279,7 +336,7 @@ impl<E: TitoEngine> Queue<E> {
                         return Ok::<_, TitoError>(());
                     };
 
-                    let mut event = Self::read_value_from_entry(&bytes).await?;
+                    let mut event = Self::read_value_from_entry(&bytes)?;
 
                     if event.get("state").and_then(Value::as_str) != Some("pending") {
                         return Ok::<_, TitoError>(());
@@ -361,7 +418,7 @@ impl<E: TitoEngine> Queue<E> {
                         return Ok::<_, TitoError>(None);
                     };
 
-                    let current = Self::read_event_from_value::<T>(&bytes).await?;
+                    let current = Self::read_event_from_value::<T>(&bytes)?;
 
                     if current.state != QueueEventState::Pending {
                         return Ok::<_, TitoError>(None);
@@ -379,8 +436,12 @@ impl<E: TitoEngine> Queue<E> {
 
                     let successor = current.successor_at(timestamp);
                     let successor_partition = self.partition_for_key(&successor.key);
-                    let successor_key =
-                        Self::pending_key(successor_partition, successor.timestamp, &successor.id);
+                    let successor_key = Self::pending_key(
+                        successor_partition,
+                        successor.timestamp,
+                        tx.start_version(),
+                        &successor.id,
+                    );
                     let successor_bytes = serde_json::to_vec(&successor)
                         .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
 
@@ -447,7 +508,11 @@ impl<E: TitoEngine> Queue<E> {
 
         self.engine
             .transaction(|tx| async move {
-                let start = format!("queue:completed:{:020}:", cutoff.saturating_add(1));
+                let start = format!(
+                    "queue:completed:{:0width$}:",
+                    cutoff.saturating_add(1),
+                    width = KEY_NUMBER_DIGITS,
+                );
                 let entries = tx
                     .scan(
                         "queue:completed:00000000000000000000".as_bytes()..start.as_bytes(),
@@ -488,38 +553,33 @@ impl<E: TitoEngine> Queue<E> {
         Ok(true)
     }
 
-    pub async fn find_by_state_after<T: DeserializeOwned + Clone + Send + Sync + 'static>(
+    /// Finds terminal invocation history processed strictly after `cutoff`.
+    ///
+    /// Pending work is ordered by due time rather than a generic state
+    /// timestamp; inspect it through [`Queue::scan_by_state`] when needed.
+    pub async fn find_completed_after<T: DeserializeOwned + Clone + Send + Sync + 'static>(
         &self,
-        state: QueueEventState,
         cutoff: i64,
         limit: u32,
     ) -> Result<Vec<(String, QueueEvent<T>)>, TitoError> {
         self.engine
             .transaction(|tx| async move {
                 let mut events = Vec::new();
-                let prefix = Self::state_prefix(state);
-                let entries = if state == QueueEventState::Completed {
-                    let start = format!("queue:completed:{:020}:", cutoff.saturating_add(1));
-                    tx.scan(
+                let start = format!("queue:completed:{:020}:", cutoff.saturating_add(1));
+                let entries = tx
+                    .scan(
                         start.as_bytes()..Self::prefix_end("queue:completed:").as_slice(),
                         limit,
                     )
                     .await
-                    .map_err(|e| TitoError::QueryFailed(format!("Scan completed queue: {}", e)))?
-                } else {
-                    tx.scan(
-                        prefix.as_bytes()..Self::prefix_end(prefix).as_slice(),
-                        limit,
-                    )
-                    .await
-                    .map_err(|e| TitoError::QueryFailed(format!("Scan queue: {}", e)))?
-                };
+                    .map_err(|e| TitoError::QueryFailed(format!("Scan completed queue: {}", e)))?;
 
                 for (storage_key, value) in entries {
-                    let event = Self::read_event_from_value::<T>(&value).await?;
+                    let event = Self::read_event_from_value::<T>(&value)?;
 
-                    if event.state == state
-                        && Self::state_timestamp(&event, state)
+                    if event.state == QueueEventState::Completed
+                        && event
+                            .processed_at
                             .is_some_and(|timestamp| timestamp > cutoff)
                     {
                         let key = String::from_utf8(storage_key).map_err(|_| {
@@ -565,7 +625,7 @@ impl<E: TitoEngine> Queue<E> {
 
                     let mut events = Vec::new();
                     for (storage_key, value) in entries {
-                        let event = Self::read_event_from_value::<T>(&value).await?;
+                        let event = Self::read_event_from_value::<T>(&value)?;
 
                         if event.state == state {
                             let key = String::from_utf8(storage_key).map_err(|_| {
@@ -638,11 +698,15 @@ mod tests {
         let now = chrono::Utc::now().timestamp();
 
         queue
-            .publish(QueueEvent::new("entry:due", payload("due")).scheduled_for(now - 10))
+            .publish(QueueEvent::new("entry:due", payload("due"), now - 10))
             .await
             .unwrap();
         queue
-            .publish(QueueEvent::new("entry:future", payload("future")).scheduled_for(now + 3600))
+            .publish(QueueEvent::new(
+                "entry:future",
+                payload("future"),
+                now + 3600,
+            ))
             .await
             .unwrap();
 
@@ -685,12 +749,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pull_reaches_due_timestamps_with_fewer_decimal_digits_than_now() {
+        let queue = queue(MemoryEngine::default());
+        let old_due_timestamp = 999_999_999;
+
+        queue
+            .publish(QueueEvent::new(
+                "entry:old-due",
+                payload("old-due"),
+                old_due_timestamp,
+            ))
+            .await
+            .unwrap();
+
+        let jobs = queue.pull::<Payload>(0, None, 10).await.unwrap().events;
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].1.key, "entry:old-due");
+        assert_eq!(jobs[0].1.timestamp, old_due_timestamp);
+    }
+
+    #[tokio::test]
     async fn scan_by_state_pages_completed_queue_rows() {
         let queue = queue(MemoryEngine::default());
 
         for name in ["one", "two", "three"] {
             queue
-                .publish(QueueEvent::new(format!("entry:{name}"), payload(name)))
+                .publish(QueueEvent::new(
+                    format!("entry:{name}"),
+                    payload(name),
+                    Utc::now().timestamp(),
+                ))
                 .await
                 .unwrap();
         }
@@ -726,7 +815,11 @@ mod tests {
 
         for name in ["one", "two", "three"] {
             queue
-                .publish(QueueEvent::new(format!("entry:{name}"), payload(name)))
+                .publish(QueueEvent::new(
+                    format!("entry:{name}"),
+                    payload(name),
+                    Utc::now().timestamp(),
+                ))
                 .await
                 .unwrap();
         }
@@ -782,7 +875,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn find_by_state_after_filters_by_state_timestamp() {
+    async fn find_completed_after_filters_by_processed_timestamp() {
         let engine = MemoryEngine::default();
         let queue = queue(engine.clone());
 
@@ -799,10 +892,7 @@ mod tests {
         )
         .await;
 
-        let events = queue
-            .find_by_state_after::<Payload>(QueueEventState::Completed, 10, 10)
-            .await
-            .unwrap();
+        let events = queue.find_completed_after::<Payload>(10, 10).await.unwrap();
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].1.key, "entry:new");

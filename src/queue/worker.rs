@@ -65,6 +65,68 @@ where
     }
 }
 
+pub(crate) fn handler_outcome_or_log<T>(
+    execution: HandlerExecution,
+    event: &QueueEvent<T>,
+    handler_timeout: Duration,
+) -> Option<QueueHandlerOutcome> {
+    match execution {
+        HandlerExecution::Finished(Ok(outcome)) => Some(outcome),
+        HandlerExecution::Finished(Err(error)) => {
+            log::error!(
+                "Queue handler failed for event {} ({}); leaving it pending for redelivery: {}",
+                event.id,
+                event.key,
+                error
+            );
+            None
+        }
+        HandlerExecution::Panicked => {
+            log::error!(
+                "Queue handler panicked for event {} ({}); leaving it pending for redelivery",
+                event.id,
+                event.key
+            );
+            None
+        }
+        HandlerExecution::TimedOut => {
+            log::error!(
+                "Queue handler timed out after {:?} for event {} ({}); leaving it pending for redelivery",
+                handler_timeout,
+                event.id,
+                event.key
+            );
+            None
+        }
+    }
+}
+
+pub(crate) async fn apply_handler_outcome<E, T>(
+    queue: &Queue<E>,
+    storage_key: &str,
+    event: &QueueEvent<T>,
+    outcome: QueueHandlerOutcome,
+) where
+    E: TitoEngine,
+    T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    let result = match outcome {
+        QueueHandlerOutcome::Acknowledge => queue.ack(storage_key).await,
+        QueueHandlerOutcome::ScheduleNextAt(timestamp) => queue
+            .schedule_next_at::<T>(storage_key, timestamp)
+            .await
+            .map(|_| ()),
+    };
+    if let Err(error) = result {
+        log::error!(
+            "Failed to apply queue outcome for event {} at {}: {}",
+            event.id,
+            storage_key,
+            error
+        );
+    }
+}
+
 pub async fn run_worker<E, T, H>(
     queue: Arc<Queue<E>>,
     config: WorkerConfig,
@@ -126,60 +188,24 @@ where
                                 Ok(page) => {
                                     cursor = page.next_cursor;
                                     for (storage_key, event) in page.events {
-                                        match execute_handler(
+                                        let execution = execute_handler(
                                             &h,
                                             event.clone(),
                                             handler_timeout,
                                         )
-                                        .await
-                                        {
-                                            HandlerExecution::Finished(Ok(outcome)) => {
-                                                let result = match outcome {
-                                                    QueueHandlerOutcome::Acknowledge => {
-                                                        q.ack(&storage_key).await
-                                                    }
-                                                    QueueHandlerOutcome::ScheduleNextAt(
-                                                        timestamp,
-                                                    ) => q
-                                                        .schedule_next_at::<T>(
-                                                            &storage_key,
-                                                            timestamp,
-                                                        )
-                                                        .await
-                                                        .map(|_| ()),
-                                                };
-                                                if let Err(error) = result {
-                                                    log::error!(
-                                                        "Failed to apply queue outcome for event {} at {}: {}",
-                                                        event.id,
-                                                        storage_key,
-                                                        error
-                                                    );
-                                                }
-                                            }
-                                            HandlerExecution::Finished(Err(error)) => {
-                                                log::error!(
-                                                    "Queue handler failed for event {} ({}); leaving it pending for redelivery: {}",
-                                                    event.id,
-                                                    event.key,
-                                                    error
-                                                );
-                                            }
-                                            HandlerExecution::Panicked => {
-                                                log::error!(
-                                                    "Queue handler panicked for event {} ({}); leaving it pending for redelivery",
-                                                    event.id,
-                                                    event.key
-                                                );
-                                            }
-                                            HandlerExecution::TimedOut => {
-                                                log::error!(
-                                                    "Queue handler timed out after {:?} for event {} ({}); leaving it pending for redelivery",
-                                                    handler_timeout,
-                                                    event.id,
-                                                    event.key
-                                                );
-                                            }
+                                        .await;
+                                        if let Some(outcome) = handler_outcome_or_log(
+                                            execution,
+                                            &event,
+                                            handler_timeout,
+                                        ) {
+                                            apply_handler_outcome(
+                                                &q,
+                                                &storage_key,
+                                                &event,
+                                                outcome,
+                                            )
+                                            .await;
                                         }
                                     }
                                 }

@@ -127,7 +127,7 @@ async fn cluster_worker_contains_handler_panic_and_redelivers_pending_invocation
     timeout(Duration::from_secs(2), async {
         loop {
             let completed = queue
-                .find_by_state_after::<QueuePayload>(QueueEventState::Completed, 0, 10)
+                .find_completed_after::<QueuePayload>(0, 10)
                 .await
                 .unwrap();
             if completed

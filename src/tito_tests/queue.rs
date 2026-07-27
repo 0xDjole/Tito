@@ -5,7 +5,7 @@ use tokio::time::Instant;
 
 #[test]
 fn queue_event_helpers_parse_key_and_update_schedule() {
-    let event = QueueEvent::new("entry:entry-1", queue_payload("payload")).scheduled_for(123);
+    let event = QueueEvent::new("entry:entry-1", queue_payload("payload"), 123);
 
     assert_eq!(event.key_type(), "entry");
     assert_eq!(event.key_value(), "entry-1");
@@ -31,7 +31,11 @@ fn queue_state_has_no_failed_or_dead_letter_variant() {
 
 #[test]
 fn queue_event_serialization_contains_no_retry_policy_metadata() {
-    let event = QueueEvent::new("entry:clean", queue_payload("clean"));
+    let event = QueueEvent::new(
+        "entry:clean",
+        queue_payload("clean"),
+        Utc::now().timestamp(),
+    );
     assert_eq!(event.completion_reason(), None);
     let value = serde_json::to_value(&event).unwrap();
 
@@ -45,18 +49,47 @@ fn queue_event_serialization_contains_no_retry_policy_metadata() {
 }
 
 #[tokio::test]
+async fn queue_pending_key_orders_by_fixed_due_time_and_enqueue_generation() {
+    let engine = engine();
+    let queue = queue(engine, 1);
+    queue
+        .publish(queue_event("event-1", "entry:1", 123))
+        .await
+        .unwrap();
+
+    let pending = queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+        .await
+        .unwrap();
+    let fields: Vec<_> = pending.events[0].0.splitn(6, ':').collect();
+
+    assert_eq!(fields.len(), 6);
+    assert_eq!(
+        &fields[..4],
+        ["queue", "pending", "0000", "00000000000000000123"]
+    );
+    assert_eq!(fields[4].len(), 20);
+    assert!(fields[4].bytes().all(|byte| byte.is_ascii_digit()));
+    assert!(fields[4].parse::<u64>().unwrap() > 0);
+    assert_eq!(fields[5], "event-1");
+}
+
+#[tokio::test]
 async fn queue_ack_missing_key_is_noop() {
     let engine = engine();
     let queue = queue(engine, 1);
 
-    queue.ack("queue:pending:0000:1:missing").await.unwrap();
+    queue
+        .ack("queue:pending:0000:00000000000000000001:00000000000000000000:missing")
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
 async fn queue_ack_preserves_malformed_pending_bytes() {
     let engine = engine();
     let queue = queue(engine.clone(), 1);
-    let key = "queue:pending:0000:1:bad";
+    let key = "queue:pending:0000:00000000000000000001:00000000000000000000:bad";
     engine.put_raw(key, b"not-json".to_vec()).await;
 
     let error = queue.ack(key).await.unwrap_err();
@@ -271,7 +304,7 @@ async fn queue_schedule_next_indeterminate_commit_converges_to_one_of_the_two_at
 async fn queue_pull_preserves_malformed_pending_bytes() {
     let engine = engine();
     let queue = queue(engine.clone(), 1);
-    let key = "queue:pending:0000:0:bad";
+    let key = "queue:pending:0000:00000000000000000000:00000000000000000000:bad";
     engine.put_raw(key, b"not-json".to_vec()).await;
 
     let pulled = queue.pull::<QueuePayload>(0, None, 10).await.unwrap();
@@ -285,7 +318,8 @@ async fn queue_pull_cursor_advances_past_a_full_malformed_page() {
     let engine = engine();
     let queue = queue(engine.clone(), 1);
     for index in 0..50 {
-        let key = format!("queue:pending:0000:0:bad-{index:02}");
+        let key =
+            format!("queue:pending:0000:00000000000000000000:00000000000000000000:bad-{index:02}");
         engine.put_raw(&key, b"not-json".to_vec()).await;
     }
     queue
@@ -310,10 +344,76 @@ async fn queue_pull_cursor_advances_past_a_full_malformed_page() {
     assert!(second.next_cursor.is_none());
     assert_eq!(
         engine
-            .keys_with_prefix("queue:pending:0000:0:bad-")
+            .keys_with_prefix("queue:pending:0000:00000000000000000000:00000000000000000000:bad-",)
             .await
             .len(),
         50
+    );
+}
+
+#[tokio::test]
+async fn queue_pull_horizon_prevents_immediate_successors_from_starving_later_due_work() {
+    let engine = engine();
+    let queue = queue(engine, 1);
+    let immediate_due_at = Utc::now().timestamp() - 2;
+    let target_due_at = immediate_due_at + 1;
+
+    for index in 0..50 {
+        queue
+            .publish(queue_event(
+                &format!("immediate-{index:02}"),
+                &format!("entry:immediate-{index:02}"),
+                immediate_due_at,
+            ))
+            .await
+            .unwrap();
+    }
+    queue
+        .publish(queue_event(
+            "later-target",
+            "entry:later-target",
+            target_due_at,
+        ))
+        .await
+        .unwrap();
+
+    let mut cursor = None;
+    let mut scheduled_continuations = 0;
+    let mut reached_target = false;
+
+    for _ in 0..10 {
+        let page = queue
+            .pull::<QueuePayload>(0, cursor.take(), 50)
+            .await
+            .unwrap();
+        cursor = page.next_cursor;
+
+        for (storage_key, event) in page.events {
+            if event.id == "later-target" {
+                queue.ack(&storage_key).await.unwrap();
+                reached_target = true;
+            } else {
+                queue
+                    .schedule_next_at::<QueuePayload>(&storage_key, immediate_due_at)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                scheduled_continuations += 1;
+            }
+        }
+
+        if reached_target {
+            break;
+        }
+    }
+
+    assert!(
+        reached_target,
+        "fresh same-time successors must not keep an older pass ahead of a later due bucket"
+    );
+    assert_eq!(
+        scheduled_continuations, 50,
+        "each invocation present at the frozen horizon runs once before the later due target"
     );
 }
 
@@ -401,7 +501,7 @@ async fn queue_schedule_next_at_atomically_completes_current_and_creates_success
     assert!(
         pending.events[0]
             .0
-            .contains(&format!(":{future_timestamp}:")),
+            .contains(&format!(":{future_timestamp:020}:")),
         "the exact successor schedule belongs in its pending storage key"
     );
 
@@ -669,7 +769,7 @@ async fn queue_clear_removes_pending_and_completed_rows() {
 
     engine
         .put_raw(
-            "queue:pending:0000:1:pending",
+            "queue:pending:0000:00000000000000000001:00000000000000000000:pending",
             serde_json::to_vec(&pending).unwrap(),
         )
         .await;
@@ -1177,7 +1277,7 @@ async fn wait_for_completed(queue: &Arc<Queue<MemoryEngine>>, event_id: &str) {
     timeout(Duration::from_secs(2), async {
         loop {
             let completed = queue
-                .find_by_state_after::<QueuePayload>(QueueEventState::Completed, 0, 10)
+                .find_completed_after::<QueuePayload>(0, 10)
                 .await
                 .unwrap();
             if completed.iter().any(|(_, event)| event.id == event_id) {

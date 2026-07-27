@@ -125,7 +125,11 @@ use tito::queue::run_worker;
 let queue = Arc::new(Queue::new(db.clone(), QueueConfig::new(4)));
 
 queue
-    .publish(QueueEvent::new("user:123", UserCreated { id: "123".into() }))
+    .publish(QueueEvent::new(
+        "user:123",
+        UserCreated { id: "123".into() },
+        chrono::Utc::now().timestamp(),
+    ))
     .await?;
 
 run_worker(
@@ -144,7 +148,16 @@ run_worker(
 
 Workers supervise each handler with a ten-minute timeout by default. Configure `handler_timeout` when a workload has a different bounded execution contract; the timeout is executor protection and never changes queue state or provider policy.
 
-Partition polling is fair across due rows. Each worker keeps an in-memory cursor for one bounded pass, advances that cursor by raw storage row (including malformed rows), and then wraps to the oldest due key. The pass keeps a fixed due-time horizon, so continuously arriving work cannot prevent the wrap. The cursor is executor state only: it is not persisted, does not lease a queue row, and does not encode retry policy.
+Partition polling is fair across due rows. Pending storage keys are ordered as
+`queue:pending:{partition:04}:{due_at:020}:{enqueue_version:020}:{event_id}`. The enqueue version is
+the datastore transaction's globally ordered start version; it is internal ordering metadata, not
+an invocation ID, provider identity, lease, or domain state. Each worker keeps an in-memory cursor
+for one bounded pass. The first pull freezes both the due-time boundary and transaction-version
+horizon. Later pulls advance by raw storage row (including malformed rows) and jump over an entire
+due-time bucket when they encounter a row enqueued at or after that horizon. A handler can therefore
+create immediate same-time successors without keeping later due-time buckets behind them forever.
+After the pass is exhausted, polling wraps to the oldest due key and those successors become
+eligible. The cursor is executor state only: it is not persisted and does not encode retry policy.
 
 Completed invocation history has one fixed retention policy: standalone workers and the elected
 cluster coordinator delete rows older than three days in bounded passes. A full pass yields and
@@ -160,7 +173,9 @@ Tito may replay a transaction closure after an explicitly retryable, determined 
 
 ### Upgrade contract
 
-This release intentionally removes the former retry/DLQ metadata and is not wire-compatible with workers using that queue protocol. Do not run the old and new queue protocols together.
+This release intentionally removes the former retry/DLQ metadata and changes Pending storage keys
+to include fixed-width due time and enqueue-version fields. It is not wire-compatible with workers
+using either older queue protocol. Do not run old and new queue protocols together.
 
 For the prelaunch cutover, stop publishers and workers, use the old release to drain Pending and clear its Failed/DLQ keyspaces, verify Pending is empty, deploy the replacement environment, and then restart publication and processing. If a future nonempty production environment requires migration, build and deploy a separately named bridge release first; compatibility scaffolding is not part of this queue contract.
 
