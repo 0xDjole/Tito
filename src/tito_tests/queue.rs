@@ -115,6 +115,113 @@ async fn queue_schedule_next_at_transaction_failure_leaves_exact_current_invocat
 }
 
 #[tokio::test]
+async fn queue_ack_indeterminate_commit_converges_to_one_of_the_two_atomic_states() {
+    for after_apply in [false, true] {
+        let engine = engine();
+        let queue = queue(engine.clone(), 1);
+        let timestamp = Utc::now().timestamp() - 10;
+        queue
+            .publish(queue_event("event-1", "entry:1", timestamp))
+            .await
+            .unwrap();
+        let (storage_key, current) = queue
+            .pull::<QueuePayload>(0, None, 10)
+            .await
+            .unwrap()
+            .events
+            .into_iter()
+            .next()
+            .unwrap();
+        engine.make_next_commit_outcome_unknown(after_apply).await;
+
+        let error = queue.ack(&storage_key).await.unwrap_err();
+
+        assert!(matches!(error, TitoError::CommitOutcomeUnknown(_)));
+        let pending = queue
+            .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+            .await
+            .unwrap();
+        let completed = queue
+            .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
+            .await
+            .unwrap();
+        if after_apply {
+            assert!(pending.events.is_empty());
+            assert_eq!(completed.events.len(), 1);
+            assert_eq!(completed.events[0].1.id, current.id);
+            assert_eq!(
+                completed.events[0].1.completion_reason(),
+                Some(QueueCompletionReason::Acknowledged)
+            );
+        } else {
+            assert_eq!(pending.events.len(), 1);
+            assert_eq!(pending.events[0].0, storage_key);
+            assert_eq!(pending.events[0].1.id, current.id);
+            assert!(completed.events.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn queue_schedule_next_indeterminate_commit_converges_to_one_of_the_two_atomic_states() {
+    for after_apply in [false, true] {
+        let engine = engine();
+        let queue = queue(engine.clone(), 1);
+        let timestamp = Utc::now().timestamp() - 10;
+        let next_timestamp = timestamp + 60;
+        queue
+            .publish(queue_event("event-1", "entry:1", timestamp))
+            .await
+            .unwrap();
+        let (storage_key, current) = queue
+            .pull::<QueuePayload>(0, None, 10)
+            .await
+            .unwrap()
+            .events
+            .into_iter()
+            .next()
+            .unwrap();
+        engine.make_next_commit_outcome_unknown(after_apply).await;
+
+        let error = queue
+            .schedule_next_at::<QueuePayload>(&storage_key, next_timestamp)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, TitoError::CommitOutcomeUnknown(_)));
+        let pending = queue
+            .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+            .await
+            .unwrap();
+        let completed = queue
+            .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
+            .await
+            .unwrap();
+        if after_apply {
+            assert_eq!(pending.events.len(), 1);
+            let successor = &pending.events[0].1;
+            assert_ne!(successor.id, current.id);
+            assert_eq!(successor.timestamp, next_timestamp);
+            assert_eq!(
+                successor.original_scheduled_at(),
+                current.original_scheduled_at()
+            );
+            assert_eq!(completed.events.len(), 1);
+            assert_eq!(completed.events[0].1.id, current.id);
+            assert_eq!(
+                completed.events[0].1.completion_reason(),
+                Some(QueueCompletionReason::ScheduledNext)
+            );
+        } else {
+            assert_eq!(pending.events.len(), 1);
+            assert_eq!(pending.events[0].0, storage_key);
+            assert_eq!(pending.events[0].1.id, current.id);
+            assert!(completed.events.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
 async fn queue_pull_preserves_malformed_pending_bytes() {
     let engine = engine();
     let queue = queue(engine.clone(), 1);

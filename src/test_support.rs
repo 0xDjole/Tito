@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 pub(crate) struct MemoryEngine {
     data: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
     next_get_error: Arc<Mutex<Option<String>>>,
+    next_commit_unknown_after_apply: Arc<Mutex<Option<bool>>>,
 }
 
 #[derive(Clone)]
@@ -19,6 +20,7 @@ pub(crate) struct MemoryTransaction {
     data: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
     local: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
     next_get_error: Arc<Mutex<Option<String>>>,
+    next_commit_unknown_after_apply: Arc<Mutex<Option<bool>>>,
 }
 
 impl MemoryEngine {
@@ -35,6 +37,10 @@ impl MemoryEngine {
 
     pub(crate) async fn fail_next_get(&self, message: &str) {
         *self.next_get_error.lock().await = Some(message.to_string());
+    }
+
+    pub(crate) async fn make_next_commit_outcome_unknown(&self, after_apply: bool) {
+        *self.next_commit_unknown_after_apply.lock().await = Some(after_apply);
     }
 
     pub(crate) async fn raw_bytes(&self, key: &str) -> Option<Vec<u8>> {
@@ -72,6 +78,7 @@ impl TitoEngine for MemoryEngine {
             data: self.data.clone(),
             local: Arc::new(Mutex::new(snapshot)),
             next_get_error: self.next_get_error.clone(),
+            next_commit_unknown_after_apply: self.next_commit_unknown_after_apply.clone(),
         })
     }
 
@@ -188,6 +195,14 @@ impl TitoTransaction for MemoryTransaction {
     }
 
     async fn commit(self) -> Result<(), TitoError> {
+        if let Some(after_apply) = self.next_commit_unknown_after_apply.lock().await.take() {
+            if after_apply {
+                *self.data.lock().await = self.local.lock().await.clone();
+            }
+            return Err(TitoError::CommitOutcomeUnknown(
+                "forced indeterminate memory transaction commit".to_string(),
+            ));
+        }
         *self.data.lock().await = self.local.lock().await.clone();
         Ok(())
     }
