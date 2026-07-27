@@ -7,6 +7,7 @@ use futures::FutureExt;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::sync::broadcast;
+use tokio::sync::broadcast::error::TryRecvError;
 use tokio::time::{sleep, timeout};
 
 use super::{
@@ -181,44 +182,41 @@ where
             handles.push(tokio::spawn(async move {
                 let mut cursor: Option<QueuePullCursor> = None;
                 loop {
-                    tokio::select! {
+                    let page = tokio::select! {
                         _ = rx.recv() => break,
-                        _ = async {
-                            match q.pull::<T>(partition, cursor.clone(), 50).await {
-                                Ok(page) => {
-                                    cursor = page.next_cursor;
-                                    for (storage_key, event) in page.events {
-                                        let execution = execute_handler(
-                                            &h,
-                                            event.clone(),
-                                            handler_timeout,
-                                        )
-                                        .await;
-                                        if let Some(outcome) = handler_outcome_or_log(
-                                            execution,
-                                            &event,
-                                            handler_timeout,
-                                        ) {
-                                            apply_handler_outcome(
-                                                &q,
-                                                &storage_key,
-                                                &event,
-                                                outcome,
-                                            )
-                                            .await;
-                                        }
+                        result = q.pull::<T>(partition, cursor.clone(), 50) => result,
+                    };
+                    match page {
+                        Ok(page) => {
+                            cursor = page.next_cursor;
+                            let mut shutting_down = false;
+                            for (storage_key, event) in page.events {
+                                match rx.try_recv() {
+                                    Ok(_) | Err(TryRecvError::Closed | TryRecvError::Lagged(_)) => {
+                                        shutting_down = true;
+                                        break;
                                     }
+                                    Err(TryRecvError::Empty) => {}
                                 }
-                                Err(error) => {
-                                    log::error!(
-                                        "Failed to pull queue partition {}: {}",
-                                        partition,
-                                        error
-                                    );
+                                let execution =
+                                    execute_handler(&h, event.clone(), handler_timeout).await;
+                                if let Some(outcome) =
+                                    handler_outcome_or_log(execution, &event, handler_timeout)
+                                {
+                                    apply_handler_outcome(&q, &storage_key, &event, outcome).await;
                                 }
                             }
-                            sleep(WORKER_POLL_INTERVAL).await;
-                        } => {}
+                            if shutting_down {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            log::error!("Failed to pull queue partition {}: {}", partition, error);
+                        }
+                    }
+                    tokio::select! {
+                        _ = rx.recv() => break,
+                        _ = sleep(WORKER_POLL_INTERVAL) => {}
                     }
                 }
             }));

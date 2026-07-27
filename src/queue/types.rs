@@ -31,8 +31,6 @@ pub struct QueueEvent<T> {
     pub payload: T,
     pub timestamp: i64,
     #[serde(default)]
-    pub(crate) original_scheduled_at: Option<i64>,
-    #[serde(default)]
     pub state: QueueEventState,
     #[serde(default)]
     pub processed_at: Option<i64>,
@@ -66,15 +64,10 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent
             key: key.into(),
             payload,
             timestamp: due_at,
-            original_scheduled_at: Some(due_at),
             state: QueueEventState::Pending,
             processed_at: None,
             completion_reason: None,
         }
-    }
-
-    pub fn original_scheduled_at(&self) -> i64 {
-        self.original_scheduled_at.unwrap_or(self.timestamp)
     }
 
     pub fn key_type(&self) -> &str {
@@ -102,7 +95,6 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent
             key: self.key.clone(),
             payload: self.payload.clone(),
             timestamp,
-            original_scheduled_at: Some(self.original_scheduled_at()),
             state: QueueEventState::Pending,
             processed_at: None,
             completion_reason: None,

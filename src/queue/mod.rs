@@ -28,10 +28,6 @@ pub(crate) const COMPLETED_EVENT_RETENTION_SECONDS: i64 = 3 * 24 * 60 * 60;
 pub(crate) const COMPLETED_EVENT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
 pub(crate) const COMPLETED_EVENT_MAINTENANCE_BATCH_SIZE: u32 = 1_000;
 pub(crate) const COMPLETED_EVENT_MAINTENANCE_MAX_BATCHES: usize = 4;
-/// Maximum serialized size of one scheduler invocation.
-///
-/// Queue range reads use bounded transport pages, and Tito's TiKV client has
-/// explicit decoding headroom above the maximum aggregate page size.
 pub const MAX_QUEUE_EVENT_BYTES: usize = 1024 * 1024;
 pub(crate) const QUEUE_SCAN_RPC_LIMIT: u32 = 16;
 const KEY_NUMBER_DIGITS: usize = 20;
@@ -679,7 +675,6 @@ mod tests {
             key: key.to_string(),
             payload: payload(id),
             timestamp,
-            original_scheduled_at: Some(timestamp),
             state,
             processed_at,
             completion_reason: None,

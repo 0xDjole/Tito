@@ -336,7 +336,6 @@ fn queue_event(id: &str, key: &str, timestamp: i64) -> QueueEvent<QueuePayload> 
         key: key.to_string(),
         payload: queue_payload(id),
         timestamp,
-        original_scheduled_at: Some(timestamp),
         state: QueueEventState::Pending,
         processed_at: None,
         completion_reason: None,

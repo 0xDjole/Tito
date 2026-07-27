@@ -11,7 +11,6 @@ fn queue_event_helpers_parse_key_and_update_schedule() {
     assert_eq!(event.key_value(), "entry-1");
     assert_eq!(event.event().name, "payload");
     assert_eq!(event.timestamp, 123);
-    assert_eq!(event.original_scheduled_at(), 123);
 }
 
 #[test]
@@ -281,10 +280,6 @@ async fn queue_schedule_next_indeterminate_commit_converges_to_one_of_the_two_at
             let successor = &pending.events[0].1;
             assert_ne!(successor.id, current.id);
             assert_eq!(successor.timestamp, next_timestamp);
-            assert_eq!(
-                successor.original_scheduled_at(),
-                current.original_scheduled_at()
-            );
             assert_eq!(completed.events.len(), 1);
             assert_eq!(completed.events[0].1.id, current.id);
             assert_eq!(
@@ -418,23 +413,6 @@ async fn queue_pull_horizon_prevents_immediate_successors_from_starving_later_du
 }
 
 #[test]
-fn queue_event_without_original_schedule_falls_back_to_timestamp() {
-    let legacy = json!({
-        "id": "legacy-event",
-        "key": "entry:legacy",
-        "payload": { "name": "legacy" },
-        "timestamp": 123,
-        "state": "pending",
-        "processedAt": null
-    });
-    let event: QueueEvent<QueuePayload> = serde_json::from_value(legacy).unwrap();
-
-    assert_eq!(event.original_scheduled_at, None);
-    assert_eq!(event.original_scheduled_at(), 123);
-    assert_eq!(event.completion_reason(), None);
-}
-
-#[test]
 fn legacy_completed_queue_event_defaults_to_acknowledged_completion() {
     let legacy = json!({
         "id": "legacy-completed",
@@ -486,10 +464,6 @@ async fn queue_schedule_next_at_atomically_completes_current_and_creates_success
     assert_eq!(successor.key, current.key);
     assert_eq!(successor.payload, current.payload);
     assert_eq!(successor.timestamp, future_timestamp);
-    assert_eq!(
-        successor.original_scheduled_at(),
-        current.original_scheduled_at()
-    );
 
     let pending = queue
         .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
@@ -940,6 +914,86 @@ async fn queue_worker_acknowledges_successful_jobs() {
         .unwrap()
         .events
         .is_empty());
+}
+
+#[tokio::test]
+async fn standalone_worker_shutdown_drains_started_handler_before_join() {
+    let engine = engine();
+    let queue = Arc::new(queue(engine, 1));
+    let now = Utc::now().timestamp() - 10;
+    queue
+        .publish(queue_event(
+            "standalone-drain",
+            "entry:standalone-drain",
+            now,
+        ))
+        .await
+        .unwrap();
+    queue
+        .publish(queue_event(
+            "standalone-second",
+            "entry:standalone-second",
+            now,
+        ))
+        .await
+        .unwrap();
+
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let handler_started = started.clone();
+    let handler_release = release.clone();
+    let handler_attempts = attempts.clone();
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let mut handle = run_worker::<_, QueuePayload, _>(
+        queue.clone(),
+        WorkerConfig::new(0..1),
+        move |event| {
+            let handler_started = handler_started.clone();
+            let handler_release = handler_release.clone();
+            let handler_attempts = handler_attempts.clone();
+            Box::pin(async move {
+                handler_attempts.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(event.id, "standalone-drain");
+                handler_started.notify_one();
+                handler_release.notified().await;
+                Ok(QueueHandlerOutcome::Acknowledge)
+            })
+        },
+        shutdown_rx,
+    )
+    .await;
+
+    timeout(Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+    let _ = shutdown_tx.send(());
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !handle.is_finished(),
+        "worker joined before its started handler drained"
+    );
+
+    release.notify_one();
+    timeout(Duration::from_secs(2), &mut handle)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    let completed = queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(completed.events.len(), 1);
+    assert_eq!(completed.events[0].1.id, "standalone-drain");
+    let pending = queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(pending.events.len(), 1);
+    assert_eq!(pending.events[0].1.id, "standalone-second");
 }
 
 #[tokio::test]

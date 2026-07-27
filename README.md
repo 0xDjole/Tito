@@ -113,7 +113,7 @@ let results = query.value(&author_id).relationship("tags").execute().await?;
 Queue events are partitioned by their business key, can be scheduled for a non-negative Unix timestamp, and remain pending until the handler explicitly acknowledges them. Tito rejects negative timestamps instead of storing an invocation that polling cannot reach. Tito has no automatic retry policy, retry counter, backoff, failed state, or DLQ:
 
 - `Ok(QueueHandlerOutcome::Acknowledge)` completes the current invocation.
-- `Ok(QueueHandlerOutcome::ScheduleNextAt(timestamp))` atomically completes the current invocation and creates a new pending invocation with a new event ID, the same business key, payload, and original schedule provenance, and that exact next timestamp.
+- `Ok(QueueHandlerOutcome::ScheduleNextAt(timestamp))` atomically completes the current invocation and creates a new pending invocation with a new event ID, the same business key and payload, and that exact next timestamp.
 - `Err(_)`, a handler panic, or the executor timeout leaves the current invocation unchanged and pending for redelivery at the worker's normal poll cadence.
 
 Every new invocation must serialize to at most `MAX_QUEUE_EVENT_BYTES` (1 MiB). Publication rejects
@@ -152,12 +152,12 @@ run_worker(
 ).await;
 ```
 
-`ScheduleNextAt` is an atomic planned continuation, not a queue retry policy. Tito checks that the exact current pending storage key still exists, moves that invocation to Completed with `processedAt` and `completionReason = scheduled_next`, and writes one new Pending invocation in the same transaction. `Acknowledge` records `completionReason = acknowledged`; legacy Completed rows without the field are exposed as acknowledged through `QueueEvent::completion_reason()`, while Pending rows return no completion reason. The successor has a new event ID, so the supplied timestamp may equal the current timestamp without colliding with the current storage key. Repeated continuations leave one ScheduledNext completed record per finished invocation and exactly one pending successor; the independent event IDs are deliberately not linked by another logical ID. If concurrent consumers return `ScheduleNextAt` for the same current storage key, only the transaction that still owns that exact Pending row can complete it and create the single successor. Application handlers should choose one of these two outcomes rather than mutating queue state directly.
+`ScheduleNextAt` is an atomic planned continuation, not a queue retry policy. Tito checks that the exact current pending storage key still exists, moves that invocation to Completed with `processedAt` and `completionReason = scheduled_next`, and writes one new Pending invocation in the same transaction. `Acknowledge` records `completionReason = acknowledged`; legacy Completed rows without the field are exposed as acknowledged through `QueueEvent::completion_reason()`, while Pending rows return no completion reason. The successor has a new event ID, so the supplied timestamp may equal the current timestamp without colliding with the current storage key. Repeated continuations leave one ScheduledNext completed record per finished invocation and exactly one pending successor; the independent event IDs are deliberately not linked by another logical ID or lineage field. If concurrent consumers return `ScheduleNextAt` for the same current storage key, only the transaction that still owns that exact Pending row can complete it and create the single successor. Application handlers should choose one of these two outcomes rather than mutating queue state directly.
 
 Workers supervise each handler with a ten-minute timeout by default. Configure `handler_timeout` when a workload has a different bounded execution contract; the timeout is executor protection and never changes queue state or provider policy.
-Cluster-worker shutdown stops new partition pulls and handler starts, then drains every handler that
-already started and applies its outcome before joining. The configured handler timeout bounds that
-drain. An error, panic, timeout, or lost partition lease still leaves the exact invocation Pending.
+Worker shutdown stops new pulls and handler starts, then drains every handler that already started
+and applies its outcome before joining. The configured handler timeout bounds that drain. An error,
+panic, timeout, or lost cluster partition lease still leaves the exact invocation Pending.
 
 Partition polling is fair across due rows. Pending storage keys are ordered as
 `queue:pending:{partition:04}:{due_at:020}:{enqueue_version:020}:{event_id}`. The enqueue version is
