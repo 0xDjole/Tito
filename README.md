@@ -194,7 +194,8 @@ fn events(&self) -> Vec<TitoEventConfig> {
 ## Event Key Format
 
 ```
-event:{type}:{partition}:{timestamp}:{uuid}
+queue:pending:{partition:04}:{due_at:020}:{enqueue_version:020}:{event_id}
+queue:completed:{processed_at:020}:{scheduled_at:020}:{event_id}
 ```
 
 ## License
