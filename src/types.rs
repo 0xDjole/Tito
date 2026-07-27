@@ -69,8 +69,6 @@ pub trait TitoEngine: Send + Sync + Clone {
 
 #[async_trait]
 pub trait TitoTransaction: Send + Sync {
-    /// The globally ordered snapshot version assigned when this transaction
-    /// began.
     fn start_version(&self) -> u64;
 
     async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<TitoValue>, TitoError>;

@@ -1277,10 +1277,14 @@ async fn wait_for_completed(queue: &Arc<Queue<MemoryEngine>>, event_id: &str) {
     timeout(Duration::from_secs(2), async {
         loop {
             let completed = queue
-                .find_completed_after::<QueuePayload>(0, 10)
+                .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
                 .await
                 .unwrap();
-            if completed.iter().any(|(_, event)| event.id == event_id) {
+            if completed
+                .events
+                .iter()
+                .any(|(_, event)| event.id == event_id)
+            {
                 break;
             }
             sleep(Duration::from_millis(10)).await;

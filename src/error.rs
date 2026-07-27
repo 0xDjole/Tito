@@ -11,16 +11,9 @@ pub enum TitoError {
     #[error("Transaction failed: {0}")]
     TransactionFailed(String),
 
-    /// A transient datastore transaction error. Queue workers do not interpret
-    /// this variant as a delivery retry instruction.
     #[error("Retryable transaction error: {0}")]
     Retryable(String),
 
-    /// TiKV could not determine whether a commit took effect.
-    ///
-    /// Tito never replays the transaction closure for this error because the
-    /// original write may already be durable. Callers must reconcile from
-    /// authoritative stored state.
     #[error("Transaction commit outcome is unknown: {0}")]
     CommitOutcomeUnknown(String),
 

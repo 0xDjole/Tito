@@ -127,10 +127,11 @@ async fn cluster_worker_contains_handler_panic_and_redelivers_pending_invocation
     timeout(Duration::from_secs(2), async {
         loop {
             let completed = queue
-                .find_completed_after::<QueuePayload>(0, 10)
+                .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
                 .await
                 .unwrap();
             if completed
+                .events
                 .iter()
                 .any(|(_, event)| event.id == "cluster-panic")
             {
@@ -235,13 +236,13 @@ async fn cluster_worker_shutdown_drains_started_handler_and_persists_outcome_bef
         "shutdown allowed another handler to start"
     );
     let completed = queue
-        .find_completed_after::<QueuePayload>(0, 10)
+        .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
         .await
         .unwrap();
-    assert_eq!(completed.len(), 1);
-    assert_eq!(completed[0].1.id, "cluster-drain");
+    assert_eq!(completed.events.len(), 1);
+    assert_eq!(completed.events[0].1.id, "cluster-drain");
     assert_eq!(
-        completed[0].1.completion_reason(),
+        completed.events[0].1.completion_reason(),
         Some(QueueCompletionReason::Acknowledged)
     );
     let pending = queue
@@ -311,9 +312,10 @@ async fn cluster_worker_shutdown_bounds_a_blocked_handler_by_its_timeout() {
     assert_eq!(pending.events.len(), 1);
     assert_eq!(pending.events[0].1.id, "cluster-timeout-drain");
     assert!(queue
-        .find_completed_after::<QueuePayload>(0, 10)
+        .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
         .await
         .unwrap()
+        .events
         .is_empty());
 }
 

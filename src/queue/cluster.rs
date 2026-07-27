@@ -522,8 +522,6 @@ where
         + Sync
         + 'static,
 {
-    // Establish both subscriptions before returning the worker handle so a
-    // caller cannot publish shutdown in the spawn-before-subscribe window.
     let maintenance_shutdown = shutdown.resubscribe();
     tokio::spawn(async move {
         let (shutdown_latch, shutdown_latched) = watch::channel(false);
@@ -886,9 +884,6 @@ where
                     return PartitionWorkerDirective::Stop;
                 }
 
-                // Once the handler starts, shutdown must not cancel either the
-                // handler or application of its outcome. The handler's own
-                // configured timeout remains the upper bound for this drain.
                 let execution =
                     execute_handler(&handler, event.clone(), config.handler_timeout).await;
                 if let Some(outcome) =

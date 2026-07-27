@@ -147,10 +147,6 @@ impl TitoEngine for TiKVBackend {
                         return Ok(value);
                     }
                     Err(e) => {
-                        // An undetermined commit may already be durable.
-                        // Rolling it back cannot resolve that ambiguity, and
-                        // replaying the closure could create a second logical
-                        // write (for example, a queue row with a fresh ID).
                         if !e.is_commit_outcome_unknown() {
                             let _ = tx.rollback().await;
                         }

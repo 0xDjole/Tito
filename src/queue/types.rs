@@ -8,30 +8,17 @@ pub enum QueueEventState {
     Completed,
 }
 
-/// Why a queue invocation entered the terminal Completed state.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum QueueCompletionReason {
-    /// The handler completed the invocation without scheduling more queue work.
     #[default]
     Acknowledged,
-    /// The handler completed the invocation and atomically scheduled a new one.
     ScheduledNext,
 }
 
-/// The durable action Tito takes after a queue handler finishes successfully.
-///
-/// Returning an error performs no queue mutation, so the current pending
-/// invocation remains eligible for redelivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueHandlerOutcome {
-    /// Complete the current invocation.
     Acknowledge,
-    /// Atomically complete the current invocation and create a new pending
-    /// invocation at the exact Unix timestamp.
-    ///
-    /// The successor receives a new queue event ID while preserving the
-    /// current invocation's business key and payload.
     ScheduleNextAt(i64),
 }
 
@@ -59,11 +46,6 @@ pub struct QueueScanPage<T> {
     pub next_cursor: Option<Vec<u8>>,
 }
 
-/// An opaque, in-memory cursor for one fair pass over a partition's due rows.
-///
-/// The cursor is deliberately not serializable or durable queue state. Pass it
-/// back to [`Queue::pull`](super::Queue::pull) to continue the same bounded
-/// pass; pass `None` to begin a new pass from the oldest due storage key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueuePullCursor {
     pub(crate) next_start: Vec<u8>,
@@ -107,11 +89,6 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent
         &self.payload
     }
 
-    /// Returns the terminal reason for a Completed invocation.
-    ///
-    /// Completed rows written before completion reasons were introduced are
-    /// interpreted as acknowledged. Pending rows never have a completion
-    /// reason.
     pub fn completion_reason(&self) -> Option<QueueCompletionReason> {
         match self.state {
             QueueEventState::Pending => None,

@@ -260,9 +260,6 @@ impl<E: TitoEngine> Queue<E> {
                         }
                     }
 
-                    // Advance by raw storage rows, not successfully decoded
-                    // events. A malformed value therefore remains available
-                    // for inspection without pinning every valid row behind it.
                     next_start = storage_key.clone();
                     next_start.push(0);
 
@@ -293,12 +290,6 @@ impl<E: TitoEngine> Queue<E> {
                     }
                 }
 
-                // A full raw page keeps this pass alive. Outcomes are applied
-                // after this transaction closes and may enqueue same-time
-                // successors; the frozen transaction horizon lets the next
-                // pull jump past those fresh rows and continue to later
-                // due-time buckets. An underfull page is already exhausted, so
-                // it wraps without adding an idle poll to ordinary workloads.
                 let next_cursor =
                     (scanned_full_page && next_start > start && next_start < cycle_end).then_some(
                         QueuePullCursor {
@@ -383,13 +374,6 @@ impl<E: TitoEngine> Queue<E> {
             .await
     }
 
-    /// Atomically completes the exact pending invocation at `storage_key` and
-    /// creates a new pending successor invocation at `timestamp`.
-    ///
-    /// The successor keeps the current event's key and payload but receives a
-    /// new event ID. The current invocation is retained as Completed history.
-    /// If another consumer has already moved or acknowledged the exact pending
-    /// row, this is an idempotent no-op.
     pub async fn schedule_next_at<
         T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     >(
@@ -551,47 +535,6 @@ impl<E: TitoEngine> Queue<E> {
         }
 
         Ok(true)
-    }
-
-    /// Finds terminal invocation history processed strictly after `cutoff`.
-    ///
-    /// Pending work is ordered by due time rather than a generic state
-    /// timestamp; inspect it through [`Queue::scan_by_state`] when needed.
-    pub async fn find_completed_after<T: DeserializeOwned + Clone + Send + Sync + 'static>(
-        &self,
-        cutoff: i64,
-        limit: u32,
-    ) -> Result<Vec<(String, QueueEvent<T>)>, TitoError> {
-        self.engine
-            .transaction(|tx| async move {
-                let mut events = Vec::new();
-                let start = format!("queue:completed:{:020}:", cutoff.saturating_add(1));
-                let entries = tx
-                    .scan(
-                        start.as_bytes()..Self::prefix_end("queue:completed:").as_slice(),
-                        limit,
-                    )
-                    .await
-                    .map_err(|e| TitoError::QueryFailed(format!("Scan completed queue: {}", e)))?;
-
-                for (storage_key, value) in entries {
-                    let event = Self::read_event_from_value::<T>(&value)?;
-
-                    if event.state == QueueEventState::Completed
-                        && event
-                            .processed_at
-                            .is_some_and(|timestamp| timestamp > cutoff)
-                    {
-                        let key = String::from_utf8(storage_key).map_err(|_| {
-                            TitoError::DeserializationFailed("Invalid queue key".to_string())
-                        })?;
-                        events.push((key, event));
-                    }
-                }
-
-                Ok::<_, TitoError>(events)
-            })
-            .await
     }
 
     pub async fn scan_by_state<T: DeserializeOwned + Clone + Send + Sync + 'static>(
@@ -872,30 +815,6 @@ mod tests {
         assert!(matches!(error, TitoError::DeserializationFailed(_)));
         assert!(engine.contains_key(orphan_key).await);
         assert!(engine.contains_key(&valid_key).await);
-    }
-
-    #[tokio::test]
-    async fn find_completed_after_filters_by_processed_timestamp() {
-        let engine = MemoryEngine::default();
-        let queue = queue(engine.clone());
-
-        put_event(
-            &engine,
-            &Queue::<MemoryEngine>::completed_key(10, 1, "old"),
-            event("old", "entry:old", QueueEventState::Completed, 1, Some(10)),
-        )
-        .await;
-        put_event(
-            &engine,
-            &Queue::<MemoryEngine>::completed_key(20, 1, "new"),
-            event("new", "entry:new", QueueEventState::Completed, 1, Some(20)),
-        )
-        .await;
-
-        let events = queue.find_completed_after::<Payload>(10, 10).await.unwrap();
-
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].1.key, "entry:new");
     }
 
     #[tokio::test]
