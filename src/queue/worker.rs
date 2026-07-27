@@ -138,11 +138,15 @@ where
                                                     QueueHandlerOutcome::Acknowledge => {
                                                         q.ack(&storage_key).await
                                                     }
-                                                    QueueHandlerOutcome::ScheduleAt(timestamp) => {
-                                                        q.schedule_at::<T>(&storage_key, timestamp)
+                                                    QueueHandlerOutcome::ScheduleNextAt(
+                                                        timestamp,
+                                                    ) => q
+                                                        .schedule_next_at::<T>(
+                                                            &storage_key,
+                                                            timestamp,
+                                                        )
                                                         .await
-                                                        .map(|_| ())
-                                                    }
+                                                        .map(|_| ()),
                                                 };
                                                 if let Err(error) = result {
                                                     log::error!(

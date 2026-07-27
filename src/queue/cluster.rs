@@ -825,8 +825,8 @@ where
                         ) {
                             let result = match outcome {
                                 QueueHandlerOutcome::Acknowledge => queue.ack(&storage_key).await,
-                                QueueHandlerOutcome::ScheduleAt(timestamp) => queue
-                                    .schedule_at::<T>(&storage_key, timestamp)
+                                QueueHandlerOutcome::ScheduleNextAt(timestamp) => queue
+                                    .schedule_next_at::<T>(&storage_key, timestamp)
                                     .await
                                     .map(|_| ()),
                             };

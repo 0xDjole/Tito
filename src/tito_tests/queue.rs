@@ -32,11 +32,16 @@ fn queue_state_has_no_failed_or_dead_letter_variant() {
 #[test]
 fn queue_event_serialization_contains_no_retry_policy_metadata() {
     let event = QueueEvent::new("entry:clean", queue_payload("clean"));
-    let value = serde_json::to_value(event).unwrap();
+    assert_eq!(event.completion_reason(), None);
+    let value = serde_json::to_value(&event).unwrap();
 
     assert!(value.get("retryCount").is_none());
     assert!(value.get("maxRetries").is_none());
     assert!(value.get("errors").is_none());
+    assert!(
+        value.get("completionReason").is_none(),
+        "pending rows do not carry terminal completion metadata"
+    );
 }
 
 #[tokio::test]
@@ -60,11 +65,53 @@ async fn queue_ack_preserves_malformed_pending_bytes() {
     assert!(engine.contains_key(key).await);
 
     let error = queue
-        .schedule_at::<QueuePayload>(key, Utc::now().timestamp() + 60)
+        .schedule_next_at::<QueuePayload>(key, Utc::now().timestamp() + 60)
         .await
         .unwrap_err();
     assert!(matches!(error, TitoError::DeserializationFailed(_)));
     assert!(engine.contains_key(key).await);
+}
+
+#[tokio::test]
+async fn queue_schedule_next_at_transaction_failure_leaves_exact_current_invocation_pending() {
+    let engine = engine();
+    let queue = queue(engine.clone(), 1);
+    let timestamp = Utc::now().timestamp() - 10;
+    queue
+        .publish(queue_event("event-1", "entry:1", timestamp))
+        .await
+        .unwrap();
+    let (storage_key, current) = queue
+        .pull::<QueuePayload>(0, None, 10)
+        .await
+        .unwrap()
+        .events
+        .into_iter()
+        .next()
+        .unwrap();
+    engine.fail_next_get("forced schedule read failure").await;
+
+    let error = queue
+        .schedule_next_at::<QueuePayload>(&storage_key, timestamp + 60)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, TitoError::QueryFailed(_)));
+    let pending = queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(pending.events.len(), 1);
+    assert_eq!(pending.events[0].0, storage_key);
+    assert_eq!(pending.events[0].1.id, current.id);
+    assert_eq!(pending.events[0].1.timestamp, current.timestamp);
+    assert_eq!(pending.events[0].1.completion_reason(), None);
+    assert!(queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
+        .await
+        .unwrap()
+        .events
+        .is_empty());
 }
 
 #[tokio::test]
@@ -131,10 +178,29 @@ fn queue_event_without_original_schedule_falls_back_to_timestamp() {
 
     assert_eq!(event.original_scheduled_at, None);
     assert_eq!(event.original_scheduled_at(), 123);
+    assert_eq!(event.completion_reason(), None);
+}
+
+#[test]
+fn legacy_completed_queue_event_defaults_to_acknowledged_completion() {
+    let legacy = json!({
+        "id": "legacy-completed",
+        "key": "entry:legacy",
+        "payload": { "name": "legacy" },
+        "timestamp": 123,
+        "state": "completed",
+        "processedAt": 456
+    });
+    let event: QueueEvent<QueuePayload> = serde_json::from_value(legacy).unwrap();
+
+    assert_eq!(
+        event.completion_reason(),
+        Some(QueueCompletionReason::Acknowledged)
+    );
 }
 
 #[tokio::test]
-async fn queue_schedule_at_atomically_hands_pending_to_successor() {
+async fn queue_schedule_next_at_atomically_completes_current_and_creates_successor() {
     let engine = engine();
     let queue = queue(engine.clone(), 1);
     let now = Utc::now().timestamp();
@@ -154,13 +220,16 @@ async fn queue_schedule_at_atomically_hands_pending_to_successor() {
     let future_timestamp = now + 3_600;
 
     let successor = queue
-        .schedule_at::<QueuePayload>(&storage_key, future_timestamp)
+        .schedule_next_at::<QueuePayload>(&storage_key, future_timestamp)
         .await
         .unwrap()
         .unwrap();
 
     assert!(!engine.contains_key(&storage_key).await);
-    assert_eq!(successor.id, current.id);
+    assert_ne!(
+        successor.id, current.id,
+        "a planned continuation is a new queue invocation"
+    );
     assert_eq!(successor.key, current.key);
     assert_eq!(successor.payload, current.payload);
     assert_eq!(successor.timestamp, future_timestamp);
@@ -175,6 +244,7 @@ async fn queue_schedule_at_atomically_hands_pending_to_successor() {
         .unwrap();
     assert_eq!(pending.events.len(), 1);
     assert_eq!(pending.events[0].1.id, successor.id);
+    assert_eq!(pending.events[0].1.completion_reason(), None);
     assert!(
         pending.events[0]
             .0
@@ -186,11 +256,26 @@ async fn queue_schedule_at_atomically_hands_pending_to_successor() {
         .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
         .await
         .unwrap();
-    assert!(completed.events.is_empty());
+    assert_eq!(completed.events.len(), 1);
+    let completed_current = &completed.events[0].1;
+    assert_eq!(completed_current.id, current.id);
+    assert_eq!(completed_current.key, current.key);
+    assert_eq!(completed_current.payload, current.payload);
+    assert_eq!(completed_current.timestamp, current.timestamp);
+    assert_eq!(completed_current.state, QueueEventState::Completed);
+    assert!(completed_current.processed_at.is_some());
+    assert_eq!(
+        serde_json::to_value(completed_current).unwrap()["completionReason"],
+        json!("scheduled_next")
+    );
+    assert_eq!(
+        completed_current.completion_reason(),
+        Some(QueueCompletionReason::ScheduledNext)
+    );
 }
 
 #[tokio::test]
-async fn queue_schedule_at_rejects_the_same_invocation_storage_key() {
+async fn queue_schedule_next_at_allows_the_same_timestamp_with_a_new_event_id() {
     let engine = engine();
     let queue = queue(engine.clone(), 1);
     let timestamp = Utc::now().timestamp() - 10;
@@ -198,7 +283,7 @@ async fn queue_schedule_at_rejects_the_same_invocation_storage_key() {
         .publish(queue_event("event-1", "entry:1", timestamp))
         .await
         .unwrap();
-    let (storage_key, _) = queue
+    let (storage_key, current) = queue
         .pull::<QueuePayload>(0, None, 10)
         .await
         .unwrap()
@@ -207,23 +292,39 @@ async fn queue_schedule_at_rejects_the_same_invocation_storage_key() {
         .next()
         .unwrap();
 
-    let error = queue
-        .schedule_at::<QueuePayload>(&storage_key, timestamp)
-        .await
-        .unwrap_err();
-
-    assert!(matches!(error, TitoError::InvalidInput(_)));
-    assert!(engine.contains_key(&storage_key).await);
-    assert!(queue
-        .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
+    let successor = queue
+        .schedule_next_at::<QueuePayload>(&storage_key, timestamp)
         .await
         .unwrap()
-        .events
-        .is_empty());
+        .unwrap();
+
+    assert_ne!(successor.id, current.id);
+    assert_eq!(successor.timestamp, current.timestamp);
+    assert!(!engine.contains_key(&storage_key).await);
+    let pending = queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(pending.events.len(), 1);
+    assert_eq!(pending.events[0].1.id, successor.id);
+    assert_ne!(
+        pending.events[0].0, storage_key,
+        "a new event ID creates a distinct pending key at the same timestamp"
+    );
+    let completed = queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(completed.events.len(), 1);
+    assert_eq!(completed.events[0].1.id, current.id);
+    assert_eq!(
+        completed.events[0].1.completion_reason(),
+        Some(QueueCompletionReason::ScheduledNext)
+    );
 }
 
 #[tokio::test]
-async fn duplicate_schedule_at_calls_create_only_one_successor() {
+async fn duplicate_schedule_next_at_calls_create_only_one_successor() {
     let engine = engine();
     let queue = Arc::new(queue(engine, 1));
     queue
@@ -251,13 +352,13 @@ async fn duplicate_schedule_at_calls_create_only_one_successor() {
     let (first, second) = tokio::join!(
         async move {
             first_queue
-                .schedule_at::<QueuePayload>(&first_key, timestamp)
+                .schedule_next_at::<QueuePayload>(&first_key, timestamp)
                 .await
                 .unwrap()
         },
         async move {
             second_queue
-                .schedule_at::<QueuePayload>(&second_key, timestamp)
+                .schedule_next_at::<QueuePayload>(&second_key, timestamp)
                 .await
                 .unwrap()
         }
@@ -273,20 +374,25 @@ async fn duplicate_schedule_at_calls_create_only_one_successor() {
         .await
         .unwrap();
     assert_eq!(pending.events.len(), 1);
-    assert_eq!(pending.events[0].1.id, current.id);
+    assert_ne!(pending.events[0].1.id, current.id);
     assert_ne!(
         pending.events[0].0, storage_key,
-        "the successor invocation is identified by its new due storage key"
+        "the successor invocation has a new event ID and pending storage key"
     );
     let completed = queue
         .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
         .await
         .unwrap();
-    assert!(completed.events.is_empty());
+    assert_eq!(completed.events.len(), 1);
+    assert_eq!(completed.events[0].1.id, current.id);
+    assert_eq!(
+        completed.events[0].1.completion_reason(),
+        Some(QueueCompletionReason::ScheduledNext)
+    );
 }
 
 #[tokio::test]
-async fn repeated_schedule_at_keeps_one_pending_row_until_terminal_acknowledgment() {
+async fn repeated_schedule_next_at_creates_completed_history_chain_without_loss_or_duplication() {
     let engine = engine();
     let queue = queue(engine, 1);
     let now = Utc::now().timestamp();
@@ -295,7 +401,7 @@ async fn repeated_schedule_at_keeps_one_pending_row_until_terminal_acknowledgmen
         .await
         .unwrap();
 
-    let (first_key, _) = queue
+    let (first_key, first) = queue
         .pull::<QueuePayload>(0, None, 10)
         .await
         .unwrap()
@@ -303,13 +409,14 @@ async fn repeated_schedule_at_keeps_one_pending_row_until_terminal_acknowledgmen
         .into_iter()
         .next()
         .unwrap();
-    queue
-        .schedule_at::<QueuePayload>(&first_key, now - 10)
+    let second = queue
+        .schedule_next_at::<QueuePayload>(&first_key, now - 10)
         .await
         .unwrap()
         .unwrap();
+    assert_ne!(second.id, first.id);
 
-    let (second_key, _) = queue
+    let (second_key, pulled_second) = queue
         .pull::<QueuePayload>(0, None, 10)
         .await
         .unwrap()
@@ -317,24 +424,38 @@ async fn repeated_schedule_at_keeps_one_pending_row_until_terminal_acknowledgmen
         .into_iter()
         .next()
         .unwrap();
-    queue
-        .schedule_at::<QueuePayload>(&second_key, now + 3_600)
+    assert_eq!(pulled_second.id, second.id);
+    let third = queue
+        .schedule_next_at::<QueuePayload>(&second_key, now + 3_600)
         .await
         .unwrap()
         .unwrap();
+    assert_ne!(third.id, first.id);
+    assert_ne!(third.id, second.id);
 
     let completed = queue
         .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
         .await
         .unwrap();
-    assert!(completed.events.is_empty());
+    assert_eq!(completed.events.len(), 2);
+    assert!(completed
+        .events
+        .iter()
+        .any(|(_, event)| event.id == first.id));
+    assert!(completed
+        .events
+        .iter()
+        .any(|(_, event)| event.id == second.id));
+    assert!(completed.events.iter().all(|(_, event)| {
+        event.completion_reason() == Some(QueueCompletionReason::ScheduledNext)
+    }));
 
     let pending = queue
         .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
         .await
         .unwrap();
     assert_eq!(pending.events.len(), 1);
-    assert_eq!(pending.events[0].1.id, "event-1");
+    assert_eq!(pending.events[0].1.id, third.id);
     assert_eq!(pending.events[0].1.timestamp, now + 3_600);
 
     queue.ack(&pending.events[0].0).await.unwrap();
@@ -348,8 +469,39 @@ async fn repeated_schedule_at_keeps_one_pending_row_until_terminal_acknowledgmen
         .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
         .await
         .unwrap();
-    assert_eq!(completed.events.len(), 1);
-    assert_eq!(completed.events[0].1.id, "event-1");
+    assert_eq!(completed.events.len(), 3);
+    assert!(completed
+        .events
+        .iter()
+        .any(|(_, event)| event.id == first.id));
+    assert!(completed
+        .events
+        .iter()
+        .any(|(_, event)| event.id == second.id));
+    assert!(completed
+        .events
+        .iter()
+        .any(|(_, event)| event.id == third.id));
+    assert_eq!(
+        completed
+            .events
+            .iter()
+            .filter(|(_, event)| {
+                event.completion_reason() == Some(QueueCompletionReason::ScheduledNext)
+            })
+            .count(),
+        2
+    );
+    assert_eq!(
+        completed
+            .events
+            .iter()
+            .filter(|(_, event)| {
+                event.completion_reason() == Some(QueueCompletionReason::Acknowledged)
+            })
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -538,7 +690,7 @@ async fn queue_worker_acknowledges_successful_jobs() {
 }
 
 #[tokio::test]
-async fn queue_worker_schedule_at_creates_a_new_future_invocation() {
+async fn queue_worker_schedule_next_at_completes_current_and_creates_new_future_invocation() {
     let engine = engine();
     let queue = Arc::new(queue(engine, 1));
     let now = Utc::now().timestamp();
@@ -562,7 +714,7 @@ async fn queue_worker_schedule_at_creates_a_new_future_invocation() {
             let handler_processed = handler_processed.clone();
             Box::pin(async move {
                 handler_processed.notify_one();
-                Ok(QueueHandlerOutcome::ScheduleAt(future_timestamp))
+                Ok(QueueHandlerOutcome::ScheduleNextAt(future_timestamp))
             })
         },
         shutdown_rx,
@@ -579,7 +731,7 @@ async fn queue_worker_schedule_at_creates_a_new_future_invocation() {
                 .await
                 .unwrap();
             if pending.events.len() == 1
-                && pending.events[0].1.id == "worker-schedule"
+                && pending.events[0].1.id != "worker-schedule"
                 && pending.events[0].1.timestamp == future_timestamp
             {
                 break;
@@ -589,12 +741,16 @@ async fn queue_worker_schedule_at_creates_a_new_future_invocation() {
     })
     .await
     .unwrap();
-    assert!(queue
+    let completed = queue
         .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
         .await
-        .unwrap()
-        .events
-        .is_empty());
+        .unwrap();
+    assert_eq!(completed.events.len(), 1);
+    assert_eq!(completed.events[0].1.id, "worker-schedule");
+    assert_eq!(
+        completed.events[0].1.completion_reason(),
+        Some(QueueCompletionReason::ScheduledNext)
+    );
 
     let _ = shutdown_tx.send(());
     timeout(Duration::from_secs(2), handle)

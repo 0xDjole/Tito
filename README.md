@@ -113,7 +113,7 @@ let results = query.value(&author_id).relationship("tags").execute().await?;
 Queue events are partitioned by their business key, can be scheduled for a future timestamp, and remain pending until the handler explicitly acknowledges them. Tito has no automatic retry policy, retry counter, backoff, failed state, or DLQ:
 
 - `Ok(QueueHandlerOutcome::Acknowledge)` completes the current invocation.
-- `Ok(QueueHandlerOutcome::ScheduleAt(timestamp))` atomically replaces the current pending invocation with a pending successor carrying the same logical event ID, key, and payload at that exact timestamp.
+- `Ok(QueueHandlerOutcome::ScheduleNextAt(timestamp))` atomically completes the current invocation and creates a new pending invocation with a new event ID, the same business key, payload, and original schedule provenance, and that exact next timestamp.
 - `Err(_)`, a handler panic, or the executor timeout leaves the current invocation unchanged and pending for redelivery at the worker's normal poll cadence.
 
 ```rust
@@ -140,7 +140,7 @@ run_worker(
 ).await;
 ```
 
-`ScheduleAt` is an atomic pending-to-pending handoff, not a queue retry policy. Tito checks that the exact current pending storage key still exists, then deletes that key and writes one successor in the same transaction. The timestamp must produce a different due key. The event ID remains the permanent logical identity; the due timestamp in each pending storage key distinguishes scheduled invocations. Only `Acknowledge` creates a completed row. If concurrent consumers process the same invocation, only the winner can create the successor. Application handlers should choose one of these two outcomes rather than mutating queue state directly.
+`ScheduleNextAt` is an atomic planned continuation, not a queue retry policy. Tito checks that the exact current pending storage key still exists, moves that invocation to Completed with `processedAt` and `completionReason = scheduled_next`, and writes one new Pending invocation in the same transaction. `Acknowledge` records `completionReason = acknowledged`; legacy Completed rows without the field are exposed as acknowledged through `QueueEvent::completion_reason()`, while Pending rows return no completion reason. The successor has a new event ID, so the supplied timestamp may equal the current timestamp without colliding with the current storage key. Repeated continuations leave one ScheduledNext completed record per finished invocation and exactly one pending successor; the independent event IDs are deliberately not linked by another logical ID. If concurrent consumers return `ScheduleNextAt` for the same current storage key, only the transaction that still owns that exact Pending row can complete it and create the single successor. Application handlers should choose one of these two outcomes rather than mutating queue state directly.
 
 Workers supervise each handler with a ten-minute timeout by default. Configure `handler_timeout` when a workload has a different bounded execution contract; the timeout is executor protection and never changes queue state or provider policy.
 
@@ -156,7 +156,7 @@ work.
 
 ### Transaction retry safety
 
-Tito may replay a transaction closure after an explicitly retryable, determined datastore failure. TiKV's `UndeterminedError` is different: the commit may already be durable. Tito returns `TitoError::CommitOutcomeUnknown` and never replays that closure. The caller must reconcile against authoritative stored state; queue acknowledgement and `ScheduleAt` operations naturally converge when a still-pending row is pulled again.
+Tito may replay a transaction closure after an explicitly retryable, determined datastore failure. TiKV's `UndeterminedError` is different: the commit may already be durable. Tito returns `TitoError::CommitOutcomeUnknown` and never replays that closure. The caller must reconcile against authoritative stored state; queue acknowledgement and `ScheduleNextAt` naturally converge because either the unchanged current Pending invocation is redelivered or its committed successor is delivered.
 
 ### Upgrade contract
 

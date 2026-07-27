@@ -59,6 +59,9 @@ async fn main() -> Result<(), TitoError> {
                 count, event.payload.action, event.payload.name, event.payload.email,
             );
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            // A planned continuation would return
+            // `QueueHandlerOutcome::ScheduleNextAt(unix_timestamp)`: Tito would
+            // complete this invocation and create a fresh-ID pending successor.
             Ok::<_, TitoError>(QueueHandlerOutcome::Acknowledge)
         }) as BoxFuture<'static, Result<QueueHandlerOutcome, TitoError>>
     };

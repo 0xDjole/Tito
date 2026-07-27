@@ -8,6 +8,17 @@ pub enum QueueEventState {
     Completed,
 }
 
+/// Why a queue invocation entered the terminal Completed state.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueCompletionReason {
+    /// The handler completed the invocation without scheduling more queue work.
+    #[default]
+    Acknowledged,
+    /// The handler completed the invocation and atomically scheduled a new one.
+    ScheduledNext,
+}
+
 /// The durable action Tito takes after a queue handler finishes successfully.
 ///
 /// Returning an error performs no queue mutation, so the current pending
@@ -16,12 +27,12 @@ pub enum QueueEventState {
 pub enum QueueHandlerOutcome {
     /// Complete the current invocation.
     Acknowledge,
-    /// Atomically replace the current pending invocation with a successor
-    /// pending invocation at the exact Unix timestamp.
+    /// Atomically complete the current invocation and create a new pending
+    /// invocation at the exact Unix timestamp.
     ///
-    /// The successor preserves the logical queue event ID. Its exact pending
-    /// storage key identifies the new scheduled invocation.
-    ScheduleAt(i64),
+    /// The successor receives a new queue event ID while preserving the
+    /// current invocation's business key and payload.
+    ScheduleNextAt(i64),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -38,6 +49,8 @@ pub struct QueueEvent<T> {
     pub state: QueueEventState,
     #[serde(default)]
     pub processed_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) completion_reason: Option<QueueCompletionReason>,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +87,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent
             original_scheduled_at: Some(now),
             state: QueueEventState::Pending,
             processed_at: None,
+            completion_reason: None,
         }
     }
 
@@ -99,15 +113,28 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent
         &self.payload
     }
 
+    /// Returns the terminal reason for a Completed invocation.
+    ///
+    /// Completed rows written before completion reasons were introduced are
+    /// interpreted as acknowledged. Pending rows never have a completion
+    /// reason.
+    pub fn completion_reason(&self) -> Option<QueueCompletionReason> {
+        match self.state {
+            QueueEventState::Pending => None,
+            QueueEventState::Completed => Some(self.completion_reason.unwrap_or_default()),
+        }
+    }
+
     pub(crate) fn successor_at(&self, timestamp: i64) -> Self {
         Self {
-            id: self.id.clone(),
+            id: queue_event_id(),
             key: self.key.clone(),
             payload: self.payload.clone(),
             timestamp,
             original_scheduled_at: Some(self.original_scheduled_at()),
             state: QueueEventState::Pending,
             processed_at: None,
+            completion_reason: None,
         }
     }
 }

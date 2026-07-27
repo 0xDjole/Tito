@@ -7,8 +7,8 @@ pub use cluster::{
     ClusterWorkerNode,
 };
 pub use types::{
-    QueueConfig, QueueEvent, QueueEventState, QueueHandlerOutcome, QueuePullCursor, QueuePullPage,
-    QueueScanPage,
+    QueueCompletionReason, QueueConfig, QueueEvent, QueueEventState, QueueHandlerOutcome,
+    QueuePullCursor, QueuePullPage, QueueScanPage,
 };
 pub use worker::{run_worker, WorkerConfig};
 
@@ -126,6 +126,7 @@ impl<E: TitoEngine> Queue<E> {
 
         event.state = QueueEventState::Pending;
         event.processed_at = None;
+        event.completion_reason = None;
 
         let bytes = serde_json::to_vec(&event)
             .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
@@ -294,6 +295,9 @@ impl<E: TitoEngine> Queue<E> {
                     event["state"] =
                         Value::String(Self::state_value(QueueEventState::Completed).to_string());
                     event["processedAt"] = Value::Number(processed_at.into());
+                    event["completionReason"] =
+                        serde_json::to_value(QueueCompletionReason::Acknowledged)
+                            .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
 
                     let completed_key = Self::completed_key(processed_at, scheduled_at, &event_id);
                     let completed_bytes = serde_json::to_vec(&event)
@@ -312,16 +316,14 @@ impl<E: TitoEngine> Queue<E> {
             .await
     }
 
-    /// Atomically hands off the exact pending invocation at `storage_key` to a
-    /// successor invocation at `timestamp`.
+    /// Atomically completes the exact pending invocation at `storage_key` and
+    /// creates a new pending successor invocation at `timestamp`.
     ///
-    /// The successor keeps the current event's key, payload, and original
-    /// schedule and permanent logical event ID. Its new pending storage key
-    /// identifies the scheduled invocation. The logical event becomes
-    /// Completed only after a handler returns [`QueueHandlerOutcome::Acknowledge`].
+    /// The successor keeps the current event's key and payload but receives a
+    /// new event ID. The current invocation is retained as Completed history.
     /// If another consumer has already moved or acknowledged the exact pending
     /// row, this is an idempotent no-op.
-    pub(crate) async fn schedule_at<
+    pub async fn schedule_next_at<
         T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
     >(
         &self,
@@ -354,20 +356,29 @@ impl<E: TitoEngine> Queue<E> {
                         return Ok::<_, TitoError>(None);
                     }
 
+                    let processed_at = Utc::now().timestamp();
+                    let mut completed = current.clone();
+                    completed.state = QueueEventState::Completed;
+                    completed.processed_at = Some(processed_at);
+                    completed.completion_reason = Some(QueueCompletionReason::ScheduledNext);
+                    let completed_key =
+                        Self::completed_key(processed_at, current.timestamp, &current.id);
+                    let completed_bytes = serde_json::to_vec(&completed)
+                        .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
+
                     let successor = current.successor_at(timestamp);
                     let successor_partition = self.partition_for_key(&successor.key);
                     let successor_key =
                         Self::pending_key(successor_partition, successor.timestamp, &successor.id);
-                    if successor_key == storage_key {
-                        return Err(TitoError::InvalidInput(
-                            "ScheduleAt must move the event to a different due timestamp"
-                                .to_string(),
-                        ));
-                    }
                     let successor_bytes = serde_json::to_vec(&successor)
                         .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
 
                     Self::delete_entry(&tx, storage_key.as_bytes()).await?;
+                    tx.put(completed_key.as_bytes(), completed_bytes)
+                        .await
+                        .map_err(|e| {
+                            TitoError::UpdateFailed(format!("Create completed event: {}", e))
+                        })?;
                     tx.put(successor_key.as_bytes(), successor_bytes)
                         .await
                         .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
@@ -599,6 +610,7 @@ mod tests {
             original_scheduled_at: Some(timestamp),
             state,
             processed_at,
+            completion_reason: None,
         }
     }
 
@@ -651,6 +663,14 @@ mod tests {
         assert_eq!(completed.events[0].1.key, "entry:due");
         assert_eq!(completed.events[0].1.state, QueueEventState::Completed);
         assert!(completed.events[0].1.processed_at.is_some());
+        assert_eq!(
+            serde_json::to_value(&completed.events[0].1).unwrap()["completionReason"],
+            serde_json::json!("acknowledged")
+        );
+        assert_eq!(
+            completed.events[0].1.completion_reason(),
+            Some(QueueCompletionReason::Acknowledged)
+        );
     }
 
     #[tokio::test]
@@ -716,7 +736,8 @@ mod tests {
         assert!(second
             .events
             .iter()
-            .all(|(_, event)| event.state == QueueEventState::Pending));
+            .all(|(_, event)| event.state == QueueEventState::Pending
+                && event.completion_reason().is_none()));
     }
 
     #[tokio::test]

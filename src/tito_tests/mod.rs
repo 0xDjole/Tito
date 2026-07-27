@@ -1,6 +1,7 @@
 use crate::key_encoder::safe_encode;
 use crate::queue::{
-    run_worker, Queue, QueueConfig, QueueEvent, QueueEventState, QueueHandlerOutcome, WorkerConfig,
+    run_worker, Queue, QueueCompletionReason, QueueConfig, QueueEvent, QueueEventState,
+    QueueHandlerOutcome, WorkerConfig,
 };
 use crate::test_support::MemoryEngine;
 use crate::types::{
@@ -338,6 +339,7 @@ fn queue_event(id: &str, key: &str, timestamp: i64) -> QueueEvent<QueuePayload> 
         original_scheduled_at: Some(timestamp),
         state: QueueEventState::Pending,
         processed_at: None,
+        completion_reason: None,
     }
 }
 
