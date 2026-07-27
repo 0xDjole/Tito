@@ -15,6 +15,7 @@ pub(crate) struct MemoryEngine {
     next_get_error: Arc<Mutex<Option<String>>>,
     next_commit_unknown_after_apply: Arc<Mutex<Option<bool>>>,
     next_transaction_version: Arc<AtomicU64>,
+    pending_queue_scans: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -24,6 +25,7 @@ pub(crate) struct MemoryTransaction {
     next_get_error: Arc<Mutex<Option<String>>>,
     next_commit_unknown_after_apply: Arc<Mutex<Option<bool>>>,
     start_version: u64,
+    pending_queue_scans: Arc<AtomicU64>,
 }
 
 impl MemoryEngine {
@@ -44,6 +46,10 @@ impl MemoryEngine {
 
     pub(crate) async fn make_next_commit_outcome_unknown(&self, after_apply: bool) {
         *self.next_commit_unknown_after_apply.lock().await = Some(after_apply);
+    }
+
+    pub(crate) fn pending_queue_scan_count(&self) -> u64 {
+        self.pending_queue_scans.load(Ordering::SeqCst)
     }
 
     pub(crate) async fn raw_bytes(&self, key: &str) -> Option<Vec<u8>> {
@@ -87,6 +93,7 @@ impl TitoEngine for MemoryEngine {
             next_get_error: self.next_get_error.clone(),
             next_commit_unknown_after_apply: self.next_commit_unknown_after_apply.clone(),
             start_version,
+            pending_queue_scans: self.pending_queue_scans.clone(),
         })
     }
 
@@ -164,6 +171,9 @@ impl TitoTransaction for MemoryTransaction {
     ) -> Result<Vec<TitoKvPair>, TitoError> {
         let start = range.start.as_ref().to_vec();
         let end = range.end.as_ref().to_vec();
+        if start.starts_with(b"queue:pending:") {
+            self.pending_queue_scans.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(self
             .local
             .lock()

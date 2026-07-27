@@ -151,6 +151,223 @@ async fn cluster_worker_contains_handler_panic_and_redelivers_pending_invocation
 }
 
 #[tokio::test]
+async fn cluster_worker_shutdown_drains_started_handler_and_persists_outcome_before_join() {
+    let engine = engine();
+    let queue = Arc::new(queue(engine.clone(), 1));
+    queue
+        .publish(queue_event(
+            "cluster-drain",
+            "entry:cluster-drain",
+            Utc::now().timestamp() - 10,
+        ))
+        .await
+        .unwrap();
+    queue
+        .publish(queue_event(
+            "cluster-already-pulled",
+            "entry:cluster-already-pulled",
+            Utc::now().timestamp() - 10,
+        ))
+        .await
+        .unwrap();
+
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handler_started = started.clone();
+    let handler_release = release.clone();
+    let handler_attempts = attempts.clone();
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let mut handle = crate::run_cluster_worker(
+        queue.clone(),
+        cluster_config("drain-node"),
+        move |event: QueueEvent<QueuePayload>| {
+            let handler_started = handler_started.clone();
+            let handler_release = handler_release.clone();
+            let handler_attempts = handler_attempts.clone();
+            Box::pin(async move {
+                handler_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(event.id, "cluster-drain");
+                handler_started.notify_one();
+                handler_release.notified().await;
+                Ok(QueueHandlerOutcome::Acknowledge)
+            })
+        },
+        shutdown_rx,
+    )
+    .await;
+
+    timeout(Duration::from_secs(3), started.notified())
+        .await
+        .unwrap();
+    let pulls_before_shutdown = engine.pending_queue_scan_count();
+    queue
+        .publish(queue_event(
+            "cluster-not-pulled",
+            "entry:cluster-not-pulled",
+            Utc::now().timestamp() - 10,
+        ))
+        .await
+        .unwrap();
+    let _ = shutdown_tx.send(());
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !handle.is_finished(),
+        "cluster worker joined before its started handler drained"
+    );
+
+    release.notify_one();
+    timeout(Duration::from_secs(2), &mut handle)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        engine.pending_queue_scan_count(),
+        pulls_before_shutdown,
+        "shutdown allowed another pending-partition pull"
+    );
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "shutdown allowed another handler to start"
+    );
+    let completed = queue
+        .find_completed_after::<QueuePayload>(0, 10)
+        .await
+        .unwrap();
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].1.id, "cluster-drain");
+    assert_eq!(
+        completed[0].1.completion_reason(),
+        Some(QueueCompletionReason::Acknowledged)
+    );
+    let pending = queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(pending.events.len(), 2);
+    assert_eq!(
+        pending
+            .events
+            .into_iter()
+            .map(|(_, event)| event.id)
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            "cluster-already-pulled".to_string(),
+            "cluster-not-pulled".to_string(),
+        ])
+    );
+}
+
+#[tokio::test]
+async fn cluster_worker_shutdown_bounds_a_blocked_handler_by_its_timeout() {
+    let engine = engine();
+    let queue = Arc::new(queue(engine, 1));
+    queue
+        .publish(queue_event(
+            "cluster-timeout-drain",
+            "entry:cluster-timeout-drain",
+            Utc::now().timestamp() - 10,
+        ))
+        .await
+        .unwrap();
+
+    let mut config = cluster_config("timeout-drain-node");
+    config.handler_timeout = Duration::from_millis(25);
+    let started = Arc::new(Notify::new());
+    let handler_started = started.clone();
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let handle = crate::run_cluster_worker(
+        queue.clone(),
+        config,
+        move |_event: QueueEvent<QueuePayload>| {
+            let handler_started = handler_started.clone();
+            Box::pin(async move {
+                handler_started.notify_one();
+                std::future::pending::<()>().await;
+                Ok(QueueHandlerOutcome::Acknowledge)
+            })
+        },
+        shutdown_rx,
+    )
+    .await;
+
+    timeout(Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+    let _ = shutdown_tx.send(());
+    timeout(Duration::from_secs(1), handle)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let pending = queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(pending.events.len(), 1);
+    assert_eq!(pending.events[0].1.id, "cluster-timeout-drain");
+    assert!(queue
+        .find_completed_after::<QueuePayload>(0, 10)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn cluster_worker_observes_shutdown_sent_immediately_after_start() {
+    let engine = engine();
+    let queue = Arc::new(queue(engine.clone(), 1));
+    queue
+        .publish(queue_event(
+            "cluster-immediate-shutdown",
+            "entry:cluster-immediate-shutdown",
+            Utc::now().timestamp() - 10,
+        ))
+        .await
+        .unwrap();
+
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handler_attempts = attempts.clone();
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let handle = crate::run_cluster_worker(
+        queue.clone(),
+        cluster_config("immediate-shutdown-node"),
+        move |_event: QueueEvent<QueuePayload>| {
+            let handler_attempts = handler_attempts.clone();
+            Box::pin(async move {
+                handler_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(QueueHandlerOutcome::Acknowledge)
+            })
+        },
+        shutdown_rx,
+    )
+    .await;
+
+    let _ = shutdown_tx.send(());
+    timeout(Duration::from_secs(1), handle)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "worker started a handler after shutdown"
+    );
+    assert_eq!(engine.pending_queue_scan_count(), 0);
+    let pending = queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(pending.events.len(), 1);
+    assert_eq!(pending.events[0].1.id, "cluster-immediate-shutdown");
+}
+
+#[tokio::test]
 async fn cluster_coordinator_enforces_fixed_completed_history_retention() {
     const THREE_DAYS_SECONDS: i64 = 3 * 24 * 60 * 60;
 
