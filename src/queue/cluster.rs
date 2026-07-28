@@ -516,11 +516,7 @@ pub async fn run_cluster_worker<E, T, H>(
 where
     E: TitoEngine + 'static,
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<QueueHandlerOutcome, TitoError>>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
+    H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerOutcome> + Clone + Send + Sync + 'static,
 {
     let maintenance_shutdown = shutdown.resubscribe();
     tokio::spawn(async move {
@@ -589,11 +585,7 @@ async fn reconcile_partition_workers<E, T, H>(
 ) where
     E: TitoEngine + 'static,
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<QueueHandlerOutcome, TitoError>>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
+    H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerOutcome> + Clone + Send + Sync + 'static,
 {
     let owned = match queue.owned_cluster_partition_assignments(&config).await {
         Ok(assignments) => assignments
@@ -698,11 +690,7 @@ async fn run_partition_worker<E, T, H>(
 ) where
     E: TitoEngine + 'static,
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<QueueHandlerOutcome, TitoError>>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
+    H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerOutcome> + Clone + Send + Sync + 'static,
 {
     let mut stop = PartitionWorkerStop {
         retirement: stop,
@@ -843,11 +831,7 @@ async fn process_partition_once<E, T, H>(
 where
     E: TitoEngine + 'static,
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<QueueHandlerOutcome, TitoError>>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
+    H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerOutcome> + Clone + Send + Sync + 'static,
 {
     let pull = tokio::select! {
         biased;

@@ -112,9 +112,9 @@ let results = query.value(&author_id).relationship("tags").execute().await?;
 
 Queue events are partitioned by their business key, can be scheduled for a non-negative Unix timestamp, and remain pending until the handler explicitly acknowledges them. Tito rejects negative timestamps instead of storing an invocation that polling cannot reach. Tito has no automatic retry policy, retry counter, backoff, failed state, or DLQ:
 
-- `Ok(QueueHandlerOutcome::Acknowledge)` completes the current invocation.
-- `Ok(QueueHandlerOutcome::ScheduleNextAt(timestamp))` atomically completes the current invocation and creates a new pending invocation with a new event ID, the same business key and payload, and that exact next timestamp.
-- `Err(_)`, a handler panic, or the executor timeout leaves the current invocation unchanged and pending for redelivery at the worker's normal poll cadence.
+- `QueueHandlerOutcome::Acknowledge` completes the current invocation.
+- `QueueHandlerOutcome::ScheduleNextAt(timestamp)` atomically completes the current invocation and creates a new pending invocation with a new event ID, the same business key and payload, and that exact next timestamp.
+- A handler panic, executor timeout, lost worker, or failure to persist either outcome leaves the current invocation unchanged and pending for redelivery.
 
 Every new invocation must serialize to at most `MAX_QUEUE_EVENT_BYTES` (1 MiB). Publication rejects
 larger events before writing anything, and planned continuations enforce the same limit on their
@@ -144,8 +144,12 @@ run_worker(
     queue,
     WorkerConfig::new(0..4),
     |event: QueueEvent<UserCreated>| async move {
-        handle_user_created(event.payload).await?;
-        Ok(QueueHandlerOutcome::Acknowledge)
+        match handle_user_created(event.payload).await {
+            Ok(()) => QueueHandlerOutcome::Acknowledge,
+            Err(_) => QueueHandlerOutcome::ScheduleNextAt(
+                chrono::Utc::now().timestamp().saturating_add(5),
+            ),
+        }
     }
     .boxed(),
     shutdown_rx,
@@ -156,8 +160,9 @@ run_worker(
 
 Workers supervise each handler with a ten-minute timeout by default. Configure `handler_timeout` when a workload has a different bounded execution contract; the timeout is executor protection and never changes queue state or provider policy.
 Worker shutdown stops new pulls and handler starts, then drains every handler that already started
-and applies its outcome before joining. The configured handler timeout bounds that drain. An error,
-panic, timeout, or lost cluster partition lease still leaves the exact invocation Pending.
+and applies its outcome before joining. The configured handler timeout bounds that drain. A panic,
+timeout, lost worker, lost cluster partition lease, or queue-outcome storage failure leaves the exact
+invocation Pending.
 
 Partition polling is fair across due rows. Pending storage keys are ordered as
 `queue:pending:{partition:04}:{due_at:020}:{enqueue_version:020}:{event_id}`. The enqueue version is

@@ -114,7 +114,7 @@ async fn cluster_worker_contains_handler_panic_and_redelivers_pending_invocation
                     panic!("simulated cluster handler panic");
                 }
                 handler_processed.notify_one();
-                Ok(QueueHandlerOutcome::Acknowledge)
+                QueueHandlerOutcome::Acknowledge
             })
         },
         shutdown_rx,
@@ -191,7 +191,7 @@ async fn cluster_worker_shutdown_drains_started_handler_and_persists_outcome_bef
                 assert_eq!(event.id, "cluster-drain");
                 handler_started.notify_one();
                 handler_release.notified().await;
-                Ok(QueueHandlerOutcome::Acknowledge)
+                QueueHandlerOutcome::Acknowledge
             })
         },
         shutdown_rx,
@@ -289,7 +289,7 @@ async fn cluster_worker_shutdown_bounds_a_blocked_handler_by_its_timeout() {
             Box::pin(async move {
                 handler_started.notify_one();
                 std::future::pending::<()>().await;
-                Ok(QueueHandlerOutcome::Acknowledge)
+                QueueHandlerOutcome::Acknowledge
             })
         },
         shutdown_rx,
@@ -342,7 +342,7 @@ async fn cluster_worker_observes_shutdown_sent_immediately_after_start() {
             let handler_attempts = handler_attempts.clone();
             Box::pin(async move {
                 handler_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(QueueHandlerOutcome::Acknowledge)
+                QueueHandlerOutcome::Acknowledge
             })
         },
         shutdown_rx,
@@ -396,7 +396,7 @@ async fn cluster_coordinator_enforces_fixed_completed_history_retention() {
         queue,
         cluster_config("retention-node"),
         |_event: QueueEvent<QueuePayload>| {
-            Box::pin(async move { Ok(QueueHandlerOutcome::Acknowledge) })
+            Box::pin(async move { QueueHandlerOutcome::Acknowledge })
         },
         shutdown_rx,
     )

@@ -1,7 +1,5 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::mpsc;
-use tokio::time::Instant;
 
 #[test]
 fn queue_event_helpers_parse_key_and_update_schedule() {
@@ -818,7 +816,7 @@ async fn standalone_worker_enforces_fixed_completed_history_retention() {
         queue,
         WorkerConfig::new(0..1),
         |_event: QueueEvent<QueuePayload>| {
-            Box::pin(async move { Ok(QueueHandlerOutcome::Acknowledge) })
+            Box::pin(async move { QueueHandlerOutcome::Acknowledge })
         },
         shutdown_rx,
     )
@@ -891,7 +889,7 @@ async fn queue_worker_acknowledges_successful_jobs() {
             Box::pin(async move {
                 assert_eq!(event.id, "worker-success");
                 handler_processed.notify_one();
-                Ok(QueueHandlerOutcome::Acknowledge)
+                QueueHandlerOutcome::Acknowledge
             })
         },
         shutdown_rx,
@@ -957,7 +955,7 @@ async fn standalone_worker_shutdown_drains_started_handler_before_join() {
                 assert_eq!(event.id, "standalone-drain");
                 handler_started.notify_one();
                 handler_release.notified().await;
-                Ok(QueueHandlerOutcome::Acknowledge)
+                QueueHandlerOutcome::Acknowledge
             })
         },
         shutdown_rx,
@@ -1021,7 +1019,7 @@ async fn queue_worker_schedule_next_at_completes_current_and_creates_new_future_
             let handler_processed = handler_processed.clone();
             Box::pin(async move {
                 handler_processed.notify_one();
-                Ok(QueueHandlerOutcome::ScheduleNextAt(future_timestamp))
+                QueueHandlerOutcome::ScheduleNextAt(future_timestamp)
             })
         },
         shutdown_rx,
@@ -1067,66 +1065,6 @@ async fn queue_worker_schedule_next_at_completes_current_and_creates_new_future_
 }
 
 #[tokio::test]
-async fn queue_worker_redelivers_same_pending_invocation_after_error_at_poll_cadence() {
-    let engine = engine();
-    let queue = Arc::new(queue(engine, 1));
-    queue
-        .publish(queue_event(
-            "worker-redelivery",
-            "entry:worker-redelivery",
-            Utc::now().timestamp() - 10,
-        ))
-        .await
-        .unwrap();
-    let attempts = Arc::new(AtomicUsize::new(0));
-    let (attempt_tx, mut attempt_rx) = mpsc::unbounded_channel();
-    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-    let handler_attempts = attempts.clone();
-
-    let handle = run_worker::<_, QueuePayload, _>(
-        queue.clone(),
-        WorkerConfig::new(0..1),
-        move |event| {
-            let attempt_tx = attempt_tx.clone();
-            let handler_attempts = handler_attempts.clone();
-            Box::pin(async move {
-                let attempt = handler_attempts.fetch_add(1, Ordering::SeqCst);
-                attempt_tx.send((event.id, Instant::now())).unwrap();
-                if attempt == 0 {
-                    Err(TitoError::Internal("handler failed".to_string()))
-                } else {
-                    Ok(QueueHandlerOutcome::Acknowledge)
-                }
-            })
-        },
-        shutdown_rx,
-    )
-    .await;
-
-    let first = timeout(Duration::from_secs(2), attempt_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    let second = timeout(Duration::from_secs(3), attempt_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(first.0, "worker-redelivery");
-    assert_eq!(second.0, first.0, "redelivery keeps the invocation ID");
-    assert!(
-        second.1.duration_since(first.1) >= Duration::from_millis(900),
-        "an unchanged due row must wait for the normal worker poll cadence"
-    );
-    wait_for_completed(&queue, "worker-redelivery").await;
-
-    let _ = shutdown_tx.send(());
-    timeout(Duration::from_secs(2), handle)
-        .await
-        .unwrap()
-        .unwrap();
-}
-
-#[tokio::test]
 async fn queue_worker_does_not_let_unacknowledged_first_page_starve_later_rows() {
     let engine = engine();
     let queue = Arc::new(queue(engine, 1));
@@ -1154,9 +1092,9 @@ async fn queue_worker_does_not_let_unacknowledged_first_page_starve_later_rows()
             Box::pin(async move {
                 if event.id == "zz-target" {
                     handler_target_processed.notify_one();
-                    Ok(QueueHandlerOutcome::Acknowledge)
+                    QueueHandlerOutcome::Acknowledge
                 } else {
-                    Err(TitoError::Internal("leave pending".to_string()))
+                    panic!("leave blocked invocation pending")
                 }
             })
         },
@@ -1206,7 +1144,7 @@ async fn queue_worker_contains_panic_and_redelivers_the_pending_invocation() {
                     panic!("simulated handler panic");
                 }
                 handler_processed.notify_one();
-                Ok(QueueHandlerOutcome::Acknowledge)
+                QueueHandlerOutcome::Acknowledge
             })
         },
         shutdown_rx,
@@ -1255,7 +1193,7 @@ async fn queue_worker_contains_synchronous_handler_panic_and_redelivers() {
             let handler_processed = handler_processed.clone();
             Box::pin(async move {
                 handler_processed.notify_one();
-                Ok(QueueHandlerOutcome::Acknowledge)
+                QueueHandlerOutcome::Acknowledge
             })
         },
         shutdown_rx,
@@ -1307,7 +1245,7 @@ async fn queue_worker_times_out_handler_and_redelivers_pending_invocation() {
                     std::future::pending::<()>().await;
                 }
                 handler_processed.notify_one();
-                Ok(QueueHandlerOutcome::Acknowledge)
+                QueueHandlerOutcome::Acknowledge
             })
         },
         shutdown_rx,

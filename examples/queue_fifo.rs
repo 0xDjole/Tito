@@ -60,8 +60,8 @@ async fn main() -> Result<(), TitoError> {
                 count, event.payload.action, event.payload.name, event.payload.email,
             );
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            Ok::<_, TitoError>(QueueHandlerOutcome::Acknowledge)
-        }) as BoxFuture<'static, Result<QueueHandlerOutcome, TitoError>>
+            QueueHandlerOutcome::Acknowledge
+        }) as BoxFuture<'static, QueueHandlerOutcome>
     };
 
     let worker_handle =

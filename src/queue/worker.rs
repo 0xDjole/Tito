@@ -14,7 +14,6 @@ use super::{
     Queue, QueueEvent, QueueHandlerOutcome, QueuePullCursor, COMPLETED_EVENT_MAINTENANCE_INTERVAL,
 };
 use crate::types::TitoEngine;
-use crate::TitoError;
 
 const WORKER_POLL_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) const DEFAULT_HANDLER_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -35,7 +34,7 @@ impl WorkerConfig {
 }
 
 pub(crate) enum HandlerExecution {
-    Finished(Result<QueueHandlerOutcome, TitoError>),
+    Finished(QueueHandlerOutcome),
     Panicked,
     TimedOut,
 }
@@ -47,7 +46,7 @@ pub(crate) async fn execute_handler<T, H>(
 ) -> HandlerExecution
 where
     T: Send + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<QueueHandlerOutcome, TitoError>>,
+    H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerOutcome>,
 {
     let handler_future = match catch_unwind(AssertUnwindSafe(|| handler(event))) {
         Ok(handler_future) => handler_future,
@@ -60,7 +59,7 @@ where
     )
     .await
     {
-        Ok(Ok(result)) => HandlerExecution::Finished(result),
+        Ok(Ok(outcome)) => HandlerExecution::Finished(outcome),
         Ok(Err(_)) => HandlerExecution::Panicked,
         Err(_) => HandlerExecution::TimedOut,
     }
@@ -72,16 +71,7 @@ pub(crate) fn handler_outcome_or_log<T>(
     handler_timeout: Duration,
 ) -> Option<QueueHandlerOutcome> {
     match execution {
-        HandlerExecution::Finished(Ok(outcome)) => Some(outcome),
-        HandlerExecution::Finished(Err(error)) => {
-            log::error!(
-                "Queue handler failed for event {} ({}); leaving it pending for redelivery: {}",
-                event.id,
-                event.key,
-                error
-            );
-            None
-        }
+        HandlerExecution::Finished(outcome) => Some(outcome),
         HandlerExecution::Panicked => {
             log::error!(
                 "Queue handler panicked for event {} ({}); leaving it pending for redelivery",
@@ -137,11 +127,7 @@ pub async fn run_worker<E, T, H>(
 where
     E: TitoEngine + 'static,
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<QueueHandlerOutcome, TitoError>>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
+    H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerOutcome> + Clone + Send + Sync + 'static,
 {
     tokio::spawn(async move {
         let mut handles = Vec::new();
