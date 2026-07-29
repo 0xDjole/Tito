@@ -7,8 +7,8 @@ pub use cluster::{
     ClusterWorkerNode,
 };
 pub use types::{
-    QueueCompletionReason, QueueConfig, QueueEvent, QueueEventState, QueueHandlerOutcome,
-    QueuePullCursor, QueuePullPage, QueueScanPage,
+    QueueConfig, QueueEvent, QueueEventState, QueueHandlerOutcome, QueuePullCursor, QueuePullPage,
+    QueueScanPage,
 };
 pub use worker::{run_worker, WorkerConfig};
 
@@ -82,34 +82,34 @@ impl<E: TitoEngine> Queue<E> {
         );
         let suffix = storage_key.strip_prefix(&prefix)?;
         let mut fields = suffix.splitn(3, ':');
-        let due_at = fields.next()?;
+        let timestamp = fields.next()?;
         let enqueue_version = fields.next()?;
         fields.next()?;
 
-        if due_at.len() != KEY_NUMBER_DIGITS
+        if timestamp.len() != KEY_NUMBER_DIGITS
             || enqueue_version.len() != KEY_NUMBER_DIGITS
-            || !due_at.bytes().all(|byte| byte.is_ascii_digit())
+            || !timestamp.bytes().all(|byte| byte.is_ascii_digit())
             || !enqueue_version.bytes().all(|byte| byte.is_ascii_digit())
         {
             return None;
         }
 
-        Some((due_at, enqueue_version.parse().ok()?))
+        Some((timestamp, enqueue_version.parse().ok()?))
     }
 
-    fn pending_due_bucket_end(partition: u32, due_at: &str) -> Vec<u8> {
+    fn pending_timestamp_bucket_end(partition: u32, timestamp: &str) -> Vec<u8> {
         let prefix = format!(
-            "queue:pending:{partition:0width$}:{due_at}:",
+            "queue:pending:{partition:0width$}:{timestamp}:",
             width = PARTITION_DIGITS
         );
         Self::prefix_end(&prefix)
     }
 
-    fn completed_key(processed_at: i64, scheduled_at: i64, event_id: &str) -> String {
+    fn completed_key(processed_at: i64, event_timestamp: i64, event_id: &str) -> String {
         format!(
             "queue:completed:{:0width$}:{:0width$}:{}",
             processed_at,
-            scheduled_at,
+            event_timestamp,
             event_id,
             width = KEY_NUMBER_DIGITS,
         )
@@ -228,7 +228,6 @@ impl<E: TitoEngine> Queue<E> {
 
         event.state = QueueEventState::Pending;
         event.processed_at = None;
-        event.completion_reason = None;
 
         let bytes = Self::serialize_new_event(&event)?;
 
@@ -303,11 +302,11 @@ impl<E: TitoEngine> Queue<E> {
                         continue;
                     }
 
-                    if let Some((due_at, enqueue_version)) =
+                    if let Some((timestamp, enqueue_version)) =
                         Self::pending_key_generation(&storage_key, partition)
                     {
                         if enqueue_version >= enqueue_horizon {
-                            next_start = Self::pending_due_bucket_end(partition, due_at);
+                            next_start = Self::pending_timestamp_bucket_end(partition, timestamp);
                             continue;
                         }
                     }
@@ -392,24 +391,20 @@ impl<E: TitoEngine> Queue<E> {
                             TitoError::DeserializationFailed("Queue event missing id".to_string())
                         })?
                         .to_string();
-                    let scheduled_at =
-                        event
-                            .get("timestamp")
-                            .and_then(Value::as_i64)
-                            .ok_or_else(|| {
-                                TitoError::DeserializationFailed(
-                                    "Queue event missing timestamp".to_string(),
-                                )
-                            })?;
+                    let event_timestamp = event
+                        .get("timestamp")
+                        .and_then(Value::as_i64)
+                        .ok_or_else(|| {
+                            TitoError::DeserializationFailed(
+                                "Queue event missing timestamp".to_string(),
+                            )
+                        })?;
                     let processed_at = Utc::now().timestamp();
                     event["state"] =
                         Value::String(Self::state_value(QueueEventState::Completed).to_string());
                     event["processedAt"] = Value::Number(processed_at.into());
-                    event["completionReason"] =
-                        serde_json::to_value(QueueCompletionReason::Acknowledged)
-                            .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
-
-                    let completed_key = Self::completed_key(processed_at, scheduled_at, &event_id);
+                    let completed_key =
+                        Self::completed_key(processed_at, event_timestamp, &event_id);
                     let completed_bytes = serde_json::to_vec(&event)
                         .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
 
@@ -426,71 +421,104 @@ impl<E: TitoEngine> Queue<E> {
             .await
     }
 
-    pub async fn schedule_next_at<
-        T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    >(
+    pub async fn reschedule<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static>(
         &self,
         storage_key: &str,
-        timestamp: i64,
-    ) -> Result<Option<QueueEvent<T>>, TitoError> {
-        Self::validate_timestamp(timestamp)?;
+        mut next: QueueEvent<T>,
+    ) -> Result<(), TitoError> {
+        Self::validate_timestamp(next.timestamp)?;
         if !storage_key.starts_with(Self::state_prefix(QueueEventState::Pending)) {
             return Err(TitoError::InvalidInput(
-                "Only pending queue events can schedule a successor".to_string(),
+                "Only pending queue events can be rescheduled".to_string(),
             ));
         }
 
+        next.state = QueueEventState::Pending;
+        next.processed_at = None;
         let storage_key = storage_key.to_string();
 
         self.engine
             .transaction(|tx| {
                 let storage_key = storage_key.clone();
+                let next = next.clone();
                 async move {
-                    let Some(bytes) = tx
-                        .get(storage_key.as_bytes())
-                        .await
-                        .map_err(|e| TitoError::QueryFailed(format!("Get queue event: {}", e)))?
+                    let Some(bytes) = tx.get(storage_key.as_bytes()).await.map_err(|error| {
+                        TitoError::QueryFailed(format!("Get queue event for reschedule: {error}"))
+                    })?
                     else {
-                        return Ok::<_, TitoError>(None);
+                        return Ok::<_, TitoError>(());
                     };
 
-                    let current = Self::read_event_from_value::<T>(&bytes)?;
-
-                    if current.state != QueueEventState::Pending {
-                        return Ok::<_, TitoError>(None);
+                    let mut current = Self::read_value_from_entry(&bytes)?;
+                    if current.get("state").and_then(Value::as_str) != Some("pending") {
+                        return Ok(());
                     }
 
-                    let processed_at = Utc::now().timestamp();
-                    let mut completed = current.clone();
-                    completed.state = QueueEventState::Completed;
-                    completed.processed_at = Some(processed_at);
-                    completed.completion_reason = Some(QueueCompletionReason::ScheduledNext);
-                    let completed_key =
-                        Self::completed_key(processed_at, current.timestamp, &current.id);
-                    let completed_bytes = serde_json::to_vec(&completed)
-                        .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
+                    let current_id = current
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            TitoError::DeserializationFailed("Queue event missing id".to_string())
+                        })?
+                        .to_string();
+                    if current_id != next.id {
+                        return Err(TitoError::InvalidInput(
+                            "A rescheduled row must preserve the logical event id".to_string(),
+                        ));
+                    }
+                    let current_key =
+                        current.get("key").and_then(Value::as_str).ok_or_else(|| {
+                            TitoError::DeserializationFailed(
+                                "Queue event missing partition key".to_string(),
+                            )
+                        })?;
+                    if current_key != next.key {
+                        return Err(TitoError::InvalidInput(
+                            "A rescheduled row must preserve the event partition key".to_string(),
+                        ));
+                    }
+                    let next_payload = serde_json::to_value(&next.payload)
+                        .map_err(|error| TitoError::SerializationFailed(error.to_string()))?;
+                    if current.get("payload") != Some(&next_payload) {
+                        return Err(TitoError::InvalidInput(
+                            "A rescheduled row must preserve the event payload".to_string(),
+                        ));
+                    }
+                    let current_timestamp = current
+                        .get("timestamp")
+                        .and_then(Value::as_i64)
+                        .ok_or_else(|| {
+                            TitoError::DeserializationFailed(
+                                "Queue event missing timestamp".to_string(),
+                            )
+                        })?;
 
-                    let successor = current.successor_at(timestamp);
-                    let successor_partition = self.partition_for_key(&successor.key);
-                    let successor_key = Self::pending_key(
-                        successor_partition,
-                        successor.timestamp,
-                        tx.start_version(),
-                        &successor.id,
-                    );
-                    let successor_bytes = Self::serialize_new_event(&successor)?;
+                    let processed_at = Utc::now().timestamp();
+                    current["state"] =
+                        Value::String(Self::state_value(QueueEventState::Completed).to_string());
+                    current["processedAt"] = Value::Number(processed_at.into());
+                    let completed_key =
+                        Self::completed_key(processed_at, current_timestamp, &current_id);
+                    let completed_bytes = serde_json::to_vec(&current)
+                        .map_err(|error| TitoError::SerializationFailed(error.to_string()))?;
+
+                    let partition = self.partition_for_key(&next.key);
+                    let pending_key =
+                        Self::pending_key(partition, next.timestamp, tx.start_version(), &next.id);
+                    let pending_bytes = Self::serialize_new_event(&next)?;
 
                     Self::delete_entry(&tx, storage_key.as_bytes()).await?;
                     tx.put(completed_key.as_bytes(), completed_bytes)
                         .await
-                        .map_err(|e| {
-                            TitoError::UpdateFailed(format!("Create completed event: {}", e))
+                        .map_err(|error| {
+                            TitoError::UpdateFailed(format!(
+                                "Complete rescheduled queue event: {error}"
+                            ))
                         })?;
-                    tx.put(successor_key.as_bytes(), successor_bytes)
+                    tx.put(pending_key.as_bytes(), pending_bytes)
                         .await
-                        .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
-
-                    Ok::<_, TitoError>(Some(successor))
+                        .map_err(|error| TitoError::CreateFailed(error.to_string()))?;
+                    Ok(())
                 }
             })
             .await
@@ -677,7 +705,6 @@ mod tests {
             timestamp,
             state,
             processed_at,
-            completion_reason: None,
         }
     }
 
@@ -734,13 +761,8 @@ mod tests {
         assert_eq!(completed.events[0].1.key, "entry:due");
         assert_eq!(completed.events[0].1.state, QueueEventState::Completed);
         assert!(completed.events[0].1.processed_at.is_some());
-        assert_eq!(
-            serde_json::to_value(&completed.events[0].1).unwrap()["completionReason"],
-            serde_json::json!("acknowledged")
-        );
-        assert_eq!(
-            completed.events[0].1.completion_reason(),
-            Some(QueueCompletionReason::Acknowledged)
+        assert!(
+            serde_json::to_value(&completed.events[0].1).unwrap()["completionReason"].is_null()
         );
     }
 
@@ -804,15 +826,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pull_reaches_due_timestamps_with_fewer_decimal_digits_than_now() {
+    async fn pull_reaches_event_timestamps_with_fewer_decimal_digits_than_now() {
         let queue = queue(MemoryEngine::default());
-        let old_due_timestamp = 999_999_999;
+        let old_timestamp = 999_999_999;
 
         queue
             .publish(QueueEvent::new(
                 "entry:old-due",
                 payload("old-due"),
-                old_due_timestamp,
+                old_timestamp,
             ))
             .await
             .unwrap();
@@ -821,7 +843,7 @@ mod tests {
 
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].1.key, "entry:old-due");
-        assert_eq!(jobs[0].1.timestamp, old_due_timestamp);
+        assert_eq!(jobs[0].1.timestamp, old_timestamp);
     }
 
     #[tokio::test]
@@ -895,8 +917,7 @@ mod tests {
         assert!(second
             .events
             .iter()
-            .all(|(_, event)| event.state == QueueEventState::Pending
-                && event.completion_reason().is_none()));
+            .all(|(_, event)| event.state == QueueEventState::Pending));
     }
 
     #[tokio::test]

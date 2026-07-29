@@ -33,8 +33,8 @@ impl WorkerConfig {
     }
 }
 
-pub(crate) enum HandlerExecution {
-    Finished(QueueHandlerOutcome),
+pub(crate) enum HandlerExecution<T> {
+    Finished(QueueHandlerOutcome<T>),
     Panicked,
     TimedOut,
 }
@@ -43,10 +43,10 @@ pub(crate) async fn execute_handler<T, H>(
     handler: &H,
     event: QueueEvent<T>,
     handler_timeout: Duration,
-) -> HandlerExecution
+) -> HandlerExecution<T>
 where
     T: Send + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerOutcome>,
+    H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerOutcome<T>>,
 {
     let handler_future = match catch_unwind(AssertUnwindSafe(|| handler(event))) {
         Ok(handler_future) => handler_future,
@@ -66,10 +66,10 @@ where
 }
 
 pub(crate) fn handler_outcome_or_log<T>(
-    execution: HandlerExecution,
+    execution: HandlerExecution<T>,
     event: &QueueEvent<T>,
     handler_timeout: Duration,
-) -> Option<QueueHandlerOutcome> {
+) -> Option<QueueHandlerOutcome<T>> {
     match execution {
         HandlerExecution::Finished(outcome) => Some(outcome),
         HandlerExecution::Panicked => {
@@ -96,17 +96,14 @@ pub(crate) async fn apply_handler_outcome<E, T>(
     queue: &Queue<E>,
     storage_key: &str,
     event: &QueueEvent<T>,
-    outcome: QueueHandlerOutcome,
+    outcome: QueueHandlerOutcome<T>,
 ) where
     E: TitoEngine,
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
     let result = match outcome {
         QueueHandlerOutcome::Acknowledge => queue.ack(storage_key).await,
-        QueueHandlerOutcome::ScheduleNextAt(timestamp) => queue
-            .schedule_next_at::<T>(storage_key, timestamp)
-            .await
-            .map(|_| ()),
+        QueueHandlerOutcome::Reschedule(next) => queue.reschedule(storage_key, next).await,
     };
     if let Err(error) = result {
         log::error!(
@@ -127,7 +124,11 @@ pub async fn run_worker<E, T, H>(
 where
     E: TitoEngine + 'static,
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerOutcome> + Clone + Send + Sync + 'static,
+    H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerOutcome<T>>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
 {
     tokio::spawn(async move {
         let mut handles = Vec::new();

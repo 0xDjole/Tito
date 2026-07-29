@@ -61,7 +61,7 @@ async fn main() -> Result<(), TitoError> {
             );
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             QueueHandlerOutcome::Acknowledge
-        }) as BoxFuture<'static, QueueHandlerOutcome>
+        }) as BoxFuture<'static, QueueHandlerOutcome<UserEvent>>
     };
 
     let worker_handle =

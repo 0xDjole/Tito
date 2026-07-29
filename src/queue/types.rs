@@ -8,21 +8,13 @@ pub enum QueueEventState {
     Completed,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum QueueCompletionReason {
-    #[default]
-    Acknowledged,
-    ScheduledNext,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QueueHandlerOutcome {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueHandlerOutcome<T> {
     Acknowledge,
-    ScheduleNextAt(i64),
+    Reschedule(QueueEvent<T>),
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct QueueEvent<T> {
@@ -34,8 +26,6 @@ pub struct QueueEvent<T> {
     pub state: QueueEventState,
     #[serde(default)]
     pub processed_at: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) completion_reason: Option<QueueCompletionReason>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,15 +48,14 @@ pub struct QueuePullPage<T> {
 }
 
 impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent<T> {
-    pub fn new(key: impl Into<String>, payload: T, due_at: i64) -> Self {
+    pub fn new(key: impl Into<String>, payload: T, timestamp: i64) -> Self {
         Self {
             id: queue_event_id(),
             key: key.into(),
             payload,
-            timestamp: due_at,
+            timestamp,
             state: QueueEventState::Pending,
             processed_at: None,
-            completion_reason: None,
         }
     }
 
@@ -82,22 +71,22 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent
         &self.payload
     }
 
-    pub fn completion_reason(&self) -> Option<QueueCompletionReason> {
-        match self.state {
-            QueueEventState::Pending => None,
-            QueueEventState::Completed => Some(self.completion_reason.unwrap_or_default()),
-        }
+    pub fn created_at_millis(&self) -> i64 {
+        self.id
+            .split_once('-')
+            .and_then(|(micros, _)| micros.parse::<i64>().ok())
+            .map(|micros| micros / 1_000)
+            .unwrap_or_else(|| self.timestamp.saturating_mul(1_000))
     }
 
-    pub(crate) fn successor_at(&self, timestamp: i64) -> Self {
+    pub fn rescheduled(&self, timestamp: i64) -> Self {
         Self {
-            id: queue_event_id(),
+            id: self.id.clone(),
             key: self.key.clone(),
             payload: self.payload.clone(),
             timestamp,
             state: QueueEventState::Pending,
             processed_at: None,
-            completion_reason: None,
         }
     }
 }

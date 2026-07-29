@@ -241,10 +241,7 @@ async fn cluster_worker_shutdown_drains_started_handler_and_persists_outcome_bef
         .unwrap();
     assert_eq!(completed.events.len(), 1);
     assert_eq!(completed.events[0].1.id, "cluster-drain");
-    assert_eq!(
-        completed.events[0].1.completion_reason(),
-        Some(QueueCompletionReason::Acknowledged)
-    );
+    assert_eq!(completed.events[0].1.state, QueueEventState::Completed);
     let pending = queue
         .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
         .await

@@ -2,7 +2,7 @@ use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
-fn queue_event_helpers_parse_key_and_update_schedule() {
+fn queue_event_helpers_read_the_event_timestamp() {
     let event = QueueEvent::new("entry:entry-1", queue_payload("payload"), 123);
 
     assert_eq!(event.key_type(), "entry");
@@ -33,7 +33,6 @@ fn queue_event_serialization_contains_no_retry_policy_metadata() {
         queue_payload("clean"),
         Utc::now().timestamp(),
     );
-    assert_eq!(event.completion_reason(), None);
     let value = serde_json::to_value(&event).unwrap();
 
     assert!(value.get("retryCount").is_none());
@@ -46,7 +45,7 @@ fn queue_event_serialization_contains_no_retry_policy_metadata() {
 }
 
 #[tokio::test]
-async fn queue_pending_key_orders_by_fixed_due_time_and_enqueue_generation() {
+async fn queue_pending_key_orders_by_event_timestamp_and_enqueue_generation() {
     let engine = engine();
     let queue = queue(engine, 1);
     queue
@@ -93,22 +92,19 @@ async fn queue_ack_preserves_malformed_pending_bytes() {
 
     assert!(matches!(error, TitoError::DeserializationFailed(_)));
     assert!(engine.contains_key(key).await);
-
-    let error = queue
-        .schedule_next_at::<QueuePayload>(key, Utc::now().timestamp() + 60)
-        .await
-        .unwrap_err();
-    assert!(matches!(error, TitoError::DeserializationFailed(_)));
-    assert!(engine.contains_key(key).await);
 }
 
 #[tokio::test]
-async fn queue_schedule_next_at_transaction_failure_leaves_exact_current_invocation_pending() {
+async fn queue_reschedule_atomically_completes_current_and_inserts_supplied_event() {
     let engine = engine();
-    let queue = queue(engine.clone(), 1);
-    let timestamp = Utc::now().timestamp() - 10;
+    let queue = queue(engine, 1);
+    let now = Utc::now().timestamp();
     queue
-        .publish(queue_event("event-1", "entry:1", timestamp))
+        .publish(QueueEvent::new(
+            "entry:1",
+            queue_payload("current"),
+            now - 1,
+        ))
         .await
         .unwrap();
     let (storage_key, current) = queue
@@ -119,23 +115,62 @@ async fn queue_schedule_next_at_transaction_failure_leaves_exact_current_invocat
         .into_iter()
         .next()
         .unwrap();
-    engine.fail_next_get("forced schedule read failure").await;
+    let next = current.rescheduled(now + 60);
+    let next_id = next.id.clone();
+    let created_at_millis = next.created_at_millis();
+    assert_eq!(next_id, current.id);
+    assert_eq!(created_at_millis, current.created_at_millis());
 
-    let error = queue
-        .schedule_next_at::<QueuePayload>(&storage_key, timestamp + 60)
-        .await
-        .unwrap_err();
+    queue.reschedule(&storage_key, next).await.unwrap();
 
-    assert!(matches!(error, TitoError::QueryFailed(_)));
     let pending = queue
         .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
         .await
         .unwrap();
     assert_eq!(pending.events.len(), 1);
-    assert_eq!(pending.events[0].0, storage_key);
-    assert_eq!(pending.events[0].1.id, current.id);
-    assert_eq!(pending.events[0].1.timestamp, current.timestamp);
-    assert_eq!(pending.events[0].1.completion_reason(), None);
+    assert_eq!(pending.events[0].1.id, next_id);
+    assert_eq!(pending.events[0].1.timestamp, now + 60);
+    let completed = queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(completed.events.len(), 1);
+    assert_eq!(completed.events[0].1.id, next_id);
+}
+
+#[tokio::test]
+async fn queue_reschedule_rejects_a_different_logical_event() {
+    let engine = engine();
+    let queue = queue(engine, 1);
+    let now = Utc::now().timestamp();
+    queue
+        .publish(queue_event("current", "entry:1", now - 1))
+        .await
+        .unwrap();
+    let (storage_key, _) = queue
+        .pull::<QueuePayload>(0, None, 10)
+        .await
+        .unwrap()
+        .events
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let error = queue
+        .reschedule(&storage_key, queue_event("different", "entry:1", now + 60))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, TitoError::InvalidInput(_)));
+    assert_eq!(
+        queue
+            .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+            .await
+            .unwrap()
+            .events
+            .len(),
+        1
+    );
     assert!(queue
         .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
         .await
@@ -154,40 +189,6 @@ async fn queue_rejects_negative_timestamps_without_creating_unreachable_rows() {
         .unwrap_err();
     assert!(matches!(error, TitoError::InvalidInput(_)));
     assert!(engine.keys_with_prefix("queue:").await.is_empty());
-
-    let timestamp = Utc::now().timestamp() - 10;
-    queue
-        .publish(queue_event("event-1", "entry:1", timestamp))
-        .await
-        .unwrap();
-    let (storage_key, current) = queue
-        .pull::<QueuePayload>(0, None, 10)
-        .await
-        .unwrap()
-        .events
-        .into_iter()
-        .next()
-        .unwrap();
-
-    let error = queue
-        .schedule_next_at::<QueuePayload>(&storage_key, -1)
-        .await
-        .unwrap_err();
-
-    assert!(matches!(error, TitoError::InvalidInput(_)));
-    let pending = queue
-        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
-        .await
-        .unwrap();
-    assert_eq!(pending.events.len(), 1);
-    assert_eq!(pending.events[0].0, storage_key);
-    assert_eq!(pending.events[0].1.id, current.id);
-    assert!(queue
-        .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
-        .await
-        .unwrap()
-        .events
-        .is_empty());
 }
 
 #[tokio::test]
@@ -225,65 +226,7 @@ async fn queue_ack_indeterminate_commit_converges_to_one_of_the_two_atomic_state
             assert!(pending.events.is_empty());
             assert_eq!(completed.events.len(), 1);
             assert_eq!(completed.events[0].1.id, current.id);
-            assert_eq!(
-                completed.events[0].1.completion_reason(),
-                Some(QueueCompletionReason::Acknowledged)
-            );
-        } else {
-            assert_eq!(pending.events.len(), 1);
-            assert_eq!(pending.events[0].0, storage_key);
-            assert_eq!(pending.events[0].1.id, current.id);
-            assert!(completed.events.is_empty());
-        }
-    }
-}
-
-#[tokio::test]
-async fn queue_schedule_next_indeterminate_commit_converges_to_one_of_the_two_atomic_states() {
-    for after_apply in [false, true] {
-        let engine = engine();
-        let queue = queue(engine.clone(), 1);
-        let timestamp = Utc::now().timestamp() - 10;
-        let next_timestamp = timestamp + 60;
-        queue
-            .publish(queue_event("event-1", "entry:1", timestamp))
-            .await
-            .unwrap();
-        let (storage_key, current) = queue
-            .pull::<QueuePayload>(0, None, 10)
-            .await
-            .unwrap()
-            .events
-            .into_iter()
-            .next()
-            .unwrap();
-        engine.make_next_commit_outcome_unknown(after_apply).await;
-
-        let error = queue
-            .schedule_next_at::<QueuePayload>(&storage_key, next_timestamp)
-            .await
-            .unwrap_err();
-
-        assert!(matches!(error, TitoError::CommitOutcomeUnknown(_)));
-        let pending = queue
-            .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
-            .await
-            .unwrap();
-        let completed = queue
-            .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
-            .await
-            .unwrap();
-        if after_apply {
-            assert_eq!(pending.events.len(), 1);
-            let successor = &pending.events[0].1;
-            assert_ne!(successor.id, current.id);
-            assert_eq!(successor.timestamp, next_timestamp);
-            assert_eq!(completed.events.len(), 1);
-            assert_eq!(completed.events[0].1.id, current.id);
-            assert_eq!(
-                completed.events[0].1.completion_reason(),
-                Some(QueueCompletionReason::ScheduledNext)
-            );
+            assert_eq!(completed.events[0].1.state, QueueEventState::Completed);
         } else {
             assert_eq!(pending.events.len(), 1);
             assert_eq!(pending.events[0].0, storage_key);
@@ -341,391 +284,6 @@ async fn queue_pull_cursor_advances_past_a_full_malformed_page() {
             .await
             .len(),
         50
-    );
-}
-
-#[tokio::test]
-async fn queue_pull_horizon_prevents_immediate_successors_from_starving_later_due_work() {
-    let engine = engine();
-    let queue = queue(engine, 1);
-    let immediate_due_at = Utc::now().timestamp() - 2;
-    let target_due_at = immediate_due_at + 1;
-
-    for index in 0..50 {
-        queue
-            .publish(queue_event(
-                &format!("immediate-{index:02}"),
-                &format!("entry:immediate-{index:02}"),
-                immediate_due_at,
-            ))
-            .await
-            .unwrap();
-    }
-    queue
-        .publish(queue_event(
-            "later-target",
-            "entry:later-target",
-            target_due_at,
-        ))
-        .await
-        .unwrap();
-
-    let mut cursor = None;
-    let mut scheduled_continuations = 0;
-    let mut reached_target = false;
-
-    for _ in 0..10 {
-        let page = queue
-            .pull::<QueuePayload>(0, cursor.take(), 50)
-            .await
-            .unwrap();
-        cursor = page.next_cursor;
-
-        for (storage_key, event) in page.events {
-            if event.id == "later-target" {
-                queue.ack(&storage_key).await.unwrap();
-                reached_target = true;
-            } else {
-                queue
-                    .schedule_next_at::<QueuePayload>(&storage_key, immediate_due_at)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                scheduled_continuations += 1;
-            }
-        }
-
-        if reached_target {
-            break;
-        }
-    }
-
-    assert!(
-        reached_target,
-        "fresh same-time successors must not keep an older pass ahead of a later due bucket"
-    );
-    assert_eq!(
-        scheduled_continuations, 50,
-        "each invocation present at the frozen horizon runs once before the later due target"
-    );
-}
-
-#[test]
-fn legacy_completed_queue_event_defaults_to_acknowledged_completion() {
-    let legacy = json!({
-        "id": "legacy-completed",
-        "key": "entry:legacy",
-        "payload": { "name": "legacy" },
-        "timestamp": 123,
-        "state": "completed",
-        "processedAt": 456
-    });
-    let event: QueueEvent<QueuePayload> = serde_json::from_value(legacy).unwrap();
-
-    assert_eq!(
-        event.completion_reason(),
-        Some(QueueCompletionReason::Acknowledged)
-    );
-}
-
-#[tokio::test]
-async fn queue_schedule_next_at_atomically_completes_current_and_creates_successor() {
-    let engine = engine();
-    let queue = queue(engine.clone(), 1);
-    let now = Utc::now().timestamp();
-    let original_timestamp = now - 10;
-    queue
-        .publish(queue_event("event-1", "entry:1", original_timestamp))
-        .await
-        .unwrap();
-    let (storage_key, current) = queue
-        .pull::<QueuePayload>(0, None, 10)
-        .await
-        .unwrap()
-        .events
-        .into_iter()
-        .next()
-        .unwrap();
-    let future_timestamp = now + 3_600;
-
-    let successor = queue
-        .schedule_next_at::<QueuePayload>(&storage_key, future_timestamp)
-        .await
-        .unwrap()
-        .unwrap();
-
-    assert!(!engine.contains_key(&storage_key).await);
-    assert_ne!(
-        successor.id, current.id,
-        "a planned continuation is a new queue invocation"
-    );
-    assert_eq!(successor.key, current.key);
-    assert_eq!(successor.payload, current.payload);
-    assert_eq!(successor.timestamp, future_timestamp);
-
-    let pending = queue
-        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
-        .await
-        .unwrap();
-    assert_eq!(pending.events.len(), 1);
-    assert_eq!(pending.events[0].1.id, successor.id);
-    assert_eq!(pending.events[0].1.completion_reason(), None);
-    assert!(
-        pending.events[0]
-            .0
-            .contains(&format!(":{future_timestamp:020}:")),
-        "the exact successor schedule belongs in its pending storage key"
-    );
-
-    let completed = queue
-        .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
-        .await
-        .unwrap();
-    assert_eq!(completed.events.len(), 1);
-    let completed_current = &completed.events[0].1;
-    assert_eq!(completed_current.id, current.id);
-    assert_eq!(completed_current.key, current.key);
-    assert_eq!(completed_current.payload, current.payload);
-    assert_eq!(completed_current.timestamp, current.timestamp);
-    assert_eq!(completed_current.state, QueueEventState::Completed);
-    assert!(completed_current.processed_at.is_some());
-    assert_eq!(
-        serde_json::to_value(completed_current).unwrap()["completionReason"],
-        json!("scheduled_next")
-    );
-    assert_eq!(
-        completed_current.completion_reason(),
-        Some(QueueCompletionReason::ScheduledNext)
-    );
-}
-
-#[tokio::test]
-async fn queue_schedule_next_at_allows_the_same_timestamp_with_a_new_event_id() {
-    let engine = engine();
-    let queue = queue(engine.clone(), 1);
-    let timestamp = Utc::now().timestamp() - 10;
-    queue
-        .publish(queue_event("event-1", "entry:1", timestamp))
-        .await
-        .unwrap();
-    let (storage_key, current) = queue
-        .pull::<QueuePayload>(0, None, 10)
-        .await
-        .unwrap()
-        .events
-        .into_iter()
-        .next()
-        .unwrap();
-
-    let successor = queue
-        .schedule_next_at::<QueuePayload>(&storage_key, timestamp)
-        .await
-        .unwrap()
-        .unwrap();
-
-    assert_ne!(successor.id, current.id);
-    assert_eq!(successor.timestamp, current.timestamp);
-    assert!(!engine.contains_key(&storage_key).await);
-    let pending = queue
-        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
-        .await
-        .unwrap();
-    assert_eq!(pending.events.len(), 1);
-    assert_eq!(pending.events[0].1.id, successor.id);
-    assert_ne!(
-        pending.events[0].0, storage_key,
-        "a new event ID creates a distinct pending key at the same timestamp"
-    );
-    let completed = queue
-        .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
-        .await
-        .unwrap();
-    assert_eq!(completed.events.len(), 1);
-    assert_eq!(completed.events[0].1.id, current.id);
-    assert_eq!(
-        completed.events[0].1.completion_reason(),
-        Some(QueueCompletionReason::ScheduledNext)
-    );
-}
-
-#[tokio::test]
-async fn duplicate_schedule_next_at_calls_create_only_one_successor() {
-    let engine = engine();
-    let queue = Arc::new(queue(engine, 1));
-    queue
-        .publish(queue_event(
-            "event-1",
-            "entry:1",
-            Utc::now().timestamp() - 10,
-        ))
-        .await
-        .unwrap();
-    let (storage_key, current) = queue
-        .pull::<QueuePayload>(0, None, 10)
-        .await
-        .unwrap()
-        .events
-        .into_iter()
-        .next()
-        .unwrap();
-    let timestamp = Utc::now().timestamp() + 3_600;
-
-    let first_queue = queue.clone();
-    let first_key = storage_key.clone();
-    let second_queue = queue.clone();
-    let second_key = storage_key.clone();
-    let (first, second) = tokio::join!(
-        async move {
-            first_queue
-                .schedule_next_at::<QueuePayload>(&first_key, timestamp)
-                .await
-                .unwrap()
-        },
-        async move {
-            second_queue
-                .schedule_next_at::<QueuePayload>(&second_key, timestamp)
-                .await
-                .unwrap()
-        }
-    );
-
-    assert_eq!(
-        usize::from(first.is_some()) + usize::from(second.is_some()),
-        1,
-        "only the transaction that still finds the exact pending key may create a successor"
-    );
-    let pending = queue
-        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
-        .await
-        .unwrap();
-    assert_eq!(pending.events.len(), 1);
-    assert_ne!(pending.events[0].1.id, current.id);
-    assert_ne!(
-        pending.events[0].0, storage_key,
-        "the successor invocation has a new event ID and pending storage key"
-    );
-    let completed = queue
-        .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
-        .await
-        .unwrap();
-    assert_eq!(completed.events.len(), 1);
-    assert_eq!(completed.events[0].1.id, current.id);
-    assert_eq!(
-        completed.events[0].1.completion_reason(),
-        Some(QueueCompletionReason::ScheduledNext)
-    );
-}
-
-#[tokio::test]
-async fn repeated_schedule_next_at_creates_completed_history_chain_without_loss_or_duplication() {
-    let engine = engine();
-    let queue = queue(engine, 1);
-    let now = Utc::now().timestamp();
-    queue
-        .publish(queue_event("event-1", "entry:1", now - 20))
-        .await
-        .unwrap();
-
-    let (first_key, first) = queue
-        .pull::<QueuePayload>(0, None, 10)
-        .await
-        .unwrap()
-        .events
-        .into_iter()
-        .next()
-        .unwrap();
-    let second = queue
-        .schedule_next_at::<QueuePayload>(&first_key, now - 10)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_ne!(second.id, first.id);
-
-    let (second_key, pulled_second) = queue
-        .pull::<QueuePayload>(0, None, 10)
-        .await
-        .unwrap()
-        .events
-        .into_iter()
-        .next()
-        .unwrap();
-    assert_eq!(pulled_second.id, second.id);
-    let third = queue
-        .schedule_next_at::<QueuePayload>(&second_key, now + 3_600)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_ne!(third.id, first.id);
-    assert_ne!(third.id, second.id);
-
-    let completed = queue
-        .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
-        .await
-        .unwrap();
-    assert_eq!(completed.events.len(), 2);
-    assert!(completed
-        .events
-        .iter()
-        .any(|(_, event)| event.id == first.id));
-    assert!(completed
-        .events
-        .iter()
-        .any(|(_, event)| event.id == second.id));
-    assert!(completed.events.iter().all(|(_, event)| {
-        event.completion_reason() == Some(QueueCompletionReason::ScheduledNext)
-    }));
-
-    let pending = queue
-        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
-        .await
-        .unwrap();
-    assert_eq!(pending.events.len(), 1);
-    assert_eq!(pending.events[0].1.id, third.id);
-    assert_eq!(pending.events[0].1.timestamp, now + 3_600);
-
-    queue.ack(&pending.events[0].0).await.unwrap();
-    assert!(queue
-        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
-        .await
-        .unwrap()
-        .events
-        .is_empty());
-    let completed = queue
-        .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
-        .await
-        .unwrap();
-    assert_eq!(completed.events.len(), 3);
-    assert!(completed
-        .events
-        .iter()
-        .any(|(_, event)| event.id == first.id));
-    assert!(completed
-        .events
-        .iter()
-        .any(|(_, event)| event.id == second.id));
-    assert!(completed
-        .events
-        .iter()
-        .any(|(_, event)| event.id == third.id));
-    assert_eq!(
-        completed
-            .events
-            .iter()
-            .filter(|(_, event)| {
-                event.completion_reason() == Some(QueueCompletionReason::ScheduledNext)
-            })
-            .count(),
-        2
-    );
-    assert_eq!(
-        completed
-            .events
-            .iter()
-            .filter(|(_, event)| {
-                event.completion_reason() == Some(QueueCompletionReason::Acknowledged)
-            })
-            .count(),
-        1
     );
 }
 
@@ -995,76 +553,6 @@ async fn standalone_worker_shutdown_drains_started_handler_before_join() {
 }
 
 #[tokio::test]
-async fn queue_worker_schedule_next_at_completes_current_and_creates_new_future_invocation() {
-    let engine = engine();
-    let queue = Arc::new(queue(engine, 1));
-    let now = Utc::now().timestamp();
-    let future_timestamp = now + 3_600;
-    queue
-        .publish(queue_event(
-            "worker-schedule",
-            "entry:worker-schedule",
-            now - 10,
-        ))
-        .await
-        .unwrap();
-    let processed = Arc::new(Notify::new());
-    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-    let handler_processed = processed.clone();
-
-    let handle = run_worker::<_, QueuePayload, _>(
-        queue.clone(),
-        WorkerConfig::new(0..1),
-        move |_event| {
-            let handler_processed = handler_processed.clone();
-            Box::pin(async move {
-                handler_processed.notify_one();
-                QueueHandlerOutcome::ScheduleNextAt(future_timestamp)
-            })
-        },
-        shutdown_rx,
-    )
-    .await;
-
-    timeout(Duration::from_secs(2), processed.notified())
-        .await
-        .unwrap();
-    timeout(Duration::from_secs(2), async {
-        loop {
-            let pending = queue
-                .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
-                .await
-                .unwrap();
-            if pending.events.len() == 1
-                && pending.events[0].1.id != "worker-schedule"
-                && pending.events[0].1.timestamp == future_timestamp
-            {
-                break;
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    let completed = queue
-        .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
-        .await
-        .unwrap();
-    assert_eq!(completed.events.len(), 1);
-    assert_eq!(completed.events[0].1.id, "worker-schedule");
-    assert_eq!(
-        completed.events[0].1.completion_reason(),
-        Some(QueueCompletionReason::ScheduledNext)
-    );
-
-    let _ = shutdown_tx.send(());
-    timeout(Duration::from_secs(2), handle)
-        .await
-        .unwrap()
-        .unwrap();
-}
-
-#[tokio::test]
 async fn queue_worker_does_not_let_unacknowledged_first_page_starve_later_rows() {
     let engine = engine();
     let queue = Arc::new(queue(engine, 1));
@@ -1094,7 +582,7 @@ async fn queue_worker_does_not_let_unacknowledged_first_page_starve_later_rows()
                     handler_target_processed.notify_one();
                     QueueHandlerOutcome::Acknowledge
                 } else {
-                    panic!("leave blocked invocation pending")
+                    panic!("simulated interrupted handler")
                 }
             })
         },

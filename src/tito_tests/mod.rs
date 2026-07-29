@@ -1,7 +1,6 @@
 use crate::key_encoder::safe_encode;
 use crate::queue::{
-    run_worker, Queue, QueueCompletionReason, QueueConfig, QueueEvent, QueueEventState,
-    QueueHandlerOutcome, WorkerConfig,
+    run_worker, Queue, QueueConfig, QueueEvent, QueueEventState, QueueHandlerOutcome, WorkerConfig,
 };
 use crate::test_support::MemoryEngine;
 use crate::types::{
@@ -338,14 +337,13 @@ fn queue_event(id: &str, key: &str, timestamp: i64) -> QueueEvent<QueuePayload> 
         timestamp,
         state: QueueEventState::Pending,
         processed_at: None,
-        completion_reason: None,
     }
 }
 
 async fn put_completed_queue_event(engine: &MemoryEngine, id: &str, processed_at: i64) -> String {
-    let scheduled_at = processed_at.saturating_sub(1);
-    let storage_key = format!("queue:completed:{processed_at:020}:{scheduled_at:020}:{id}");
-    let mut event = queue_event(id, &format!("entry:{id}"), scheduled_at);
+    let event_timestamp = processed_at.saturating_sub(1);
+    let storage_key = format!("queue:completed:{processed_at:020}:{event_timestamp:020}:{id}");
+    let mut event = queue_event(id, &format!("entry:{id}"), event_timestamp);
     event.state = QueueEventState::Completed;
     event.processed_at = Some(processed_at);
     engine

@@ -1,6 +1,6 @@
 # Tito
 
-A database layer on TiKV with indexing, relationships, transactions, and a built-in partitioned scheduled queue.
+A database layer on TiKV with indexing, relationships, transactions, and a built-in partitioned event queue.
 
 ## Features
 
@@ -11,7 +11,7 @@ A database layer on TiKV with indexing, relationships, transactions, and a built
 - **Query Builder**: Fluent API for querying by index
 - **Transactional Publication**: Queue events can be written atomically with application data
 - **Partitioned Queue**: Horizontal scaling via stable business-key partitions
-- **Scheduled Events**: Set timestamp for when events should fire
+- **Event Timestamps**: Each event says when it becomes runnable
 
 ## Connection
 
@@ -110,15 +110,16 @@ let results = query.value(&author_id).relationship("tags").execute().await?;
 
 ## Queue Processing
 
-Queue events are partitioned by their business key, can be scheduled for a non-negative Unix timestamp, and remain pending until the handler explicitly acknowledges them. Tito rejects negative timestamps instead of storing an invocation that polling cannot reach. Tito has no automatic retry policy, retry counter, backoff, failed state, or DLQ:
+Queue events are partitioned by their business key, carry their own non-negative Unix timestamp, and remain pending until the handler explicitly acknowledges them. Tito rejects negative timestamps instead of storing an event that polling cannot reach. Tito has no automatic retry policy, retry counter, backoff, failed state, or DLQ:
 
 - `QueueHandlerOutcome::Acknowledge` completes the current invocation.
-- `QueueHandlerOutcome::ScheduleNextAt(timestamp)` atomically completes the current invocation and creates a new pending invocation with a new event ID, the same business key and payload, and that exact next timestamp.
-- A handler panic, executor timeout, lost worker, or failure to persist either outcome leaves the current invocation unchanged and pending for redelivery.
+- `QueueHandlerOutcome::Reschedule(next_event)` atomically completes the current queue row and inserts the supplied replacement row.
+- A handler panic, executor timeout, lost worker, or queue-commit failure produces no persisted outcome, so the current invocation remains pending.
+
+Each event's own timestamp determines when it becomes runnable. Tito indexes that timestamp but never chooses or changes it. A domain that needs another invocation supplies a replacement event carrying the desired timestamp through `Reschedule`; Tito only commits the acknowledge-and-insert transaction. A replacement must preserve the logical event ID, partition key, and payload and may change only the timestamp. `QueueEvent::rescheduled` constructs that replacement, so replay-safe projections keep one identity across queue rows. Provider leases and processing deadlines belong only to domain records.
 
 Every new invocation must serialize to at most `MAX_QUEUE_EVENT_BYTES` (1 MiB). Publication rejects
-larger events before writing anything, and planned continuations enforce the same limit on their
-successor. Queue range reads preserve their public logical page size while fetching at most 16
+larger events before writing anything. Queue range reads preserve their public logical page size while fetching at most 16
 invocations per datastore scan. Tito configures both TiKV clients with a 32 MiB decoding budget, so
 the maximum 16 MiB of valid invocation bytes has at least 2x transport headroom for completed-state
 metadata, keys, and protobuf framing. This keeps one logical page from becoming one unbounded RPC
@@ -144,11 +145,17 @@ run_worker(
     queue,
     WorkerConfig::new(0..4),
     |event: QueueEvent<UserCreated>| async move {
-        match handle_user_created(event.payload).await {
-            Ok(()) => QueueHandlerOutcome::Acknowledge,
-            Err(_) => QueueHandlerOutcome::ScheduleNextAt(
-                chrono::Utc::now().timestamp().saturating_add(5),
-            ),
+        match handle_user_created(&event.payload).await {
+            Ok(None) => QueueHandlerOutcome::Acknowledge,
+            Ok(Some(next_at)) => {
+                QueueHandlerOutcome::Reschedule(event.rescheduled(next_at))
+            }
+            Err(error) => {
+                log::error!("Could not handle user creation: {error}");
+                QueueHandlerOutcome::Reschedule(event.rescheduled(
+                    chrono::Utc::now().timestamp().saturating_add(5),
+                ))
+            }
         }
     }
     .boxed(),
@@ -156,7 +163,7 @@ run_worker(
 ).await;
 ```
 
-`ScheduleNextAt` is an atomic planned continuation, not a queue retry policy. Tito checks that the exact current pending storage key still exists, moves that invocation to Completed with `processedAt` and `completionReason = scheduled_next`, and writes one new Pending invocation in the same transaction. `Acknowledge` records `completionReason = acknowledged`; legacy Completed rows without the field are exposed as acknowledged through `QueueEvent::completion_reason()`, while Pending rows return no completion reason. The successor has a new event ID, so the supplied timestamp may equal the current timestamp without colliding with the current storage key. Repeated continuations leave one ScheduledNext completed record per finished invocation and exactly one pending successor; the independent event IDs are deliberately not linked by another logical ID or lineage field. If concurrent consumers return `ScheduleNextAt` for the same current storage key, only the transaction that still owns that exact Pending row can complete it and create the single successor. Application handlers should choose one of these two outcomes rather than mutating queue state directly.
+`Reschedule` is not an automatic retry policy. The application decides whether another event exists and supplies the complete event, including its timestamp. Tito creates no successor on its own and never interprets provider or domain state.
 
 Workers supervise each handler with a ten-minute timeout by default. Configure `handler_timeout` when a workload has a different bounded execution contract; the timeout is executor protection and never changes queue state or provider policy.
 Worker shutdown stops new pulls and handler starts, then drains every handler that already started
@@ -165,14 +172,14 @@ timeout, lost worker, lost cluster partition lease, or queue-outcome storage fai
 invocation Pending.
 
 Partition polling is fair across due rows. Pending storage keys are ordered as
-`queue:pending:{partition:04}:{due_at:020}:{enqueue_version:020}:{event_id}`. The enqueue version is
+`queue:pending:{partition:04}:{timestamp:020}:{enqueue_version:020}:{event_id}`. The enqueue version is
 the datastore transaction's globally ordered start version; it is internal ordering metadata, not
 an invocation ID, provider identity, lease, or domain state. Each worker keeps an in-memory cursor
-for one bounded pass. The first pull freezes both the due-time boundary and transaction-version
+for one bounded pass. The first pull freezes both the runnable timestamp boundary and transaction-version
 horizon. Later pulls advance by raw storage row (including malformed rows) and jump over an entire
 due-time bucket when they encounter a row enqueued at or after that horizon. A handler can therefore
-create immediate same-time successors without keeping later due-time buckets behind them forever.
-After the pass is exhausted, polling wraps to the oldest due key and those successors become
+create immediate same-time events without keeping later timestamp buckets behind them forever.
+After the pass is exhausted, polling wraps to the oldest runnable key and those events become
 eligible. The cursor is executor state only: it is not persisted and does not encode retry policy.
 
 Completed invocation history has one fixed retention policy: standalone workers and the elected
@@ -185,17 +192,17 @@ work.
 
 ### Transaction retry safety
 
-Tito may replay a transaction closure after an explicitly retryable, determined datastore failure. TiKV's `UndeterminedError` is different: the commit may already be durable. Tito returns `TitoError::CommitOutcomeUnknown` and never replays that closure. The caller must reconcile against authoritative stored state; queue acknowledgement and `ScheduleNextAt` naturally converge because either the unchanged current Pending invocation is redelivered or its committed successor is delivered.
+Tito may replay a transaction closure after an explicitly retryable, determined datastore failure. TiKV's `UndeterminedError` is different: the commit may already be durable. Tito returns `TitoError::CommitOutcomeUnknown` and never replays that closure. The caller reconciles against authoritative domain state; an acknowledgement either committed or the unchanged Pending invocation is delivered again.
 
 ### Upgrade contract
 
 This release intentionally removes the former retry/DLQ metadata and changes Pending storage keys
-to include fixed-width due time and enqueue-version fields. It is not wire-compatible with workers
+to include the fixed-width event timestamp and enqueue-version fields. It is not wire-compatible with workers
 using either older queue protocol. Do not run old and new queue protocols together.
 
 For the prelaunch cutover, stop publishers and workers, use the old release to drain Pending and clear its Failed/DLQ keyspaces, verify Pending is empty, deploy the replacement environment, and then restart publication and processing. If a future nonempty production environment requires migration, build and deploy a separately named bridge release first; compatibility scaffolding is not part of this queue contract.
 
-## Scheduled Events
+## Future Events
 
 ```rust
 fn events(&self) -> Vec<TitoEventConfig> {
@@ -210,8 +217,8 @@ fn events(&self) -> Vec<TitoEventConfig> {
 ## Event Key Format
 
 ```
-queue:pending:{partition:04}:{due_at:020}:{enqueue_version:020}:{event_id}
-queue:completed:{processed_at:020}:{scheduled_at:020}:{event_id}
+queue:pending:{partition:04}:{timestamp:020}:{enqueue_version:020}:{event_id}
+queue:completed:{processed_at:020}:{event_timestamp:020}:{event_id}
 ```
 
 ## License
