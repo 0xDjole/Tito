@@ -7,9 +7,14 @@ use futures::future::BoxFuture;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch};
-use tokio::time::sleep;
+use tokio::time::{sleep, Instant};
 
-use super::{Queue, QueueEvent};
+use super::worker::{
+    apply_handler_outcome, execute_handler, handler_outcome_or_log, DEFAULT_HANDLER_TIMEOUT,
+};
+use super::{
+    Queue, QueueEvent, QueueHandlerOutcome, QueuePullCursor, COMPLETED_EVENT_MAINTENANCE_INTERVAL,
+};
 use crate::key_encoder::safe_encode;
 use crate::types::{TitoEngine, TitoTransaction, PARTITION_DIGITS};
 use crate::TitoError;
@@ -19,6 +24,7 @@ pub struct ClusterWorkerConfig {
     pub node_id: String,
     pub heartbeat_interval: Duration,
     pub poll_interval: Duration,
+    pub handler_timeout: Duration,
     pub lease_ttl: Duration,
     pub stale_node_ttl: Duration,
 }
@@ -29,6 +35,7 @@ impl ClusterWorkerConfig {
             node_id: node_id.into(),
             heartbeat_interval: Duration::from_secs(5),
             poll_interval: Duration::from_millis(500),
+            handler_timeout: DEFAULT_HANDLER_TIMEOUT,
             lease_ttl: Duration::from_secs(30),
             stale_node_ttl: Duration::from_secs(300),
         }
@@ -509,41 +516,54 @@ pub async fn run_cluster_worker<E, T, H>(
 where
     E: TitoEngine + 'static,
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<(), TitoError>>
+    H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerOutcome<T>>
         + Clone
         + Send
         + Sync
         + 'static,
 {
+    let maintenance_shutdown = shutdown.resubscribe();
     tokio::spawn(async move {
-        let mut rx = shutdown.resubscribe();
+        let (shutdown_latch, shutdown_latched) = watch::channel(false);
+        let mut shutdown_signal = shutdown;
         let mut partition_workers = BTreeMap::<u32, PartitionWorker>::new();
         let mut retired_partition_workers = Vec::<tokio::task::JoinHandle<()>>::new();
         let maintenance_queue = queue.clone();
         let maintenance_config = config.clone();
-        let maintenance_shutdown = shutdown.resubscribe();
         let maintenance_handle = tokio::spawn(async move {
             maintain_cluster_worker(maintenance_queue, maintenance_config, maintenance_shutdown)
                 .await;
         });
 
         loop {
-            if shutdown_requested(&mut rx) {
+            if shutdown_requested(&mut shutdown_signal) {
+                let _ = shutdown_latch.send(true);
                 break;
             }
 
-            reconcile_partition_workers(
-                queue.clone(),
-                config.clone(),
-                handler.clone(),
-                &mut partition_workers,
-                &mut retired_partition_workers,
-            )
-            .await;
+            tokio::select! {
+                biased;
+                _ = shutdown_signal.recv() => {
+                    let _ = shutdown_latch.send(true);
+                    break;
+                }
+                _ = reconcile_partition_workers(
+                    queue.clone(),
+                    config.clone(),
+                    handler.clone(),
+                    &mut partition_workers,
+                    &mut retired_partition_workers,
+                    shutdown_latched.clone(),
+                ) => {}
+            }
             reap_partition_workers(&mut retired_partition_workers).await;
 
             tokio::select! {
-                _ = rx.recv() => break,
+                biased;
+                _ = shutdown_signal.recv() => {
+                    let _ = shutdown_latch.send(true);
+                    break;
+                }
                 _ = sleep(config.poll_interval) => {}
             }
         }
@@ -565,10 +585,11 @@ async fn reconcile_partition_workers<E, T, H>(
     handler: H,
     partition_workers: &mut BTreeMap<u32, PartitionWorker>,
     retired_partition_workers: &mut Vec<tokio::task::JoinHandle<()>>,
+    shutdown: watch::Receiver<bool>,
 ) where
     E: TitoEngine + 'static,
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<(), TitoError>>
+    H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerOutcome<T>>
         + Clone
         + Send
         + Sync
@@ -585,7 +606,11 @@ async fn reconcile_partition_workers<E, T, H>(
     let stale_partitions = partition_workers
         .iter()
         .filter_map(|(partition, worker)| match owned.get(partition) {
-            Some(assignment) if assignment.generation == worker.generation => None,
+            Some(assignment)
+                if assignment.generation == worker.generation && !worker.handle.is_finished() =>
+            {
+                None
+            }
             _ => Some(*partition),
         })
         .collect::<Vec<_>>();
@@ -608,8 +633,18 @@ async fn reconcile_partition_workers<E, T, H>(
         let h = handler.clone();
         let partition = assignment.partition;
         let generation = assignment.generation;
+        let shutdown_rx = shutdown.clone();
         let handle = tokio::spawn(async move {
-            run_partition_worker(q, worker_config, partition, generation, h, stop_rx).await;
+            run_partition_worker(
+                q,
+                worker_config,
+                partition,
+                generation,
+                h,
+                stop_rx,
+                shutdown_rx,
+            )
+            .await;
         });
 
         partition_workers.insert(
@@ -658,65 +693,132 @@ async fn run_partition_worker<E, T, H>(
     partition: u32,
     generation: u64,
     handler: H,
-    mut stop: watch::Receiver<bool>,
+    stop: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) where
     E: TitoEngine + 'static,
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<(), TitoError>>
+    H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerOutcome<T>>
         + Clone
         + Send
         + Sync
         + 'static,
 {
+    let mut stop = PartitionWorkerStop {
+        retirement: stop,
+        shutdown,
+    };
+    let mut cursor: Option<QueuePullCursor> = None;
+
     loop {
-        if *stop.borrow() {
+        if partition_stop_requested(&mut stop) {
             break;
         }
 
-        let processed = process_partition_once(
+        if process_partition_once(
             queue.clone(),
             config.clone(),
             partition,
             generation,
             handler.clone(),
+            &mut cursor,
+            &mut stop,
         )
-        .await;
+        .await
+            == PartitionWorkerDirective::Stop
+        {
+            break;
+        }
 
-        if !processed {
-            tokio::select! {
-                _ = stop.changed() => break,
-                _ = sleep(config.poll_interval) => {}
-            }
+        tokio::select! {
+            biased;
+            _ = stop.retirement.changed() => break,
+            _ = stop.shutdown.changed() => break,
+            _ = sleep(config.poll_interval) => {}
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PartitionWorkerDirective {
+    Continue,
+    Stop,
+}
+
+struct PartitionWorkerStop {
+    retirement: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
+}
+
+fn partition_stop_requested(stop: &mut PartitionWorkerStop) -> bool {
+    *stop.retirement.borrow_and_update() || *stop.shutdown.borrow_and_update()
 }
 
 async fn maintain_cluster_worker<E>(
     queue: Arc<Queue<E>>,
     config: ClusterWorkerConfig,
-    shutdown: broadcast::Receiver<()>,
+    mut shutdown: broadcast::Receiver<()>,
 ) where
     E: TitoEngine + 'static,
 {
-    let mut rx = shutdown.resubscribe();
+    let mut next_completed_event_maintenance = Instant::now();
 
     loop {
-        if shutdown_requested(&mut rx) {
+        if shutdown_requested(&mut shutdown) {
             break;
         }
 
         if queue.heartbeat_cluster_worker(&config).await.is_ok() {
-            if matches!(
+            let is_coordinator = matches!(
                 queue.try_acquire_cluster_coordinator(&config).await,
                 Ok(true)
-            ) {
+            );
+            if is_coordinator {
                 let _ = queue.rebalance_cluster_partitions(&config).await;
+                let now = Instant::now();
+                if now >= next_completed_event_maintenance {
+                    loop {
+                        match queue
+                            .maintain_completed_event_retention(Utc::now().timestamp())
+                            .await
+                        {
+                            Ok(true) => {
+                                tokio::task::yield_now().await;
+                                if shutdown_requested(&mut shutdown) {
+                                    return;
+                                }
+                                if queue.heartbeat_cluster_worker(&config).await.is_err() {
+                                    break;
+                                }
+                                if !matches!(
+                                    queue.try_acquire_cluster_coordinator(&config).await,
+                                    Ok(true)
+                                ) {
+                                    break;
+                                }
+                                let _ = queue.rebalance_cluster_partitions(&config).await;
+                                if queue.sync_cluster_partition_leases(&config).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Ok(false) => break,
+                            Err(error) => {
+                                log::error!(
+                                    "Completed queue retention maintenance failed: {error}"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    next_completed_event_maintenance =
+                        Instant::now() + COMPLETED_EVENT_MAINTENANCE_INTERVAL;
+                }
             }
             let _ = queue.sync_cluster_partition_leases(&config).await;
         }
 
         tokio::select! {
-            _ = rx.recv() => break,
+            _ = shutdown.recv() => break,
             _ = sleep(config.heartbeat_interval) => {}
         }
     }
@@ -735,66 +837,81 @@ async fn process_partition_once<E, T, H>(
     partition: u32,
     generation: u64,
     handler: H,
-) -> bool
+    cursor: &mut Option<QueuePullCursor>,
+    stop: &mut PartitionWorkerStop,
+) -> PartitionWorkerDirective
 where
     E: TitoEngine + 'static,
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, Result<(), TitoError>>
+    H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerOutcome<T>>
         + Clone
         + Send
         + Sync
         + 'static,
 {
-    match queue.pull::<T>(partition, 50).await {
-        Ok(jobs) if jobs.is_empty() => false,
-        Ok(jobs) => {
-            for (storage_key, event) in jobs {
-                if !matches!(
-                    queue
+    let pull = tokio::select! {
+        biased;
+        _ = stop.retirement.changed() => return PartitionWorkerDirective::Stop,
+        _ = stop.shutdown.changed() => return PartitionWorkerDirective::Stop,
+        pull = queue.pull::<T>(partition, cursor.clone(), 50) => pull,
+    };
+
+    match pull {
+        Ok(page) => {
+            *cursor = page.next_cursor;
+            if page.events.is_empty() {
+                return PartitionWorkerDirective::Continue;
+            }
+
+            for (storage_key, event) in page.events {
+                if partition_stop_requested(stop) {
+                    return PartitionWorkerDirective::Stop;
+                }
+
+                let lease_is_current = tokio::select! {
+                    biased;
+                    _ = stop.retirement.changed() => return PartitionWorkerDirective::Stop,
+                    _ = stop.shutdown.changed() => return PartitionWorkerDirective::Stop,
+                    result = queue
                         .cluster_partition_lease_is_current(&config, partition, generation)
-                        .await,
-                    Ok(true)
-                ) {
+                        => matches!(result, Ok(true)),
+                };
+                if !lease_is_current {
                     continue;
                 }
 
-                match handler(event.clone()).await {
-                    Ok(_) => {
-                        if matches!(
-                            queue
-                                .cluster_partition_lease_is_current(&config, partition, generation)
-                                .await,
-                            Ok(true)
-                        ) {
-                            if let Err(error) = queue.ack(&storage_key).await {
-                                log::error!(
-                                    "Failed to acknowledge queue event {} at {}: {}",
-                                    event.id,
-                                    storage_key,
-                                    error
-                                );
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        if matches!(
-                            queue
-                                .cluster_partition_lease_is_current(&config, partition, generation)
-                                .await,
-                            Ok(true)
-                        ) {
-                            queue
-                                .retry_after_handler_error(event, &storage_key, err)
-                                .await;
-                        }
+                if partition_stop_requested(stop) {
+                    return PartitionWorkerDirective::Stop;
+                }
+
+                let execution =
+                    execute_handler(&handler, event.clone(), config.handler_timeout).await;
+                if let Some(outcome) =
+                    handler_outcome_or_log(execution, &event, config.handler_timeout)
+                {
+                    if matches!(
+                        queue
+                            .cluster_partition_lease_is_current(&config, partition, generation)
+                            .await,
+                        Ok(true)
+                    ) {
+                        apply_handler_outcome(&queue, &storage_key, &event, outcome).await;
                     }
                 }
+
+                if partition_stop_requested(stop) {
+                    return PartitionWorkerDirective::Stop;
+                }
             }
-            true
+            PartitionWorkerDirective::Continue
         }
         Err(_) => {
-            sleep(Duration::from_millis(500)).await;
-            false
+            tokio::select! {
+                biased;
+                _ = stop.retirement.changed() => PartitionWorkerDirective::Stop,
+                _ = stop.shutdown.changed() => PartitionWorkerDirective::Stop,
+                _ = sleep(Duration::from_millis(500)) => PartitionWorkerDirective::Continue,
+            }
         }
     }
 }

@@ -3,15 +3,18 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum QueueEventState {
-    #[serde(alias = "processing")]
     #[default]
     Pending,
     Completed,
-    #[serde(alias = "dead_letter")]
-    Failed,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueHandlerOutcome<T> {
+    Acknowledge,
+    Reschedule(QueueEvent<T>),
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct QueueEvent<T> {
@@ -20,14 +23,9 @@ pub struct QueueEvent<T> {
     pub payload: T,
     pub timestamp: i64,
     #[serde(default)]
-    pub(crate) original_scheduled_at: Option<i64>,
-    #[serde(default)]
     pub state: QueueEventState,
     #[serde(default)]
     pub processed_at: Option<i64>,
-    pub retry_count: u32,
-    pub max_retries: u32,
-    pub errors: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -36,36 +34,29 @@ pub struct QueueScanPage<T> {
     pub next_cursor: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuePullCursor {
+    pub(crate) next_start: Vec<u8>,
+    pub(crate) cycle_end: Vec<u8>,
+    pub(crate) enqueue_horizon: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueuePullPage<T> {
+    pub events: Vec<(String, QueueEvent<T>)>,
+    pub next_cursor: Option<QueuePullCursor>,
+}
+
 impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent<T> {
-    pub fn new(key: impl Into<String>, payload: T) -> Self {
-        let now = chrono::Utc::now().timestamp();
+    pub fn new(key: impl Into<String>, payload: T, timestamp: i64) -> Self {
         Self {
             id: queue_event_id(),
             key: key.into(),
             payload,
-            timestamp: now,
-            original_scheduled_at: Some(now),
+            timestamp,
             state: QueueEventState::Pending,
             processed_at: None,
-            retry_count: 0,
-            max_retries: 0,
-            errors: Vec::new(),
         }
-    }
-
-    pub fn scheduled_for(mut self, timestamp: i64) -> Self {
-        self.timestamp = timestamp;
-        self.original_scheduled_at = Some(timestamp);
-        self
-    }
-
-    pub fn original_scheduled_at(&self) -> i64 {
-        self.original_scheduled_at.unwrap_or(self.timestamp)
-    }
-
-    pub fn with_max_retries(mut self, max_retries: u32) -> Self {
-        self.max_retries = max_retries;
-        self
     }
 
     pub fn key_type(&self) -> &str {
@@ -78,6 +69,25 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent
 
     pub fn event(&self) -> &T {
         &self.payload
+    }
+
+    pub fn created_at_millis(&self) -> i64 {
+        self.id
+            .split_once('-')
+            .and_then(|(micros, _)| micros.parse::<i64>().ok())
+            .map(|micros| micros / 1_000)
+            .unwrap_or_else(|| self.timestamp.saturating_mul(1_000))
+    }
+
+    pub fn rescheduled(&self, timestamp: i64) -> Self {
+        Self {
+            id: self.id.clone(),
+            key: self.key.clone(),
+            payload: self.payload.clone(),
+            timestamp,
+            state: QueueEventState::Pending,
+            processed_at: None,
+        }
     }
 }
 

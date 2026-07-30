@@ -1,17 +1,73 @@
 use super::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
-fn queue_event_helpers_parse_key_and_update_builder_fields() {
-    let event = QueueEvent::new("entry:entry-1", queue_payload("payload"))
-        .scheduled_for(123)
-        .with_max_retries(5);
+fn queue_event_helpers_read_the_event_timestamp() {
+    let event = QueueEvent::new("entry:entry-1", queue_payload("payload"), 123);
 
     assert_eq!(event.key_type(), "entry");
     assert_eq!(event.key_value(), "entry-1");
     assert_eq!(event.event().name, "payload");
     assert_eq!(event.timestamp, 123);
-    assert_eq!(event.original_scheduled_at(), 123);
-    assert_eq!(event.max_retries, 5);
+}
+
+#[test]
+fn queue_state_has_no_failed_or_dead_letter_variant() {
+    assert_eq!(
+        serde_json::to_value(QueueEventState::Pending).unwrap(),
+        json!("pending")
+    );
+    assert_eq!(
+        serde_json::to_value(QueueEventState::Completed).unwrap(),
+        json!("completed")
+    );
+    assert!(serde_json::from_value::<QueueEventState>(json!("failed")).is_err());
+    assert!(serde_json::from_value::<QueueEventState>(json!("dead_letter")).is_err());
+    assert!(serde_json::from_value::<QueueEventState>(json!("processing")).is_err());
+}
+
+#[test]
+fn queue_event_serialization_contains_no_retry_policy_metadata() {
+    let event = QueueEvent::new(
+        "entry:clean",
+        queue_payload("clean"),
+        Utc::now().timestamp(),
+    );
+    let value = serde_json::to_value(&event).unwrap();
+
+    assert!(value.get("retryCount").is_none());
+    assert!(value.get("maxRetries").is_none());
+    assert!(value.get("errors").is_none());
+    assert!(
+        value.get("completionReason").is_none(),
+        "pending rows do not carry terminal completion metadata"
+    );
+}
+
+#[tokio::test]
+async fn queue_pending_key_orders_by_event_timestamp_and_enqueue_generation() {
+    let engine = engine();
+    let queue = queue(engine, 1);
+    queue
+        .publish(queue_event("event-1", "entry:1", 123))
+        .await
+        .unwrap();
+
+    let pending = queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+        .await
+        .unwrap();
+    let fields: Vec<_> = pending.events[0].0.splitn(6, ':').collect();
+
+    assert_eq!(fields.len(), 6);
+    assert_eq!(
+        &fields[..4],
+        ["queue", "pending", "0000", "00000000000000000123"]
+    );
+    assert_eq!(fields[4].len(), 20);
+    assert!(fields[4].bytes().all(|byte| byte.is_ascii_digit()));
+    assert!(fields[4].parse::<u64>().unwrap() > 0);
+    assert_eq!(fields[5], "event-1");
 }
 
 #[tokio::test]
@@ -19,122 +75,220 @@ async fn queue_ack_missing_key_is_noop() {
     let engine = engine();
     let queue = queue(engine, 1);
 
-    queue.ack("queue:pending:0000:1:missing").await.unwrap();
+    queue
+        .ack("queue:pending:0000:00000000000000000001:00000000000000000000:missing")
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
-async fn queue_ack_deletes_orphan_event_bytes() {
+async fn queue_ack_preserves_malformed_pending_bytes() {
     let engine = engine();
     let queue = queue(engine.clone(), 1);
-    let key = "queue:pending:0000:1:bad";
+    let key = "queue:pending:0000:00000000000000000001:00000000000000000000:bad";
     engine.put_raw(key, b"not-json".to_vec()).await;
 
-    queue.ack(key).await.unwrap();
+    let error = queue.ack(key).await.unwrap_err();
 
-    assert!(!engine.contains_key(key).await);
+    assert!(matches!(error, TitoError::DeserializationFailed(_)));
+    assert!(engine.contains_key(key).await);
 }
 
 #[tokio::test]
-async fn queue_reschedule_updates_due_time_but_preserves_original_schedule() {
-    let engine = engine();
-    let queue = queue(engine.clone(), 1);
-    let now = Utc::now().timestamp();
-    let original_timestamp = now - 10;
-    let mut legacy_event = queue_event("event-1", "entry:1", original_timestamp);
-    legacy_event.original_scheduled_at = None;
-    queue.publish(legacy_event).await.unwrap();
-
-    let pulled = queue.pull::<QueuePayload>(0, 10).await.unwrap();
-    assert_eq!(pulled.len(), 1);
-    let (old_storage_key, event) = pulled.into_iter().next().unwrap();
-    let future_timestamp = now + 3_600;
-
-    queue
-        .reschedule(event, &old_storage_key, future_timestamp)
-        .await
-        .unwrap();
-
-    assert!(!engine.contains_key(&old_storage_key).await);
-    assert!(queue.pull::<QueuePayload>(0, 10).await.unwrap().is_empty());
-    let page = queue
-        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
-        .await
-        .unwrap();
-    assert_eq!(page.events.len(), 1);
-    assert_eq!(page.events[0].1.timestamp, future_timestamp);
-    assert_eq!(page.events[0].1.original_scheduled_at(), original_timestamp);
-    assert!(
-        page.events[0].0.contains(&format!(":{future_timestamp}:")),
-        "retry not-before time belongs in the pending storage key"
-    );
-    let scheduled_after_now = queue
-        .find_by_state_after::<QueuePayload>(QueueEventState::Pending, now, 10)
-        .await
-        .unwrap();
-    assert_eq!(scheduled_after_now.len(), 1);
-    assert_eq!(scheduled_after_now[0].1.id, "event-1");
-}
-
-#[test]
-fn queue_event_without_original_schedule_falls_back_to_timestamp() {
-    let legacy = serde_json::json!({
-        "id": "legacy-event",
-        "key": "entry:legacy",
-        "payload": { "name": "legacy" },
-        "timestamp": 123,
-        "state": "pending",
-        "processedAt": null,
-        "retryCount": 0,
-        "maxRetries": 3,
-        "errors": []
-    });
-    let event: QueueEvent<QueuePayload> = serde_json::from_value(legacy).unwrap();
-
-    assert_eq!(event.original_scheduled_at, None);
-    assert_eq!(event.original_scheduled_at(), 123);
-}
-
-#[test]
-fn queue_retry_backoff_is_exponential_and_capped() {
-    assert_eq!(retry_backoff_seconds(1), 2);
-    assert_eq!(retry_backoff_seconds(7), 128);
-    assert_eq!(retry_backoff_seconds(8), 256);
-    assert_eq!(retry_backoff_seconds(9), 300);
-    assert_eq!(retry_backoff_seconds(u32::MAX), 300);
-}
-
-#[tokio::test]
-async fn queue_move_to_dlq_is_failed_alias() {
+async fn queue_reschedule_atomically_completes_current_and_inserts_supplied_event() {
     let engine = engine();
     let queue = queue(engine, 1);
+    let now = Utc::now().timestamp();
     queue
-        .publish(queue_event(
-            "event-1",
+        .publish(QueueEvent::new(
             "entry:1",
-            Utc::now().timestamp() - 10,
+            queue_payload("current"),
+            now - 1,
         ))
         .await
         .unwrap();
-    let (storage_key, event) = queue
-        .pull::<QueuePayload>(0, 10)
+    let (storage_key, current) = queue
+        .pull::<QueuePayload>(0, None, 10)
         .await
         .unwrap()
+        .events
+        .into_iter()
+        .next()
+        .unwrap();
+    let next = current.rescheduled(now + 60);
+    let next_id = next.id.clone();
+    let created_at_millis = next.created_at_millis();
+    assert_eq!(next_id, current.id);
+    assert_eq!(created_at_millis, current.created_at_millis());
+
+    queue.reschedule(&storage_key, next).await.unwrap();
+
+    let pending = queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(pending.events.len(), 1);
+    assert_eq!(pending.events[0].1.id, next_id);
+    assert_eq!(pending.events[0].1.timestamp, now + 60);
+    let completed = queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(completed.events.len(), 1);
+    assert_eq!(completed.events[0].1.id, next_id);
+}
+
+#[tokio::test]
+async fn queue_reschedule_rejects_a_different_logical_event() {
+    let engine = engine();
+    let queue = queue(engine, 1);
+    let now = Utc::now().timestamp();
+    queue
+        .publish(queue_event("current", "entry:1", now - 1))
+        .await
+        .unwrap();
+    let (storage_key, _) = queue
+        .pull::<QueuePayload>(0, None, 10)
+        .await
+        .unwrap()
+        .events
         .into_iter()
         .next()
         .unwrap();
 
-    queue.move_to_dlq(event, &storage_key).await.unwrap();
-
-    let failed = queue
-        .find_by_state_after::<QueuePayload>(QueueEventState::Failed, 0, 10)
+    let error = queue
+        .reschedule(&storage_key, queue_event("different", "entry:1", now + 60))
         .await
-        .unwrap();
-    assert_eq!(failed.len(), 1);
-    assert_eq!(failed[0].1.state, QueueEventState::Failed);
+        .unwrap_err();
+
+    assert!(matches!(error, TitoError::InvalidInput(_)));
+    assert_eq!(
+        queue
+            .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+            .await
+            .unwrap()
+            .events
+            .len(),
+        1
+    );
+    assert!(queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
+        .await
+        .unwrap()
+        .events
+        .is_empty());
 }
 
 #[tokio::test]
-async fn queue_clear_removes_pending_completed_failed_and_dlq_rows() {
+async fn queue_rejects_negative_timestamps_without_creating_unreachable_rows() {
+    let engine = engine();
+    let queue = queue(engine.clone(), 1);
+    let error = queue
+        .publish(queue_event("negative-event", "entry:negative", -1))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, TitoError::InvalidInput(_)));
+    assert!(engine.keys_with_prefix("queue:").await.is_empty());
+}
+
+#[tokio::test]
+async fn queue_ack_indeterminate_commit_converges_to_one_of_the_two_atomic_states() {
+    for after_apply in [false, true] {
+        let engine = engine();
+        let queue = queue(engine.clone(), 1);
+        let timestamp = Utc::now().timestamp() - 10;
+        queue
+            .publish(queue_event("event-1", "entry:1", timestamp))
+            .await
+            .unwrap();
+        let (storage_key, current) = queue
+            .pull::<QueuePayload>(0, None, 10)
+            .await
+            .unwrap()
+            .events
+            .into_iter()
+            .next()
+            .unwrap();
+        engine.make_next_commit_outcome_unknown(after_apply).await;
+
+        let error = queue.ack(&storage_key).await.unwrap_err();
+
+        assert!(matches!(error, TitoError::CommitOutcomeUnknown(_)));
+        let pending = queue
+            .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+            .await
+            .unwrap();
+        let completed = queue
+            .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
+            .await
+            .unwrap();
+        if after_apply {
+            assert!(pending.events.is_empty());
+            assert_eq!(completed.events.len(), 1);
+            assert_eq!(completed.events[0].1.id, current.id);
+            assert_eq!(completed.events[0].1.state, QueueEventState::Completed);
+        } else {
+            assert_eq!(pending.events.len(), 1);
+            assert_eq!(pending.events[0].0, storage_key);
+            assert_eq!(pending.events[0].1.id, current.id);
+            assert!(completed.events.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn queue_pull_preserves_malformed_pending_bytes() {
+    let engine = engine();
+    let queue = queue(engine.clone(), 1);
+    let key = "queue:pending:0000:00000000000000000000:00000000000000000000:bad";
+    engine.put_raw(key, b"not-json".to_vec()).await;
+
+    let pulled = queue.pull::<QueuePayload>(0, None, 10).await.unwrap();
+
+    assert!(pulled.events.is_empty());
+    assert!(engine.contains_key(key).await);
+}
+
+#[tokio::test]
+async fn queue_pull_cursor_advances_past_a_full_malformed_page() {
+    let engine = engine();
+    let queue = queue(engine.clone(), 1);
+    for index in 0..50 {
+        let key =
+            format!("queue:pending:0000:00000000000000000000:00000000000000000000:bad-{index:02}");
+        engine.put_raw(&key, b"not-json".to_vec()).await;
+    }
+    queue
+        .publish(queue_event(
+            "zz-valid",
+            "entry:zz-valid",
+            Utc::now().timestamp() - 10,
+        ))
+        .await
+        .unwrap();
+
+    let first = queue.pull::<QueuePayload>(0, None, 50).await.unwrap();
+    assert!(first.events.is_empty());
+    assert!(first.next_cursor.is_some());
+
+    let second = queue
+        .pull::<QueuePayload>(0, first.next_cursor, 50)
+        .await
+        .unwrap();
+    assert_eq!(second.events.len(), 1);
+    assert_eq!(second.events[0].1.id, "zz-valid");
+    assert!(second.next_cursor.is_none());
+    assert_eq!(
+        engine
+            .keys_with_prefix("queue:pending:0000:00000000000000000000:00000000000000000000:bad-",)
+            .await
+            .len(),
+        50
+    );
+}
+
+#[tokio::test]
+async fn queue_clear_removes_pending_and_completed_rows() {
     let engine = engine();
     let queue = queue(engine.clone(), 1);
     let now = Utc::now().timestamp();
@@ -142,16 +296,10 @@ async fn queue_clear_removes_pending_completed_failed_and_dlq_rows() {
     let mut completed = queue_event("completed", "entry:completed", now);
     completed.state = QueueEventState::Completed;
     completed.processed_at = Some(now);
-    let mut failed = queue_event("failed", "entry:failed", now);
-    failed.state = QueueEventState::Failed;
-    failed.processed_at = Some(now);
-    let mut dlq = queue_event("dlq", "entry:dlq", now);
-    dlq.state = QueueEventState::Failed;
-    dlq.processed_at = Some(now);
 
     engine
         .put_raw(
-            "queue:pending:0000:1:pending",
+            "queue:pending:0000:00000000000000000001:00000000000000000000:pending",
             serde_json::to_vec(&pending).unwrap(),
         )
         .await;
@@ -161,16 +309,6 @@ async fn queue_clear_removes_pending_completed_failed_and_dlq_rows() {
             serde_json::to_vec(&completed).unwrap(),
         )
         .await;
-    engine
-        .put_raw(
-            "queue:failed:0000:1:failed",
-            serde_json::to_vec(&failed).unwrap(),
-        )
-        .await;
-    engine
-        .put_raw("queue:dlq:0000:1:dlq", serde_json::to_vec(&dlq).unwrap())
-        .await;
-
     queue.clear().await.unwrap();
 
     assert!(engine.keys_with_prefix("queue:").await.is_empty());
@@ -187,6 +325,79 @@ async fn queue_delete_by_state_before_rejects_pending_state() {
         .unwrap_err();
 
     assert!(matches!(error, TitoError::InvalidInput(_)));
+}
+
+#[tokio::test]
+async fn queue_completed_retention_uses_the_terminal_time_index_not_value_decoding() {
+    let engine = engine();
+    let queue = queue(engine.clone(), 1);
+    let cutoff = Utc::now().timestamp() - 1;
+    let malformed_key = format!(
+        "queue:completed:{:020}:00000000000000000000:malformed",
+        cutoff - 1
+    );
+    engine.put_raw(&malformed_key, b"not-json".to_vec()).await;
+
+    let deleted = queue
+        .delete_by_state_before(QueueEventState::Completed, cutoff, 10)
+        .await
+        .unwrap();
+
+    assert_eq!(deleted, 1);
+    assert!(!engine.contains_key(&malformed_key).await);
+}
+
+#[tokio::test]
+async fn standalone_worker_enforces_fixed_completed_history_retention() {
+    const THREE_DAYS_SECONDS: i64 = 3 * 24 * 60 * 60;
+
+    let engine = engine();
+    let queue = Arc::new(queue(engine.clone(), 1));
+    let now = Utc::now().timestamp();
+    let expired_count = crate::queue::COMPLETED_EVENT_MAINTENANCE_BATCH_SIZE as usize
+        * crate::queue::COMPLETED_EVENT_MAINTENANCE_MAX_BATCHES
+        + 1;
+    let mut last_expired_key = String::new();
+    for index in 0..expired_count {
+        last_expired_key = put_completed_queue_event(
+            &engine,
+            &format!("expired-{index:05}"),
+            now - THREE_DAYS_SECONDS - 1,
+        )
+        .await;
+    }
+    let retained_key =
+        put_completed_queue_event(&engine, "retained", now - THREE_DAYS_SECONDS + 60).await;
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+
+    let handle = run_worker(
+        queue,
+        WorkerConfig::new(0..1),
+        |_event: QueueEvent<QueuePayload>| {
+            Box::pin(async move { QueueHandlerOutcome::Acknowledge })
+        },
+        shutdown_rx,
+    )
+    .await;
+
+    timeout(Duration::from_secs(5), async {
+        while engine.contains_key(&last_expired_key).await {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        engine.keys_with_prefix("queue:completed:").await,
+        vec![retained_key.clone()]
+    );
+    assert!(engine.contains_key(&retained_key).await);
+
+    let _ = shutdown_tx.send(());
+    timeout(Duration::from_secs(2), handle)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]
@@ -213,7 +424,7 @@ async fn queue_scan_cursor_continues_after_previous_page() {
 }
 
 #[tokio::test]
-async fn queue_worker_acks_successful_jobs() {
+async fn queue_worker_acknowledges_successful_jobs() {
     let engine = engine();
     let queue = Arc::new(queue(engine, 1));
     queue
@@ -230,15 +441,13 @@ async fn queue_worker_acks_successful_jobs() {
 
     let handle = run_worker::<_, QueuePayload, _>(
         queue.clone(),
-        WorkerConfig {
-            partition_range: 0..1,
-        },
+        WorkerConfig::new(0..1),
         move |event| {
             let handler_processed = handler_processed.clone();
             Box::pin(async move {
                 assert_eq!(event.id, "worker-success");
                 handler_processed.notify_one();
-                Ok(())
+                QueueHandlerOutcome::Acknowledge
             })
         },
         shutdown_rx,
@@ -248,15 +457,313 @@ async fn queue_worker_acks_successful_jobs() {
     timeout(Duration::from_secs(2), processed.notified())
         .await
         .unwrap();
+    wait_for_completed(&queue, "worker-success").await;
+
+    let _ = shutdown_tx.send(());
+    timeout(Duration::from_secs(2), handle)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+        .await
+        .unwrap()
+        .events
+        .is_empty());
+}
+
+#[tokio::test]
+async fn standalone_worker_shutdown_drains_started_handler_before_join() {
+    let engine = engine();
+    let queue = Arc::new(queue(engine, 1));
+    let now = Utc::now().timestamp() - 10;
+    queue
+        .publish(queue_event(
+            "standalone-drain",
+            "entry:standalone-drain",
+            now,
+        ))
+        .await
+        .unwrap();
+    queue
+        .publish(queue_event(
+            "standalone-second",
+            "entry:standalone-second",
+            now,
+        ))
+        .await
+        .unwrap();
+
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let handler_started = started.clone();
+    let handler_release = release.clone();
+    let handler_attempts = attempts.clone();
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let mut handle = run_worker::<_, QueuePayload, _>(
+        queue.clone(),
+        WorkerConfig::new(0..1),
+        move |event| {
+            let handler_started = handler_started.clone();
+            let handler_release = handler_release.clone();
+            let handler_attempts = handler_attempts.clone();
+            Box::pin(async move {
+                handler_attempts.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(event.id, "standalone-drain");
+                handler_started.notify_one();
+                handler_release.notified().await;
+                QueueHandlerOutcome::Acknowledge
+            })
+        },
+        shutdown_rx,
+    )
+    .await;
+
+    timeout(Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+    let _ = shutdown_tx.send(());
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !handle.is_finished(),
+        "worker joined before its started handler drained"
+    );
+
+    release.notify_one();
+    timeout(Duration::from_secs(2), &mut handle)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    let completed = queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(completed.events.len(), 1);
+    assert_eq!(completed.events[0].1.id, "standalone-drain");
+    let pending = queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(pending.events.len(), 1);
+    assert_eq!(pending.events[0].1.id, "standalone-second");
+}
+
+#[tokio::test]
+async fn queue_worker_does_not_let_unacknowledged_first_page_starve_later_rows() {
+    let engine = engine();
+    let queue = Arc::new(queue(engine, 1));
+    let timestamp = Utc::now().timestamp() - 10;
+    for index in 0..50 {
+        let id = format!("blocked-{index:02}");
+        queue
+            .publish(queue_event(&id, &format!("entry:{id}"), timestamp))
+            .await
+            .unwrap();
+    }
+    queue
+        .publish(queue_event("zz-target", "entry:zz-target", timestamp))
+        .await
+        .unwrap();
+
+    let target_processed = Arc::new(Notify::new());
+    let handler_target_processed = target_processed.clone();
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let handle = run_worker::<_, QueuePayload, _>(
+        queue.clone(),
+        WorkerConfig::new(0..1),
+        move |event| {
+            let handler_target_processed = handler_target_processed.clone();
+            Box::pin(async move {
+                if event.id == "zz-target" {
+                    handler_target_processed.notify_one();
+                    QueueHandlerOutcome::Acknowledge
+                } else {
+                    panic!("simulated interrupted handler")
+                }
+            })
+        },
+        shutdown_rx,
+    )
+    .await;
+
+    timeout(Duration::from_secs(3), target_processed.notified())
+        .await
+        .unwrap();
+    wait_for_completed(&queue, "zz-target").await;
+
+    let _ = shutdown_tx.send(());
+    timeout(Duration::from_secs(2), handle)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn queue_worker_contains_panic_and_redelivers_the_pending_invocation() {
+    let engine = engine();
+    let queue = Arc::new(queue(engine, 1));
+    queue
+        .publish(queue_event(
+            "worker-panic",
+            "entry:worker-panic",
+            Utc::now().timestamp() - 10,
+        ))
+        .await
+        .unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let processed = Arc::new(Notify::new());
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let handler_attempts = attempts.clone();
+    let handler_processed = processed.clone();
+
+    let handle = run_worker::<_, QueuePayload, _>(
+        queue.clone(),
+        WorkerConfig::new(0..1),
+        move |event| {
+            let handler_attempts = handler_attempts.clone();
+            let handler_processed = handler_processed.clone();
+            Box::pin(async move {
+                assert_eq!(event.id, "worker-panic");
+                if handler_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("simulated handler panic");
+                }
+                handler_processed.notify_one();
+                QueueHandlerOutcome::Acknowledge
+            })
+        },
+        shutdown_rx,
+    )
+    .await;
+
+    timeout(Duration::from_secs(3), processed.notified())
+        .await
+        .unwrap();
+    wait_for_completed(&queue, "worker-panic").await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+    let _ = shutdown_tx.send(());
+    timeout(Duration::from_secs(2), handle)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn queue_worker_contains_synchronous_handler_panic_and_redelivers() {
+    let engine = engine();
+    let queue = Arc::new(queue(engine, 1));
+    queue
+        .publish(queue_event(
+            "worker-sync-panic",
+            "entry:worker-sync-panic",
+            Utc::now().timestamp() - 10,
+        ))
+        .await
+        .unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let processed = Arc::new(Notify::new());
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let handler_attempts = attempts.clone();
+    let handler_processed = processed.clone();
+
+    let handle = run_worker::<_, QueuePayload, _>(
+        queue.clone(),
+        WorkerConfig::new(0..1),
+        move |event| {
+            assert_eq!(event.id, "worker-sync-panic");
+            if handler_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("simulated synchronous handler panic");
+            }
+            let handler_processed = handler_processed.clone();
+            Box::pin(async move {
+                handler_processed.notify_one();
+                QueueHandlerOutcome::Acknowledge
+            })
+        },
+        shutdown_rx,
+    )
+    .await;
+
+    timeout(Duration::from_secs(3), processed.notified())
+        .await
+        .unwrap();
+    wait_for_completed(&queue, "worker-sync-panic").await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+    let _ = shutdown_tx.send(());
+    timeout(Duration::from_secs(2), handle)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn queue_worker_times_out_handler_and_redelivers_pending_invocation() {
+    let engine = engine();
+    let queue = Arc::new(queue(engine, 1));
+    queue
+        .publish(queue_event(
+            "worker-timeout",
+            "entry:worker-timeout",
+            Utc::now().timestamp() - 10,
+        ))
+        .await
+        .unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let processed = Arc::new(Notify::new());
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let handler_attempts = attempts.clone();
+    let handler_processed = processed.clone();
+    let mut config = WorkerConfig::new(0..1);
+    config.handler_timeout = Duration::from_millis(20);
+
+    let handle = run_worker::<_, QueuePayload, _>(
+        queue.clone(),
+        config,
+        move |event| {
+            let attempt = handler_attempts.fetch_add(1, Ordering::SeqCst);
+            let handler_processed = handler_processed.clone();
+            Box::pin(async move {
+                assert_eq!(event.id, "worker-timeout");
+                if attempt == 0 {
+                    std::future::pending::<()>().await;
+                }
+                handler_processed.notify_one();
+                QueueHandlerOutcome::Acknowledge
+            })
+        },
+        shutdown_rx,
+    )
+    .await;
+
+    timeout(Duration::from_secs(3), processed.notified())
+        .await
+        .unwrap();
+    wait_for_completed(&queue, "worker-timeout").await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+    let _ = shutdown_tx.send(());
+    timeout(Duration::from_secs(2), handle)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+async fn wait_for_completed(queue: &Arc<Queue<MemoryEngine>>, event_id: &str) {
     timeout(Duration::from_secs(2), async {
         loop {
             let completed = queue
-                .find_by_state_after::<QueuePayload>(QueueEventState::Completed, 0, 10)
+                .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
                 .await
                 .unwrap();
             if completed
+                .events
                 .iter()
-                .any(|(_, event)| event.id == "worker-success")
+                .any(|(_, event)| event.id == event_id)
             {
                 break;
             }
@@ -265,119 +772,4 @@ async fn queue_worker_acks_successful_jobs() {
     })
     .await
     .unwrap();
-
-    let _ = shutdown_tx.send(());
-    timeout(Duration::from_secs(2), handle)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(queue
-        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
-        .await
-        .unwrap()
-        .events
-        .is_empty());
-}
-
-#[tokio::test]
-async fn queue_worker_moves_exhausted_retries_to_failed() {
-    let engine = engine();
-    let queue = Arc::new(queue(engine, 1));
-    let mut event = queue_event(
-        "worker-failed",
-        "entry:worker-failed",
-        Utc::now().timestamp() - 10,
-    );
-    event.max_retries = 0;
-    queue.publish(event).await.unwrap();
-    let processed = Arc::new(Notify::new());
-    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-    let handler_processed = processed.clone();
-
-    let handle = run_worker::<_, QueuePayload, _>(
-        queue.clone(),
-        WorkerConfig {
-            partition_range: 0..1,
-        },
-        move |_event| {
-            let handler_processed = handler_processed.clone();
-            Box::pin(async move {
-                handler_processed.notify_one();
-                Err(TitoError::Internal("handler failed".to_string()))
-            })
-        },
-        shutdown_rx,
-    )
-    .await;
-
-    timeout(Duration::from_secs(2), processed.notified())
-        .await
-        .unwrap();
-    timeout(Duration::from_secs(2), async {
-        loop {
-            let failed = queue
-                .find_by_state_after::<QueuePayload>(QueueEventState::Failed, 0, 10)
-                .await
-                .unwrap();
-            if failed.iter().any(|(_, event)| {
-                event.id == "worker-failed"
-                    && event.retry_count == 1
-                    && event.errors == vec!["Unexpected error: handler failed".to_string()]
-            }) {
-                break;
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-
-    let _ = shutdown_tx.send(());
-    timeout(Duration::from_secs(2), handle)
-        .await
-        .unwrap()
-        .unwrap();
-}
-
-#[tokio::test]
-async fn queue_deferral_reschedules_without_spending_retry_budget() {
-    let engine = engine();
-    let queue = queue(engine, 1);
-    let original_schedule = Utc::now().timestamp() - 10;
-    let mut event = queue_event(
-        "worker-deferred",
-        "entry:worker-deferred",
-        original_schedule,
-    );
-    event.max_retries = 0;
-    queue.publish(event).await.unwrap();
-    let (storage_key, event) = queue
-        .pull::<QueuePayload>(0, 1)
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
-    let error = TitoError::Deferred("runtime fence is active".to_string());
-    queue
-        .retry_after_handler_error(event, &storage_key, error)
-        .await;
-
-    let pending = queue
-        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
-        .await
-        .unwrap()
-        .events
-        .pop()
-        .unwrap()
-        .1;
-    assert_eq!(pending.state, QueueEventState::Pending);
-    assert!(pending.timestamp > original_schedule);
-    assert_eq!(pending.retry_count, 0);
-    assert!(pending.errors.is_empty());
-    assert_eq!(pending.original_scheduled_at(), original_schedule);
-    assert!(queue
-        .find_by_state_after::<QueuePayload>(QueueEventState::Failed, 0, 10)
-        .await
-        .unwrap()
-        .is_empty());
 }

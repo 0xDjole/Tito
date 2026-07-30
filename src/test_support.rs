@@ -5,6 +5,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -12,6 +13,9 @@ use tokio::sync::Mutex;
 pub(crate) struct MemoryEngine {
     data: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
     next_get_error: Arc<Mutex<Option<String>>>,
+    next_commit_unknown_after_apply: Arc<Mutex<Option<bool>>>,
+    next_transaction_version: Arc<AtomicU64>,
+    pending_queue_scans: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -19,6 +23,9 @@ pub(crate) struct MemoryTransaction {
     data: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
     local: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
     next_get_error: Arc<Mutex<Option<String>>>,
+    next_commit_unknown_after_apply: Arc<Mutex<Option<bool>>>,
+    start_version: u64,
+    pending_queue_scans: Arc<AtomicU64>,
 }
 
 impl MemoryEngine {
@@ -35,6 +42,14 @@ impl MemoryEngine {
 
     pub(crate) async fn fail_next_get(&self, message: &str) {
         *self.next_get_error.lock().await = Some(message.to_string());
+    }
+
+    pub(crate) async fn make_next_commit_outcome_unknown(&self, after_apply: bool) {
+        *self.next_commit_unknown_after_apply.lock().await = Some(after_apply);
+    }
+
+    pub(crate) fn pending_queue_scan_count(&self) -> u64 {
+        self.pending_queue_scans.load(Ordering::SeqCst)
     }
 
     pub(crate) async fn raw_bytes(&self, key: &str) -> Option<Vec<u8>> {
@@ -68,10 +83,17 @@ impl TitoEngine for MemoryEngine {
 
     async fn begin_transaction(&self) -> Result<Self::Transaction, TitoError> {
         let snapshot = self.data.lock().await.clone();
+        let start_version = self
+            .next_transaction_version
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1);
         Ok(MemoryTransaction {
             data: self.data.clone(),
             local: Arc::new(Mutex::new(snapshot)),
             next_get_error: self.next_get_error.clone(),
+            next_commit_unknown_after_apply: self.next_commit_unknown_after_apply.clone(),
+            start_version,
+            pending_queue_scans: self.pending_queue_scans.clone(),
         })
     }
 
@@ -114,6 +136,10 @@ impl TitoEngine for MemoryEngine {
 
 #[async_trait]
 impl TitoTransaction for MemoryTransaction {
+    fn start_version(&self) -> u64 {
+        self.start_version
+    }
+
     async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<TitoValue>, TitoError> {
         if let Some(message) = self.next_get_error.lock().await.take() {
             return Err(TitoError::QueryFailed(message));
@@ -145,6 +171,9 @@ impl TitoTransaction for MemoryTransaction {
     ) -> Result<Vec<TitoKvPair>, TitoError> {
         let start = range.start.as_ref().to_vec();
         let end = range.end.as_ref().to_vec();
+        if start.starts_with(b"queue:pending:") {
+            self.pending_queue_scans.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(self
             .local
             .lock()
@@ -188,6 +217,14 @@ impl TitoTransaction for MemoryTransaction {
     }
 
     async fn commit(self) -> Result<(), TitoError> {
+        if let Some(after_apply) = self.next_commit_unknown_after_apply.lock().await.take() {
+            if after_apply {
+                *self.data.lock().await = self.local.lock().await.clone();
+            }
+            return Err(TitoError::CommitOutcomeUnknown(
+                "forced indeterminate memory transaction commit".to_string(),
+            ));
+        }
         *self.data.lock().await = self.local.lock().await.clone();
         Ok(())
     }

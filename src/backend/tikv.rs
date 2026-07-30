@@ -8,8 +8,22 @@ use std::future::Future;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tikv_client::{ColumnFamily, RawClient, Transaction, TransactionClient};
+use tikv_client::{ColumnFamily, RawClient, TimestampExt, Transaction, TransactionClient};
 use tokio::time::{sleep, Duration};
+
+const MAX_TRANSACTION_RETRIES: u32 = 10;
+const TIKV_GRPC_MAX_DECODING_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
+
+fn contains_undetermined_error(error: &tikv_client::Error) -> bool {
+    match error {
+        tikv_client::Error::UndeterminedError(_) => true,
+        tikv_client::Error::MultipleKeyErrors(errors)
+        | tikv_client::Error::ExtractedErrors(errors) => {
+            errors.iter().any(contains_undetermined_error)
+        }
+        _ => false,
+    }
+}
 
 fn classify_tikv_error(
     e: tikv_client::Error,
@@ -17,6 +31,10 @@ fn classify_tikv_error(
     retryable_flag: &AtomicBool,
 ) -> TitoError {
     let msg = format!("{}: {}", context, e);
+    if contains_undetermined_error(&e) {
+        return TitoError::CommitOutcomeUnknown(msg);
+    }
+
     let is_retryable = match &e {
         tikv_client::Error::RegionError(_)
         | tikv_client::Error::RegionForKeyNotFound { .. }
@@ -26,7 +44,6 @@ fn classify_tikv_error(
         | tikv_client::Error::ResolveLockError(_)
         | tikv_client::Error::NoCurrentRegions
         | tikv_client::Error::EntryNotFoundInRegionCache
-        | tikv_client::Error::UndeterminedError(_)
         | tikv_client::Error::PessimisticLockError { .. } => true,
         tikv_client::Error::KeyError(ke) => {
             ke.locked.is_some() || ke.conflict.is_some() || !ke.retryable.is_empty()
@@ -53,6 +70,20 @@ fn classify_tikv_error(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitFailureAction {
+    Retry,
+    Return,
+}
+
+fn commit_failure_action(error: &TitoError, retries: u32) -> CommitFailureAction {
+    if error.is_retryable() && retries < MAX_TRANSACTION_RETRIES {
+        CommitFailureAction::Retry
+    } else {
+        CommitFailureAction::Return
+    }
+}
+
 #[derive(Clone)]
 pub struct TiKVBackend {
     pub client: Arc<TransactionClient>,
@@ -71,10 +102,12 @@ impl TitoEngine for TiKVBackend {
             .begin_optimistic()
             .await
             .map_err(|e| classify_tikv_error(e, "Failed to begin transaction", &no_flag))?;
+        let start_version = tx.start_timestamp().version();
         Ok(TiKVTransaction {
             id: DBUuid::new_v4().to_string(),
             inner: Arc::new(tokio::sync::Mutex::new(tx)),
             had_retryable_error: Arc::new(AtomicBool::new(false)),
+            start_version,
         })
     }
 
@@ -85,7 +118,6 @@ impl TitoEngine for TiKVBackend {
         T: Send,
         E: From<TitoError> + Send + std::fmt::Debug,
     {
-        const MAX_RETRIES: u32 = 10;
         let mut retries = 0;
         let mut base_delay_ms = 50u64;
 
@@ -116,13 +148,15 @@ impl TitoEngine for TiKVBackend {
                         return Ok(value);
                     }
                     Err(e) => {
-                        let _ = tx.rollback().await;
+                        if !e.is_commit_outcome_unknown() {
+                            let _ = tx.rollback().await;
+                        }
                         {
                             let mut active_transactions = self.active_transactions.lock().await;
                             active_transactions.remove(&tx_id);
                         }
 
-                        if e.is_retryable() && retries < MAX_RETRIES {
+                        if commit_failure_action(&e, retries) == CommitFailureAction::Retry {
                             retries += 1;
                             let jitter = rand::thread_rng().gen_range(0..base_delay_ms / 2);
                             let delay = base_delay_ms + jitter;
@@ -141,7 +175,7 @@ impl TitoEngine for TiKVBackend {
                         active_transactions.remove(&tx_id);
                     }
 
-                    if is_retryable && retries < MAX_RETRIES {
+                    if is_retryable && retries < MAX_TRANSACTION_RETRIES {
                         retries += 1;
                         let jitter = rand::thread_rng().gen_range(0..base_delay_ms / 2);
                         let delay = base_delay_ms + jitter;
@@ -197,15 +231,76 @@ impl TitoEngine for TiKVBackend {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::queue::{MAX_QUEUE_EVENT_BYTES, QUEUE_SCAN_RPC_LIMIT};
+
+    #[test]
+    fn queue_scan_pages_have_two_x_tikv_decode_headroom() {
+        let maximum_valid_invocation_bytes = MAX_QUEUE_EVENT_BYTES * QUEUE_SCAN_RPC_LIMIT as usize;
+
+        assert_eq!(maximum_valid_invocation_bytes, 16 * 1024 * 1024);
+        assert!(
+            TIKV_GRPC_MAX_DECODING_MESSAGE_BYTES >= maximum_valid_invocation_bytes * 2,
+            "TiKV decoding must leave headroom for terminal metadata, keys, and protobuf framing"
+        );
+    }
+
+    #[test]
+    fn undetermined_commit_is_classified_as_unknown_and_never_retried() {
+        let retryable_flag = AtomicBool::new(false);
+        let error = classify_tikv_error(
+            tikv_client::Error::UndeterminedError(Box::new(tikv_client::Error::Unimplemented)),
+            "Transaction commit failed",
+            &retryable_flag,
+        );
+
+        assert!(matches!(error, TitoError::CommitOutcomeUnknown(_)));
+        assert!(!error.is_retryable());
+        assert!(!retryable_flag.load(Ordering::Relaxed));
+        assert_eq!(
+            commit_failure_action(&error, 0),
+            CommitFailureAction::Return
+        );
+    }
+
+    #[test]
+    fn commit_retry_policy_only_retries_explicit_retryable_errors_within_budget() {
+        let retryable = TitoError::Retryable("conflict".to_string());
+
+        assert_eq!(
+            commit_failure_action(&retryable, 0),
+            CommitFailureAction::Retry
+        );
+        assert_eq!(
+            commit_failure_action(&retryable, MAX_TRANSACTION_RETRIES),
+            CommitFailureAction::Return
+        );
+        assert_eq!(
+            commit_failure_action(
+                &TitoError::TransactionFailed("determined failure".to_string()),
+                0
+            ),
+            CommitFailureAction::Return
+        );
+    }
+}
+
 #[derive(Clone)]
 pub struct TiKVTransaction {
     pub id: String,
     pub inner: Arc<tokio::sync::Mutex<Transaction>>,
     pub had_retryable_error: Arc<AtomicBool>,
+    start_version: u64,
 }
 
 #[async_trait]
 impl TitoTransaction for TiKVTransaction {
+    fn start_version(&self) -> u64 {
+        self.start_version
+    }
+
     async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<TitoValue>, TitoError> {
         let tikv_key: tikv_client::Key = key.as_ref().to_vec().into();
         self.inner
@@ -325,15 +420,20 @@ impl TiKV {
     pub async fn connect<S: AsRef<str>>(endpoints: Vec<S>) -> Result<TiKVBackend, TitoError> {
         let endpoint_strings: Vec<String> =
             endpoints.iter().map(|s| s.as_ref().to_string()).collect();
-        let client = TransactionClient::new(endpoint_strings.clone())
+        let client_config = tikv_client::Config::default()
+            .with_grpc_max_decoding_message_size(TIKV_GRPC_MAX_DECODING_MESSAGE_BYTES);
+        let client =
+            TransactionClient::new_with_config(endpoint_strings.clone(), client_config.clone())
+                .await
+                .map_err(|e| {
+                    TitoError::ConnectionFailed(format!("Failed to connect to TiKV: {}", e))
+                })?;
+
+        let raw_client = RawClient::new_with_config(endpoint_strings, client_config)
             .await
             .map_err(|e| {
-                TitoError::ConnectionFailed(format!("Failed to connect to TiKV: {}", e))
+                TitoError::ConnectionFailed(format!("Failed to connect RawClient to TiKV: {}", e))
             })?;
-
-        let raw_client = RawClient::new(endpoint_strings).await.map_err(|e| {
-            TitoError::ConnectionFailed(format!("Failed to connect RawClient to TiKV: {}", e))
-        })?;
 
         Ok(TiKVBackend {
             client: Arc::new(client),

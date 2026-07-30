@@ -11,11 +11,11 @@ pub enum TitoError {
     #[error("Transaction failed: {0}")]
     TransactionFailed(String),
 
-    #[error("Retryable error: {0}")]
+    #[error("Retryable transaction error: {0}")]
     Retryable(String),
 
-    #[error("Deferred: {0}")]
-    Deferred(String),
+    #[error("Transaction commit outcome is unknown: {0}")]
+    CommitOutcomeUnknown(String),
 
     #[error("Failed to create resource: {0}")]
     CreateFailed(String),
@@ -66,5 +66,9 @@ pub enum TitoError {
 impl TitoError {
     pub fn is_retryable(&self) -> bool {
         matches!(self, TitoError::Retryable(_))
+    }
+
+    pub fn is_commit_outcome_unknown(&self) -> bool {
+        matches!(self, TitoError::CommitOutcomeUnknown(_))
     }
 }

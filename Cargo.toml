@@ -1,8 +1,8 @@
 [package]
 name = "tito"
-version = "0.9.2"
+version = "0.10.0"
 edition = "2021"
-description = "Database layer on TiKV with indexing, relationships, transactions, and a built-in partitioned scheduled outbox"
+description = "Database layer on TiKV with indexing, relationships, transactions, and a built-in partitioned scheduled queue"
 license = "Apache-2.0"
 authors = ["0xDjole 0xdjole@gmail.com"]
 

@@ -1,7 +1,6 @@
 use crate::key_encoder::safe_encode;
 use crate::queue::{
-    retry_backoff_seconds, run_worker, Queue, QueueConfig, QueueEvent, QueueEventState,
-    WorkerConfig,
+    run_worker, Queue, QueueConfig, QueueEvent, QueueEventState, QueueHandlerOutcome, WorkerConfig,
 };
 use crate::test_support::MemoryEngine;
 use crate::types::{
@@ -336,13 +335,21 @@ fn queue_event(id: &str, key: &str, timestamp: i64) -> QueueEvent<QueuePayload> 
         key: key.to_string(),
         payload: queue_payload(id),
         timestamp,
-        original_scheduled_at: Some(timestamp),
         state: QueueEventState::Pending,
         processed_at: None,
-        retry_count: 0,
-        max_retries: 3,
-        errors: Vec::new(),
     }
+}
+
+async fn put_completed_queue_event(engine: &MemoryEngine, id: &str, processed_at: i64) -> String {
+    let event_timestamp = processed_at.saturating_sub(1);
+    let storage_key = format!("queue:completed:{processed_at:020}:{event_timestamp:020}:{id}");
+    let mut event = queue_event(id, &format!("entry:{id}"), event_timestamp);
+    event.state = QueueEventState::Completed;
+    event.processed_at = Some(processed_at);
+    engine
+        .put_raw(&storage_key, serde_json::to_vec(&event).unwrap())
+        .await;
+    storage_key
 }
 
 fn queue(engine: MemoryEngine, partitions: u32) -> Queue<MemoryEngine> {
@@ -354,6 +361,7 @@ fn cluster_config(node_id: &str) -> ClusterWorkerConfig {
         node_id: node_id.to_string(),
         heartbeat_interval: Duration::from_millis(10),
         poll_interval: Duration::from_millis(10),
+        handler_timeout: Duration::from_secs(10 * 60),
         lease_ttl: Duration::from_secs(60),
         stale_node_ttl: Duration::from_secs(120),
     }
