@@ -177,13 +177,13 @@ create immediate same-time events without keeping later timestamp buckets behind
 After the pass is exhausted, polling wraps to the oldest runnable key and those events become
 eligible. The cursor is executor state only: it is not persisted and does not encode retry policy.
 
-Completed invocation history has one fixed retention policy: standalone workers and the elected
-cluster coordinator delete rows older than three days in bounded passes. A full pass yields and
-continues immediately until the expired range is caught up; the 30-second interval applies only
-after a short pass. Maintenance uses the completed-state/processed-time key range directly, never
-inspects pending work, and has no retry, recovery, or provider semantics. Malformed values inside an
-expired completed-row key are also removed so corrupt terminal history cannot pin newer cleanup
-work.
+Completed invocation history uses the retention supplied by the application in `QueueConfig`.
+Standalone workers and the elected cluster coordinator delete older rows in bounded passes. A full
+pass yields and continues immediately until the expired range is caught up; the 30-second interval
+applies only after a short pass. Maintenance uses the completed-state/processed-time key range
+directly, never inspects pending work, and has no retry, recovery, or provider semantics. Malformed
+values inside an expired completed-row key are also removed so corrupt terminal history cannot pin
+newer cleanup work.
 
 ### Transaction retry safety
 
