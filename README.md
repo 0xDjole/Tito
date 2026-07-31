@@ -127,11 +127,15 @@ without turning a 50-event worker pull into dozens of sequential datastore calls
 
 ```rust
 use std::sync::Arc;
+use std::time::Duration;
 use futures::FutureExt;
-use tito::{Queue, QueueConfig, QueueEvent, QueueHandlerOutcome, WorkerConfig};
+use tito::{Queue, QueueConfig, QueueEvent, WorkerConfig};
 use tito::queue::run_worker;
 
-let queue = Arc::new(Queue::new(db.clone(), QueueConfig::new(4)));
+let queue = Arc::new(Queue::new(
+    db.clone(),
+    QueueConfig::new(4, Duration::from_secs(3 * 24 * 60 * 60)),
+));
 
 queue
     .publish(QueueEvent::new(
@@ -144,24 +148,15 @@ queue
 run_worker(
     queue,
     WorkerConfig::new(0..4),
-    |event: QueueEvent<UserCreated>| async move {
-        match handle_user_created(&event.payload).await {
-            Ok(None) => QueueHandlerOutcome::Acknowledge,
-            Ok(Some(next_at)) => {
-                QueueHandlerOutcome::Reschedule(event.rescheduled(next_at))
-            }
-            Err(error) => {
-                log::error!("Could not handle user creation: {error}");
-                QueueHandlerOutcome::Reschedule(event.rescheduled(
-                    chrono::Utc::now().timestamp().saturating_add(5),
-                ))
-            }
-        }
-    }
-    .boxed(),
+    |event: QueueEvent<UserCreated>| async move { handle_user_created(event).await }.boxed(),
     shutdown_rx,
 ).await;
 ```
+
+`completed_retention` is an application policy supplied at queue construction. Tito's standalone
+worker or elected cluster coordinator removes bounded batches of older completed rows during its
+normal maintenance tick. Tito does not hardcode the duration, publish cleanup events, or delegate
+queue cleanup to the application's backup process.
 
 `Reschedule` is not an automatic retry policy. The application decides whether another event exists and supplies the complete event, including its timestamp. Tito creates no successor on its own and never interprets provider or domain state.
 

@@ -24,7 +24,6 @@ use serde_json::Value;
 use crate::types::{TitoEngine, TitoKvPair, TitoTransaction, PARTITION_DIGITS};
 use crate::TitoError;
 
-pub(crate) const COMPLETED_EVENT_RETENTION_SECONDS: i64 = 3 * 24 * 60 * 60;
 pub(crate) const COMPLETED_EVENT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
 pub(crate) const COMPLETED_EVENT_MAINTENANCE_BATCH_SIZE: u32 = 1_000;
 pub(crate) const COMPLETED_EVENT_MAINTENANCE_MAX_BATCHES: usize = 4;
@@ -601,7 +600,9 @@ impl<E: TitoEngine> Queue<E> {
         &self,
         now: i64,
     ) -> Result<bool, TitoError> {
-        let cutoff = now.saturating_sub(COMPLETED_EVENT_RETENTION_SECONDS);
+        let retention_seconds =
+            i64::try_from(self.config.completed_retention.as_secs()).unwrap_or(i64::MAX);
+        let cutoff = now.saturating_sub(retention_seconds);
 
         for _ in 0..COMPLETED_EVENT_MAINTENANCE_MAX_BATCHES {
             let batch = self
@@ -682,7 +683,10 @@ mod tests {
     }
 
     fn queue(engine: MemoryEngine) -> Queue<MemoryEngine> {
-        Queue::new(engine, QueueConfig::new(1))
+        Queue::new(
+            engine,
+            QueueConfig::new(1, Duration::from_secs(3 * 24 * 60 * 60)),
+        )
     }
 
     fn payload(name: &str) -> Payload {

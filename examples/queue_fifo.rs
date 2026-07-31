@@ -2,6 +2,7 @@ use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 use tito::{
     queue::{run_worker, QueueConfig, QueueEvent, QueueHandlerOutcome},
     types::DBUuid,
@@ -23,7 +24,10 @@ async fn main() -> Result<(), TitoError> {
 
     let tito_db = TiKV::connect(vec!["127.0.0.1:2379"]).await?;
 
-    let queue = Arc::new(Queue::new(tito_db.clone(), QueueConfig::new(1)));
+    let queue = Arc::new(Queue::new(
+        tito_db.clone(),
+        QueueConfig::new(1, Duration::from_secs(3 * 24 * 60 * 60)),
+    ));
 
     println!("Publishing 5 events...\n");
 

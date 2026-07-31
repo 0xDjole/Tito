@@ -348,11 +348,13 @@ async fn queue_completed_retention_uses_the_terminal_time_index_not_value_decodi
 }
 
 #[tokio::test]
-async fn standalone_worker_enforces_fixed_completed_history_retention() {
-    const THREE_DAYS_SECONDS: i64 = 3 * 24 * 60 * 60;
-
+async fn standalone_worker_enforces_configured_completed_history_retention() {
+    const RETENTION_SECONDS: i64 = 60 * 60;
     let engine = engine();
-    let queue = Arc::new(queue(engine.clone(), 1));
+    let queue = Arc::new(Queue::new(
+        engine.clone(),
+        QueueConfig::new(1, Duration::from_secs(RETENTION_SECONDS as u64)),
+    ));
     let now = Utc::now().timestamp();
     let expired_count = crate::queue::COMPLETED_EVENT_MAINTENANCE_BATCH_SIZE as usize
         * crate::queue::COMPLETED_EVENT_MAINTENANCE_MAX_BATCHES
@@ -362,12 +364,12 @@ async fn standalone_worker_enforces_fixed_completed_history_retention() {
         last_expired_key = put_completed_queue_event(
             &engine,
             &format!("expired-{index:05}"),
-            now - THREE_DAYS_SECONDS - 1,
+            now - RETENTION_SECONDS - 1,
         )
         .await;
     }
     let retained_key =
-        put_completed_queue_event(&engine, "retained", now - THREE_DAYS_SECONDS + 60).await;
+        put_completed_queue_event(&engine, "retained", now - RETENTION_SECONDS + 60).await;
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
     let handle = run_worker(

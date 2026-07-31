@@ -353,7 +353,10 @@ async fn put_completed_queue_event(engine: &MemoryEngine, id: &str, processed_at
 }
 
 fn queue(engine: MemoryEngine, partitions: u32) -> Queue<MemoryEngine> {
-    Queue::new(engine, QueueConfig::new(partitions))
+    Queue::new(
+        engine,
+        QueueConfig::new(partitions, Duration::from_secs(3 * 24 * 60 * 60)),
+    )
 }
 
 fn cluster_config(node_id: &str) -> ClusterWorkerConfig {

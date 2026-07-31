@@ -1,4 +1,5 @@
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::time::Duration;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -99,10 +100,14 @@ fn queue_event_id() -> String {
 #[derive(Debug, Clone)]
 pub struct QueueConfig {
     pub partition_count: u32,
+    pub completed_retention: Duration,
 }
 
 impl QueueConfig {
-    pub fn new(partition_count: u32) -> Self {
-        Self { partition_count }
+    pub fn new(partition_count: u32, completed_retention: Duration) -> Self {
+        Self {
+            partition_count,
+            completed_retention,
+        }
     }
 }
