@@ -112,9 +112,11 @@ let results = query.value(&author_id).relationship("tags").execute().await?;
 
 Queue events are partitioned by their business key, carry their own non-negative Unix timestamp, and remain pending until the handler explicitly acknowledges them. Tito rejects negative timestamps instead of storing an event that polling cannot reach. Tito has no automatic retry policy, retry counter, backoff, failed state, or DLQ:
 
-- `QueueHandlerOutcome::Acknowledge` completes the current invocation.
-- `QueueHandlerOutcome::Reschedule(next_event)` atomically completes the current queue row and inserts the supplied replacement row.
-- A handler panic, executor timeout, lost worker, or queue-commit failure produces no persisted outcome, so the current invocation remains pending.
+Handlers return `QueueHandlerResult<T>`, an alias for `Result<QueueHandlerOutcome<T>, TitoError>`.
+
+- `Ok(QueueHandlerOutcome::Acknowledge)` completes the current invocation.
+- `Ok(QueueHandlerOutcome::Reschedule(next_event))` atomically completes the current queue row and inserts the supplied replacement row.
+- `Err(_)`, a handler panic, executor timeout, lost worker, or queue-commit failure produces no persisted outcome, so the exact current invocation remains pending.
 
 Each event's own timestamp determines when it becomes runnable. Tito indexes that timestamp but never chooses or changes it. A domain that needs another invocation supplies a replacement event carrying the desired timestamp through `Reschedule`; Tito only commits the acknowledge-and-insert transaction. A replacement must preserve the logical event ID, partition key, and payload and may change only the timestamp. `QueueEvent::rescheduled` constructs that replacement, so replay-safe projections keep one identity across queue rows. Provider leases and processing deadlines belong only to domain records.
 
@@ -129,7 +131,7 @@ without turning a 50-event worker pull into dozens of sequential datastore calls
 use std::sync::Arc;
 use std::time::Duration;
 use futures::FutureExt;
-use tito::{Queue, QueueConfig, QueueEvent, WorkerConfig};
+use tito::{Queue, QueueConfig, QueueEvent, QueueHandlerOutcome, WorkerConfig};
 use tito::queue::run_worker;
 
 let queue = Arc::new(Queue::new(
@@ -148,7 +150,10 @@ queue
 run_worker(
     queue,
     WorkerConfig::new(0..4),
-    |event: QueueEvent<UserCreated>| async move { handle_user_created(event).await }.boxed(),
+    |event: QueueEvent<UserCreated>| async move {
+        handle_user_created(event).await?;
+        Ok(QueueHandlerOutcome::Acknowledge)
+    }.boxed(),
     shutdown_rx,
 ).await;
 ```
@@ -162,9 +167,9 @@ queue cleanup to the application's backup process.
 
 Workers supervise each handler with a ten-minute timeout by default. Configure `handler_timeout` when a workload has a different bounded execution contract; the timeout is executor protection and never changes queue state or provider policy.
 Worker shutdown stops new pulls and handler starts, then drains every handler that already started
-and applies its outcome before joining. The configured handler timeout bounds that drain. A panic,
-timeout, lost worker, lost cluster partition lease, or queue-outcome storage failure leaves the exact
-invocation Pending.
+and applies its outcome before joining. The configured handler timeout bounds that drain. A handler
+error, panic, timeout, lost worker, lost cluster partition lease, or queue-outcome storage failure
+leaves the exact invocation Pending.
 
 Partition polling is fair across due rows. Pending storage keys are ordered as
 `queue:pending:{partition:04}:{timestamp:020}:{enqueue_version:020}:{event_id}`. The enqueue version is

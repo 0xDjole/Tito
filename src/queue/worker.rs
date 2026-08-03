@@ -11,7 +11,8 @@ use tokio::sync::broadcast::error::TryRecvError;
 use tokio::time::{sleep, timeout};
 
 use super::{
-    Queue, QueueEvent, QueueHandlerOutcome, QueuePullCursor, COMPLETED_EVENT_MAINTENANCE_INTERVAL,
+    Queue, QueueEvent, QueueHandlerOutcome, QueueHandlerResult, QueuePullCursor,
+    COMPLETED_EVENT_MAINTENANCE_INTERVAL,
 };
 use crate::types::TitoEngine;
 
@@ -34,7 +35,7 @@ impl WorkerConfig {
 }
 
 pub(crate) enum HandlerExecution<T> {
-    Finished(QueueHandlerOutcome<T>),
+    Finished(QueueHandlerResult<T>),
     Panicked,
     TimedOut,
 }
@@ -46,7 +47,7 @@ pub(crate) async fn execute_handler<T, H>(
 ) -> HandlerExecution<T>
 where
     T: Send + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerOutcome<T>>,
+    H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerResult<T>>,
 {
     let handler_future = match catch_unwind(AssertUnwindSafe(|| handler(event))) {
         Ok(handler_future) => handler_future,
@@ -59,7 +60,7 @@ where
     )
     .await
     {
-        Ok(Ok(outcome)) => HandlerExecution::Finished(outcome),
+        Ok(Ok(result)) => HandlerExecution::Finished(result),
         Ok(Err(_)) => HandlerExecution::Panicked,
         Err(_) => HandlerExecution::TimedOut,
     }
@@ -71,7 +72,16 @@ pub(crate) fn handler_outcome_or_log<T>(
     handler_timeout: Duration,
 ) -> Option<QueueHandlerOutcome<T>> {
     match execution {
-        HandlerExecution::Finished(outcome) => Some(outcome),
+        HandlerExecution::Finished(Ok(outcome)) => Some(outcome),
+        HandlerExecution::Finished(Err(error)) => {
+            log::error!(
+                "Queue handler failed for event {} ({}); leaving it pending for redelivery: {}",
+                event.id,
+                event.key,
+                error
+            );
+            None
+        }
         HandlerExecution::Panicked => {
             log::error!(
                 "Queue handler panicked for event {} ({}); leaving it pending for redelivery",
@@ -124,7 +134,7 @@ pub async fn run_worker<E, T, H>(
 where
     E: TitoEngine + 'static,
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerOutcome<T>>
+    H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerResult<T>>
         + Clone
         + Send
         + Sync

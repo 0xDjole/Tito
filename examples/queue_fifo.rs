@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tito::{
-    queue::{run_worker, QueueConfig, QueueEvent, QueueHandlerOutcome},
+    queue::{run_worker, QueueConfig, QueueEvent, QueueHandlerOutcome, QueueHandlerResult},
     types::DBUuid,
     Queue, TiKV, TitoError, WorkerConfig,
 };
@@ -64,8 +64,8 @@ async fn main() -> Result<(), TitoError> {
                 count, event.payload.action, event.payload.name, event.payload.email,
             );
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-            QueueHandlerOutcome::Acknowledge
-        }) as BoxFuture<'static, QueueHandlerOutcome<UserEvent>>
+            Ok(QueueHandlerOutcome::Acknowledge)
+        }) as BoxFuture<'static, QueueHandlerResult<UserEvent>>
     };
 
     let worker_handle =

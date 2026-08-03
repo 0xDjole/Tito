@@ -7,8 +7,8 @@ pub use cluster::{
     ClusterWorkerNode,
 };
 pub use types::{
-    QueueConfig, QueueEvent, QueueEventState, QueueHandlerOutcome, QueuePullCursor, QueuePullPage,
-    QueueScanPage,
+    QueueConfig, QueueEvent, QueueEventState, QueueHandlerOutcome, QueueHandlerResult,
+    QueuePullCursor, QueuePullPage, QueueScanPage,
 };
 pub use worker::{run_worker, WorkerConfig};
 

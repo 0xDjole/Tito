@@ -376,7 +376,7 @@ async fn standalone_worker_enforces_configured_completed_history_retention() {
         queue,
         WorkerConfig::new(0..1),
         |_event: QueueEvent<QueuePayload>| {
-            Box::pin(async move { QueueHandlerOutcome::Acknowledge })
+            Box::pin(async move { Ok(QueueHandlerOutcome::Acknowledge) })
         },
         shutdown_rx,
     )
@@ -449,7 +449,7 @@ async fn queue_worker_acknowledges_successful_jobs() {
             Box::pin(async move {
                 assert_eq!(event.id, "worker-success");
                 handler_processed.notify_one();
-                QueueHandlerOutcome::Acknowledge
+                Ok(QueueHandlerOutcome::Acknowledge)
             })
         },
         shutdown_rx,
@@ -472,6 +472,72 @@ async fn queue_worker_acknowledges_successful_jobs() {
         .unwrap()
         .events
         .is_empty());
+}
+
+#[tokio::test]
+async fn queue_worker_handler_error_leaves_exact_pending_invocation_unchanged() {
+    let engine = engine();
+    let queue = Arc::new(queue(engine.clone(), 1));
+    queue
+        .publish(queue_event(
+            "worker-error",
+            "entry:worker-error",
+            Utc::now().timestamp() - 10,
+        ))
+        .await
+        .unwrap();
+    let initial = queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+        .await
+        .unwrap();
+    let (storage_key, event) = initial.events.into_iter().next().unwrap();
+    let pending_bytes = engine.raw_bytes(&storage_key).await.unwrap();
+
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let handler_started = started.clone();
+    let handler_release = release.clone();
+    let handler_event = event.clone();
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let handle = run_worker::<_, QueuePayload, _>(
+        queue.clone(),
+        WorkerConfig::new(0..1),
+        move |handled_event| {
+            let handler_started = handler_started.clone();
+            let handler_release = handler_release.clone();
+            let handler_event = handler_event.clone();
+            Box::pin(async move {
+                assert_eq!(handled_event, handler_event);
+                handler_started.notify_one();
+                handler_release.notified().await;
+                Err(TitoError::Internal("simulated handler error".to_string()))
+            })
+        },
+        shutdown_rx,
+    )
+    .await;
+
+    timeout(Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+    let _ = shutdown_tx.send(());
+    release.notify_one();
+    timeout(Duration::from_secs(2), handle)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let pending = queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(pending.events, vec![(storage_key.clone(), event)]);
+    assert_eq!(engine.raw_bytes(&storage_key).await, Some(pending_bytes));
+    assert_eq!(
+        engine.keys_with_prefix("queue:pending:").await,
+        vec![storage_key]
+    );
+    assert!(engine.keys_with_prefix("queue:completed:").await.is_empty());
 }
 
 #[tokio::test]
@@ -515,7 +581,7 @@ async fn standalone_worker_shutdown_drains_started_handler_before_join() {
                 assert_eq!(event.id, "standalone-drain");
                 handler_started.notify_one();
                 handler_release.notified().await;
-                QueueHandlerOutcome::Acknowledge
+                Ok(QueueHandlerOutcome::Acknowledge)
             })
         },
         shutdown_rx,
@@ -582,7 +648,7 @@ async fn queue_worker_does_not_let_unacknowledged_first_page_starve_later_rows()
             Box::pin(async move {
                 if event.id == "zz-target" {
                     handler_target_processed.notify_one();
-                    QueueHandlerOutcome::Acknowledge
+                    Ok(QueueHandlerOutcome::Acknowledge)
                 } else {
                     panic!("simulated interrupted handler")
                 }
@@ -634,7 +700,7 @@ async fn queue_worker_contains_panic_and_redelivers_the_pending_invocation() {
                     panic!("simulated handler panic");
                 }
                 handler_processed.notify_one();
-                QueueHandlerOutcome::Acknowledge
+                Ok(QueueHandlerOutcome::Acknowledge)
             })
         },
         shutdown_rx,
@@ -683,7 +749,7 @@ async fn queue_worker_contains_synchronous_handler_panic_and_redelivers() {
             let handler_processed = handler_processed.clone();
             Box::pin(async move {
                 handler_processed.notify_one();
-                QueueHandlerOutcome::Acknowledge
+                Ok(QueueHandlerOutcome::Acknowledge)
             })
         },
         shutdown_rx,
@@ -735,7 +801,7 @@ async fn queue_worker_times_out_handler_and_redelivers_pending_invocation() {
                     std::future::pending::<()>().await;
                 }
                 handler_processed.notify_one();
-                QueueHandlerOutcome::Acknowledge
+                Ok(QueueHandlerOutcome::Acknowledge)
             })
         },
         shutdown_rx,

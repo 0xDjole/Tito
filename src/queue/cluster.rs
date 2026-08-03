@@ -13,7 +13,7 @@ use super::worker::{
     apply_handler_outcome, execute_handler, handler_outcome_or_log, DEFAULT_HANDLER_TIMEOUT,
 };
 use super::{
-    Queue, QueueEvent, QueueHandlerOutcome, QueuePullCursor, COMPLETED_EVENT_MAINTENANCE_INTERVAL,
+    Queue, QueueEvent, QueueHandlerResult, QueuePullCursor, COMPLETED_EVENT_MAINTENANCE_INTERVAL,
 };
 use crate::key_encoder::safe_encode;
 use crate::types::{TitoEngine, TitoTransaction, PARTITION_DIGITS};
@@ -516,7 +516,7 @@ pub async fn run_cluster_worker<E, T, H>(
 where
     E: TitoEngine + 'static,
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerOutcome<T>>
+    H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerResult<T>>
         + Clone
         + Send
         + Sync
@@ -589,7 +589,7 @@ async fn reconcile_partition_workers<E, T, H>(
 ) where
     E: TitoEngine + 'static,
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerOutcome<T>>
+    H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerResult<T>>
         + Clone
         + Send
         + Sync
@@ -698,7 +698,7 @@ async fn run_partition_worker<E, T, H>(
 ) where
     E: TitoEngine + 'static,
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerOutcome<T>>
+    H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerResult<T>>
         + Clone
         + Send
         + Sync
@@ -843,7 +843,7 @@ async fn process_partition_once<E, T, H>(
 where
     E: TitoEngine + 'static,
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerOutcome<T>>
+    H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerResult<T>>
         + Clone
         + Send
         + Sync

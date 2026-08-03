@@ -1,6 +1,8 @@
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::time::Duration;
 
+use crate::TitoError;
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum QueueEventState {
@@ -14,6 +16,11 @@ pub enum QueueHandlerOutcome<T> {
     Acknowledge,
     Reschedule(QueueEvent<T>),
 }
+
+/// The result of handling one queue event.
+///
+/// An error leaves the current pending event unchanged for later redelivery.
+pub type QueueHandlerResult<T> = Result<QueueHandlerOutcome<T>, TitoError>;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
