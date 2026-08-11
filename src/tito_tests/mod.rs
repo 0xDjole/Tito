@@ -333,6 +333,7 @@ fn queue_event(id: &str, key: &str, timestamp: i64) -> QueueEvent<QueuePayload> 
     QueueEvent {
         id: id.to_string(),
         key: key.to_string(),
+        owner: None,
         payload: queue_payload(id),
         timestamp,
         state: QueueEventState::Pending,

@@ -7,8 +7,8 @@ pub use cluster::{
     ClusterWorkerNode,
 };
 pub use types::{
-    QueueConfig, QueueEvent, QueueEventState, QueueHandlerOutcome, QueueHandlerResult,
-    QueuePullCursor, QueuePullPage, QueueScanPage,
+    QueueConfig, QueueDeletePage, QueueEvent, QueueEventState, QueueHandlerOutcome,
+    QueueHandlerResult, QueueOwner, QueuePullCursor, QueuePullPage, QueueScanPage,
 };
 pub use worker::{run_worker, WorkerConfig};
 
@@ -669,6 +669,49 @@ impl<E: TitoEngine> Queue<E> {
             })
             .await
     }
+
+    pub async fn delete_matching_in_tx<T, F>(
+        &self,
+        state: QueueEventState,
+        cursor: Option<Vec<u8>>,
+        limit: u32,
+        tx: &E::Transaction,
+        matches: F,
+    ) -> Result<QueueDeletePage, TitoError>
+    where
+        T: DeserializeOwned + Clone + Send + Sync + 'static,
+        F: Fn(&QueueEvent<T>) -> Result<bool, TitoError> + Send + Sync,
+    {
+        let prefix = Self::state_prefix(state);
+        let limit = limit.max(1);
+        let start = cursor.unwrap_or_else(|| prefix.as_bytes().to_vec());
+        let entries = Self::scan_queue_entries(tx, start, Self::prefix_end(prefix), limit)
+            .await
+            .map_err(|error| TitoError::QueryFailed(format!("Scan queue for deletion: {error}")))?;
+        let next_cursor = if entries.len() == limit as usize {
+            entries.last().map(|(key, _)| {
+                let mut cursor = key.clone();
+                cursor.push(0);
+                cursor
+            })
+        } else {
+            None
+        };
+        let mut deleted_event_ids = Vec::new();
+        for (storage_key, value) in entries {
+            let event = Self::read_event_from_value::<T>(&value)?;
+            if event.state == state && matches(&event)? {
+                deleted_event_ids.push(event.id);
+                Self::delete_entry(tx, &storage_key).await?;
+            }
+        }
+        deleted_event_ids.sort();
+        deleted_event_ids.dedup();
+        Ok(QueueDeletePage {
+            deleted_event_ids,
+            next_cursor,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -705,6 +748,7 @@ mod tests {
         QueueEvent {
             id: id.to_string(),
             key: key.to_string(),
+            owner: None,
             payload: payload(id),
             timestamp,
             state,
@@ -994,5 +1038,72 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, TitoError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn delete_matching_in_tx_is_bounded_selective_and_owner_aware() {
+        let engine = MemoryEngine::default();
+        let queue = queue(engine.clone());
+        let now = Utc::now().timestamp();
+        let target = QueueOwner::new("store", "target").unwrap();
+        let foreign = QueueOwner::new("store", "foreign").unwrap();
+        for index in 0..5 {
+            let owner = if index < 3 {
+                target.clone()
+            } else {
+                foreign.clone()
+            };
+            queue
+                .publish(
+                    QueueEvent::new(
+                        format!("entry:owned-{index}"),
+                        payload(&format!("owned-{index}")),
+                        now,
+                    )
+                    .with_owner(owner),
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut cursor = None;
+        let mut deleted = Vec::new();
+        loop {
+            let queue_for_tx = queue.clone();
+            let target_for_tx = target.clone();
+            let page = engine
+                .transaction(move |tx| {
+                    let cursor = cursor.clone();
+                    let target = target_for_tx.clone();
+                    let queue = queue_for_tx.clone();
+                    async move {
+                        queue
+                            .delete_matching_in_tx::<Payload, _>(
+                                QueueEventState::Pending,
+                                cursor,
+                                2,
+                                &tx,
+                                |event| Ok(event.owner.as_ref() == Some(&target)),
+                            )
+                            .await
+                    }
+                })
+                .await
+                .unwrap();
+            deleted.extend(page.deleted_event_ids);
+            let Some(next) = page.next_cursor else { break };
+            cursor = Some(next);
+        }
+
+        assert_eq!(deleted.len(), 3);
+        let remaining = queue
+            .scan_by_state::<Payload>(QueueEventState::Pending, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(remaining.events.len(), 2);
+        assert!(remaining
+            .events
+            .iter()
+            .all(|(_, event)| event.owner.as_ref() == Some(&foreign)));
     }
 }

@@ -17,6 +17,28 @@ pub enum QueueHandlerOutcome<T> {
     Reschedule(QueueEvent<T>),
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueOwner {
+    pub kind: String,
+    pub id: String,
+}
+
+impl QueueOwner {
+    pub fn new(kind: impl Into<String>, id: impl Into<String>) -> Result<Self, TitoError> {
+        let owner = Self {
+            kind: kind.into(),
+            id: id.into(),
+        };
+        if owner.kind.trim().is_empty() || owner.id.trim().is_empty() {
+            return Err(TitoError::InvalidInput(
+                "Queue owner kind and id must be non-empty".to_string(),
+            ));
+        }
+        Ok(owner)
+    }
+}
+
 /// The result of handling one queue event.
 ///
 /// An error leaves the current pending event unchanged for later redelivery.
@@ -28,6 +50,8 @@ pub type QueueHandlerResult<T> = Result<QueueHandlerOutcome<T>, TitoError>;
 pub struct QueueEvent<T> {
     pub id: String,
     pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<QueueOwner>,
     pub payload: T,
     pub timestamp: i64,
     #[serde(default)]
@@ -39,6 +63,12 @@ pub struct QueueEvent<T> {
 #[derive(Debug, Clone)]
 pub struct QueueScanPage<T> {
     pub events: Vec<(String, QueueEvent<T>)>,
+    pub next_cursor: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueDeletePage {
+    pub deleted_event_ids: Vec<String>,
     pub next_cursor: Option<Vec<u8>>,
 }
 
@@ -60,6 +90,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent
         Self {
             id: queue_event_id(),
             key: key.into(),
+            owner: None,
             payload,
             timestamp,
             state: QueueEventState::Pending,
@@ -69,6 +100,11 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent
 
     pub fn key_type(&self) -> &str {
         self.key.split(':').next().unwrap_or(&self.key)
+    }
+
+    pub fn with_owner(mut self, owner: QueueOwner) -> Self {
+        self.owner = Some(owner);
+        self
     }
 
     pub fn key_value(&self) -> &str {
@@ -91,6 +127,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent
         Self {
             id: self.id.clone(),
             key: self.key.clone(),
+            owner: self.owner.clone(),
             payload: self.payload.clone(),
             timestamp,
             state: QueueEventState::Pending,
