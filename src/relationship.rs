@@ -124,21 +124,17 @@ impl<
                             };
 
                             if let Some(id_str) = actual_value.as_str() {
-                                if id_str != "__null__" {
-                                    relationship_keys_to_fetch.push((
-                                        config.clone(),
-                                        format!("table:{}:{}", config.model, id_str),
-                                    ));
-                                }
+                                relationship_keys_to_fetch.push((
+                                    config.clone(),
+                                    format!("table:{}:{}", config.model, id_str),
+                                ));
                             } else if let Some(id_array) = actual_value.as_array() {
                                 for id_element in id_array {
                                     if let Some(id_str) = id_element.as_str() {
-                                        if id_str != "__null__" {
-                                            relationship_keys_to_fetch.push((
-                                                config.clone(),
-                                                format!("table:{}:{}", config.model, id_str),
-                                            ));
-                                        }
+                                        relationship_keys_to_fetch.push((
+                                            config.clone(),
+                                            format!("table:{}:{}", config.model, id_str),
+                                        ));
                                     }
                                 }
                             }

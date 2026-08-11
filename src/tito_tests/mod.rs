@@ -91,6 +91,20 @@ impl TitoModelTrait for Author {
                 }],
             },
             TitoIndexConfig {
+                condition: true,
+                name: "author-by-org-optional".to_string(),
+                fields: vec![
+                    TitoIndexField {
+                        name: "org_id".to_string(),
+                        r#type: TitoIndexBlockType::String,
+                    },
+                    TitoIndexField {
+                        name: "optional".to_string(),
+                        r#type: TitoIndexBlockType::String,
+                    },
+                ],
+            },
+            TitoIndexConfig {
                 condition: false,
                 name: "author-disabled".to_string(),
                 fields: vec![TitoIndexField {

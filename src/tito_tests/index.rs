@@ -79,7 +79,7 @@ async fn custom_index_values_are_queryable() {
 }
 
 #[tokio::test]
-async fn missing_or_null_index_values_use_null_sentinel() {
+async fn null_index_values_are_not_indexed() {
     let engine = engine();
     let model = engine.clone().model::<Author>(TitoModelOptions::default());
     save_author(&engine, author("a1", "ada@example.com", 36, "org-a")).await;
@@ -87,8 +87,72 @@ async fn missing_or_null_index_values_use_null_sentinel() {
     let mut query = model.query_by_index("author-by-optional");
     let found = query.value("__null__").execute(None).await.unwrap();
 
-    assert_eq!(found.items.len(), 1);
-    assert_eq!(found.items[0].id, "a1");
+    assert!(found.items.is_empty());
+    assert!(engine
+        .keys_with_prefix("index:author-by-optional:")
+        .await
+        .is_empty());
+    assert!(engine
+        .keys_with_prefix("index:author-by-org-optional:")
+        .await
+        .is_empty());
+}
+
+#[test]
+fn missing_empty_and_wrong_typed_index_values_are_not_indexed() {
+    let engine = engine();
+    let model = engine.model::<Author>(TitoModelOptions::default());
+    let value = author("a1", "ada@example.com", 36, "org-a");
+
+    for optional in [None, Some(json!("")), Some(json!(false)), Some(json!(7))] {
+        let mut json = serde_json::to_value(&value).unwrap();
+        match optional {
+            Some(optional) => json["optional"] = optional,
+            None => {
+                json.as_object_mut().unwrap().remove("optional");
+            }
+        }
+
+        let keys = model
+            .get_index_keys("table:authors:a1".to_string(), &value, &json)
+            .unwrap();
+
+        assert!(keys
+            .iter()
+            .all(|(key, _)| !key.starts_with("index:author-by-optional:")
+                && !key.starts_with("index:author-by-org-optional:")));
+    }
+}
+
+#[tokio::test]
+async fn removing_an_optional_value_removes_its_index_key() {
+    let engine = engine();
+    let mut value = author("a1", "ada@example.com", 36, "org-a");
+    value.optional = Some("present".to_string());
+    save_author(&engine, value.clone()).await;
+
+    assert!(
+        engine
+            .contains_key("index:author-by-optional:optional:present:table:authors:a1")
+            .await
+    );
+
+    value.optional = None;
+    save_author(&engine, value).await;
+
+    assert!(
+        !engine
+            .contains_key("index:author-by-optional:optional:present:table:authors:a1")
+            .await
+    );
+    assert!(engine
+        .keys_with_prefix("index:author-by-optional:")
+        .await
+        .is_empty());
+    assert!(engine
+        .keys_with_prefix("index:author-by-org-optional:")
+        .await
+        .is_empty());
 }
 
 #[tokio::test]

@@ -9,6 +9,11 @@ A database layer on TiKV with indexing, relationships, transactions, and a built
 - **Relationships**: Embedded relationship hydration
 - **Transactions**: Full ACID transactions
 - **Query Builder**: Fluent API for querying by index
+
+Indexes are sparse. Tito writes an index key only when every configured field contains a value of
+the configured type. Missing fields, JSON `null`, empty strings, empty collections, and values of a
+different type produce no key for that index. A model can use `condition` to apply an additional
+domain-specific inclusion rule.
 - **Transactional Publication**: Queue events can be written atomically with application data
 - **Partitioned Queue**: Horizontal scaling via stable business-key partitions
 - **Event Timestamps**: Each event says when it becomes runnable
