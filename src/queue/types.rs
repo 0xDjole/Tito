@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use crate::TitoError;
 
+pub const MAX_QUEUE_OWNER_COMPONENT_BYTES: usize = 512;
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum QueueEventState {
@@ -30,12 +32,24 @@ impl QueueOwner {
             kind: kind.into(),
             id: id.into(),
         };
-        if owner.kind.trim().is_empty() || owner.id.trim().is_empty() {
+        owner.validate()?;
+        Ok(owner)
+    }
+
+    pub fn validate(&self) -> Result<(), TitoError> {
+        if self.kind.trim().is_empty() || self.id.trim().is_empty() {
             return Err(TitoError::InvalidInput(
                 "Queue owner kind and id must be non-empty".to_string(),
             ));
         }
-        Ok(owner)
+        if self.kind.len() > MAX_QUEUE_OWNER_COMPONENT_BYTES
+            || self.id.len() > MAX_QUEUE_OWNER_COMPONENT_BYTES
+        {
+            return Err(TitoError::InvalidInput(format!(
+                "Queue owner kind and id must each be at most {MAX_QUEUE_OWNER_COMPONENT_BYTES} bytes"
+            )));
+        }
+        Ok(())
     }
 }
 

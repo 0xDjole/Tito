@@ -9,6 +9,7 @@ pub use cluster::{
 pub use types::{
     QueueConfig, QueueDeletePage, QueueEvent, QueueEventState, QueueHandlerOutcome,
     QueueHandlerResult, QueueOwner, QueuePullCursor, QueuePullPage, QueueScanPage,
+    MAX_QUEUE_OWNER_COMPONENT_BYTES,
 };
 pub use worker::{run_worker, WorkerConfig};
 
@@ -16,6 +17,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::Utc;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -30,6 +32,7 @@ pub(crate) const COMPLETED_EVENT_MAINTENANCE_MAX_BATCHES: usize = 4;
 pub const MAX_QUEUE_EVENT_BYTES: usize = 1024 * 1024;
 pub(crate) const QUEUE_SCAN_RPC_LIMIT: u32 = 16;
 const KEY_NUMBER_DIGITS: usize = 20;
+const OWNER_INDEX_PREFIX: &str = "queue:owner:";
 
 #[derive(Clone)]
 pub struct Queue<E: TitoEngine> {
@@ -128,6 +131,87 @@ impl<E: TitoEngine> Queue<E> {
         }
     }
 
+    fn owner_state_prefix(owner: &QueueOwner, state: QueueEventState) -> Result<String, TitoError> {
+        owner.validate()?;
+        Ok(format!(
+            "{OWNER_INDEX_PREFIX}{}:{}:{}:",
+            URL_SAFE_NO_PAD.encode(owner.kind.as_bytes()),
+            URL_SAFE_NO_PAD.encode(owner.id.as_bytes()),
+            Self::state_value(state),
+        ))
+    }
+
+    fn owner_index_key(
+        owner: &QueueOwner,
+        state: QueueEventState,
+        storage_key: &[u8],
+    ) -> Result<String, TitoError> {
+        Ok(format!(
+            "{}{}",
+            Self::owner_state_prefix(owner, state)?,
+            URL_SAFE_NO_PAD.encode(storage_key),
+        ))
+    }
+
+    fn indexed_storage_key(index_key: &[u8], prefix: &str) -> Result<Vec<u8>, TitoError> {
+        let index_key = std::str::from_utf8(index_key).map_err(|_| {
+            TitoError::DeserializationFailed("Invalid queue owner index key".to_string())
+        })?;
+        let encoded = index_key.strip_prefix(prefix).ok_or_else(|| {
+            TitoError::DeserializationFailed(
+                "Queue owner index escaped its requested prefix".to_string(),
+            )
+        })?;
+        URL_SAFE_NO_PAD.decode(encoded).map_err(|error| {
+            TitoError::DeserializationFailed(format!(
+                "Invalid queue owner index storage key: {error}"
+            ))
+        })
+    }
+
+    fn owner_from_value(event: &Value) -> Result<Option<QueueOwner>, TitoError> {
+        let Some(owner) = event.get("owner") else {
+            return Ok(None);
+        };
+        if owner.is_null() {
+            return Ok(None);
+        }
+        let owner = serde_json::from_value::<QueueOwner>(owner.clone())
+            .map_err(|error| TitoError::DeserializationFailed(error.to_string()))?;
+        owner.validate()?;
+        Ok(Some(owner))
+    }
+
+    async fn put_owner_index(
+        tx: &E::Transaction,
+        owner: Option<&QueueOwner>,
+        state: QueueEventState,
+        storage_key: &[u8],
+    ) -> Result<(), TitoError> {
+        let Some(owner) = owner else {
+            return Ok(());
+        };
+        let index_key = Self::owner_index_key(owner, state, storage_key)?;
+        tx.put(index_key.as_bytes(), Vec::new())
+            .await
+            .map_err(|error| TitoError::CreateFailed(format!("Create queue owner index: {error}")))
+    }
+
+    async fn delete_owner_index(
+        tx: &E::Transaction,
+        owner: Option<&QueueOwner>,
+        state: QueueEventState,
+        storage_key: &[u8],
+    ) -> Result<(), TitoError> {
+        let Some(owner) = owner else {
+            return Ok(());
+        };
+        let index_key = Self::owner_index_key(owner, state, storage_key)?;
+        tx.delete(index_key.as_bytes())
+            .await
+            .map_err(|error| TitoError::DeleteFailed(format!("Delete queue owner index: {error}")))
+    }
+
     fn validate_timestamp(timestamp: i64) -> Result<(), TitoError> {
         if timestamp < 0 {
             return Err(TitoError::InvalidInput(
@@ -221,6 +305,9 @@ impl<E: TitoEngine> Queue<E> {
         tx: &E::Transaction,
     ) -> Result<(), TitoError> {
         Self::validate_timestamp(event.timestamp)?;
+        if let Some(owner) = event.owner.as_ref() {
+            owner.validate()?;
+        }
         let partition = self.partition_for_key(&event.key);
         let pending_key =
             Self::pending_key(partition, event.timestamp, tx.start_version(), &event.id);
@@ -233,6 +320,13 @@ impl<E: TitoEngine> Queue<E> {
         tx.put(pending_key.as_bytes(), bytes)
             .await
             .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
+        Self::put_owner_index(
+            tx,
+            event.owner.as_ref(),
+            QueueEventState::Pending,
+            pending_key.as_bytes(),
+        )
+        .await?;
 
         Ok(())
     }
@@ -398,6 +492,7 @@ impl<E: TitoEngine> Queue<E> {
                                 "Queue event missing timestamp".to_string(),
                             )
                         })?;
+                    let owner = Self::owner_from_value(&event)?;
                     let processed_at = Utc::now().timestamp();
                     event["state"] =
                         Value::String(Self::state_value(QueueEventState::Completed).to_string());
@@ -408,11 +503,25 @@ impl<E: TitoEngine> Queue<E> {
                         .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
 
                     Self::delete_entry(&tx, key.as_bytes()).await?;
+                    Self::delete_owner_index(
+                        &tx,
+                        owner.as_ref(),
+                        QueueEventState::Pending,
+                        key.as_bytes(),
+                    )
+                    .await?;
                     tx.put(completed_key.as_bytes(), completed_bytes)
                         .await
                         .map_err(|e| {
                             TitoError::UpdateFailed(format!("Create completed event: {}", e))
                         })?;
+                    Self::put_owner_index(
+                        &tx,
+                        owner.as_ref(),
+                        QueueEventState::Completed,
+                        completed_key.as_bytes(),
+                    )
+                    .await?;
 
                     Ok::<_, TitoError>(())
                 }
@@ -426,6 +535,9 @@ impl<E: TitoEngine> Queue<E> {
         mut next: QueueEvent<T>,
     ) -> Result<(), TitoError> {
         Self::validate_timestamp(next.timestamp)?;
+        if let Some(owner) = next.owner.as_ref() {
+            owner.validate()?;
+        }
         if !storage_key.starts_with(Self::state_prefix(QueueEventState::Pending)) {
             return Err(TitoError::InvalidInput(
                 "Only pending queue events can be rescheduled".to_string(),
@@ -476,6 +588,12 @@ impl<E: TitoEngine> Queue<E> {
                             "A rescheduled row must preserve the event partition key".to_string(),
                         ));
                     }
+                    let current_owner = Self::owner_from_value(&current)?;
+                    if current_owner.as_ref() != next.owner.as_ref() {
+                        return Err(TitoError::InvalidInput(
+                            "A rescheduled row must preserve the event owner".to_string(),
+                        ));
+                    }
                     let next_payload = serde_json::to_value(&next.payload)
                         .map_err(|error| TitoError::SerializationFailed(error.to_string()))?;
                     if current.get("payload") != Some(&next_payload) {
@@ -507,6 +625,13 @@ impl<E: TitoEngine> Queue<E> {
                     let pending_bytes = Self::serialize_new_event(&next)?;
 
                     Self::delete_entry(&tx, storage_key.as_bytes()).await?;
+                    Self::delete_owner_index(
+                        &tx,
+                        current_owner.as_ref(),
+                        QueueEventState::Pending,
+                        storage_key.as_bytes(),
+                    )
+                    .await?;
                     tx.put(completed_key.as_bytes(), completed_bytes)
                         .await
                         .map_err(|error| {
@@ -514,9 +639,23 @@ impl<E: TitoEngine> Queue<E> {
                                 "Complete rescheduled queue event: {error}"
                             ))
                         })?;
+                    Self::put_owner_index(
+                        &tx,
+                        current_owner.as_ref(),
+                        QueueEventState::Completed,
+                        completed_key.as_bytes(),
+                    )
+                    .await?;
                     tx.put(pending_key.as_bytes(), pending_bytes)
                         .await
                         .map_err(|error| TitoError::CreateFailed(error.to_string()))?;
+                    Self::put_owner_index(
+                        &tx,
+                        next.owner.as_ref(),
+                        QueueEventState::Pending,
+                        pending_key.as_bytes(),
+                    )
+                    .await?;
                     Ok(())
                 }
             })
@@ -524,7 +663,7 @@ impl<E: TitoEngine> Queue<E> {
     }
 
     pub async fn clear(&self) -> Result<(), TitoError> {
-        for prefix in ["queue:pending:", "queue:completed:"] {
+        for prefix in ["queue:pending:", "queue:completed:", OWNER_INDEX_PREFIX] {
             loop {
                 let deleted = self
                     .engine
@@ -587,7 +726,13 @@ impl<E: TitoEngine> Queue<E> {
                 .map_err(|e| TitoError::QueryFailed(format!("Scan completed queue: {}", e)))?;
 
                 let deleted = entries.len();
-                for (storage_key, _) in entries {
+                for (storage_key, value) in entries {
+                    if let Ok(event) = Self::read_value_from_entry(&value) {
+                        if let Ok(owner) = Self::owner_from_value(&event) {
+                            Self::delete_owner_index(&tx, owner.as_ref(), state, &storage_key)
+                                .await?;
+                        }
+                    }
                     Self::delete_entry(&tx, storage_key.as_slice()).await?;
                 }
 
@@ -702,6 +847,7 @@ impl<E: TitoEngine> Queue<E> {
             let event = Self::read_event_from_value::<T>(&value)?;
             if event.state == state && matches(&event)? {
                 deleted_event_ids.push(event.id);
+                Self::delete_owner_index(tx, event.owner.as_ref(), state, &storage_key).await?;
                 Self::delete_entry(tx, &storage_key).await?;
             }
         }
@@ -711,6 +857,60 @@ impl<E: TitoEngine> Queue<E> {
             deleted_event_ids,
             next_cursor,
         })
+    }
+
+    /// Deletes a bounded batch by the optional owner index inside the caller's transaction.
+    ///
+    /// The predicate can preserve a currently executing owner lifecycle event. Only rows published
+    /// with owner indexes by this queue protocol are visible; an upgrade must drain/reset old rows
+    /// or explicitly backfill them before relying on owner-bounded erasure.
+    pub async fn delete_by_owner_matching_in_tx<T, F>(
+        &self,
+        owner: &QueueOwner,
+        state: QueueEventState,
+        limit: u32,
+        tx: &E::Transaction,
+        matches: F,
+    ) -> Result<usize, TitoError>
+    where
+        T: DeserializeOwned + Clone + Send + Sync + 'static,
+        F: Fn(&QueueEvent<T>) -> Result<bool, TitoError> + Send + Sync,
+    {
+        let prefix = Self::owner_state_prefix(owner, state)?;
+        let entries = Self::scan_queue_entries(
+            tx,
+            prefix.as_bytes().to_vec(),
+            Self::prefix_end(&prefix),
+            limit.max(1),
+        )
+        .await
+        .map_err(|error| TitoError::QueryFailed(format!("Scan queue owner index: {error}")))?;
+        let mut deleted = 0usize;
+
+        for (index_key, _) in entries {
+            let storage_key = Self::indexed_storage_key(&index_key, &prefix)?;
+            let Some(value) = tx.get(&storage_key).await.map_err(|error| {
+                TitoError::QueryFailed(format!("Get owner-indexed queue event: {error}"))
+            })?
+            else {
+                Self::delete_entry(tx, &index_key).await?;
+                deleted += 1;
+                continue;
+            };
+            let event = Self::read_event_from_value::<T>(&value)?;
+            if event.state != state || event.owner.as_ref() != Some(owner) {
+                return Err(TitoError::InvalidInput(
+                    "Queue owner index conflicts with its event".to_string(),
+                ));
+            }
+            if matches(&event)? {
+                Self::delete_entry(tx, &storage_key).await?;
+                Self::delete_entry(tx, &index_key).await?;
+                deleted += 1;
+            }
+        }
+
+        Ok(deleted)
     }
 }
 
@@ -1105,5 +1305,114 @@ mod tests {
             .events
             .iter()
             .all(|(_, event)| event.owner.as_ref() == Some(&foreign)));
+    }
+
+    #[tokio::test]
+    async fn owner_index_deletes_only_the_owned_invocations_across_queue_states() {
+        let engine = MemoryEngine::default();
+        let queue = queue(engine.clone());
+        let now = Utc::now().timestamp();
+        let target = QueueOwner::new("store", "target:with/slashes").unwrap();
+        let foreign = QueueOwner::new("store", "foreign").unwrap();
+
+        for (name, owner) in [
+            ("acknowledged", target.clone()),
+            ("rescheduled", target.clone()),
+            ("kept", target.clone()),
+            ("foreign", foreign.clone()),
+        ] {
+            queue
+                .publish(
+                    QueueEvent::new(format!("entry:{name}"), payload(name), now).with_owner(owner),
+                )
+                .await
+                .unwrap();
+        }
+
+        let due = queue.pull::<Payload>(0, None, 10).await.unwrap().events;
+        let (ack_key, _) = due
+            .iter()
+            .find(|(_, event)| event.payload.name == "acknowledged")
+            .unwrap();
+        queue.ack(ack_key).await.unwrap();
+        let (reschedule_key, rescheduled) = due
+            .iter()
+            .find(|(_, event)| event.payload.name == "rescheduled")
+            .unwrap();
+        queue
+            .reschedule(reschedule_key, rescheduled.rescheduled(now + 60))
+            .await
+            .unwrap();
+
+        let deleted_pending = engine
+            .transaction(|tx| {
+                let queue = queue.clone();
+                let target = target.clone();
+                async move {
+                    queue
+                        .delete_by_owner_matching_in_tx::<Payload, _>(
+                            &target,
+                            QueueEventState::Pending,
+                            100,
+                            &tx,
+                            |event| Ok(event.payload.name != "kept"),
+                        )
+                        .await
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(deleted_pending, 1);
+
+        let deleted_completed = engine
+            .transaction(|tx| {
+                let queue = queue.clone();
+                let target = target.clone();
+                async move {
+                    queue
+                        .delete_by_owner_matching_in_tx::<Payload, _>(
+                            &target,
+                            QueueEventState::Completed,
+                            100,
+                            &tx,
+                            |_| Ok(true),
+                        )
+                        .await
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(deleted_completed, 2);
+
+        let pending = queue
+            .scan_by_state::<Payload>(QueueEventState::Pending, None, 10)
+            .await
+            .unwrap();
+        let mut names = pending
+            .events
+            .into_iter()
+            .map(|(_, event)| event.payload.name)
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, vec!["foreign", "kept"]);
+        assert!(queue
+            .scan_by_state::<Payload>(QueueEventState::Completed, None, 10)
+            .await
+            .unwrap()
+            .events
+            .is_empty());
+
+        let target_pending_prefix =
+            Queue::<MemoryEngine>::owner_state_prefix(&target, QueueEventState::Pending).unwrap();
+        let target_completed_prefix =
+            Queue::<MemoryEngine>::owner_state_prefix(&target, QueueEventState::Completed).unwrap();
+        assert_eq!(
+            engine.keys_with_prefix(&target_pending_prefix).await.len(),
+            1
+        );
+        assert!(engine
+            .keys_with_prefix(&target_completed_prefix)
+            .await
+            .is_empty());
     }
 }

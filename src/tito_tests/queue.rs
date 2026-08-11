@@ -1,4 +1,5 @@
 use super::*;
+use crate::QueueOwner;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
@@ -197,8 +198,9 @@ async fn queue_ack_indeterminate_commit_converges_to_one_of_the_two_atomic_state
         let engine = engine();
         let queue = queue(engine.clone(), 1);
         let timestamp = Utc::now().timestamp() - 10;
+        let owner = QueueOwner::new("store", "atomic-owner").unwrap();
         queue
-            .publish(queue_event("event-1", "entry:1", timestamp))
+            .publish(queue_event("event-1", "entry:1", timestamp).with_owner(owner.clone()))
             .await
             .unwrap();
         let (storage_key, current) = queue
@@ -222,16 +224,20 @@ async fn queue_ack_indeterminate_commit_converges_to_one_of_the_two_atomic_state
             .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
             .await
             .unwrap();
+        let owner_indexes = engine.keys_with_prefix("queue:owner:").await;
+        assert_eq!(owner_indexes.len(), 1);
         if after_apply {
             assert!(pending.events.is_empty());
             assert_eq!(completed.events.len(), 1);
             assert_eq!(completed.events[0].1.id, current.id);
             assert_eq!(completed.events[0].1.state, QueueEventState::Completed);
+            assert!(owner_indexes[0].contains(":completed:"));
         } else {
             assert_eq!(pending.events.len(), 1);
             assert_eq!(pending.events[0].0, storage_key);
             assert_eq!(pending.events[0].1.id, current.id);
             assert!(completed.events.is_empty());
+            assert!(owner_indexes[0].contains(":pending:"));
         }
     }
 }

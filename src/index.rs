@@ -63,10 +63,9 @@ impl<
                                     None => None,
                                 }
                             }
-                            TitoIndexBlockType::Number => match value.as_i64() {
-                                Some(n) => Some(format!("{}:{}:{:0>10}", field.name, key, n)),
-                                None => None,
-                            },
+                            TitoIndexBlockType::Number => value
+                                .as_i64()
+                                .map(|n| format!("{}:{}:{:0>10}", field.name, key, n)),
                         },
                         FieldValue::Simple(value) => match &field.r#type {
                             TitoIndexBlockType::String | TitoIndexBlockType::Custom(_) => {
@@ -76,10 +75,9 @@ impl<
                                     None => None,
                                 }
                             }
-                            TitoIndexBlockType::Number => match value.as_i64() {
-                                Some(n) => Some(format!("{}:{:0>10}", field.name, n)),
-                                None => None,
-                            },
+                            TitoIndexBlockType::Number => {
+                                value.as_i64().map(|n| format!("{}:{:0>10}", field.name, n))
+                            }
                         },
                     };
 
