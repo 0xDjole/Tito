@@ -44,10 +44,9 @@ impl<
                     TitoIndexBlockType::Custom(value) => {
                         vec![FieldValue::Simple(Value::String(value.clone()))]
                     }
-                    _ => match self.get_nested_values(json, &field.name) {
-                        Some(values) if !values.is_empty() => values,
-                        _ => vec![FieldValue::Simple(Value::String("__null__".to_string()))],
-                    },
+                    _ => self
+                        .get_nested_values(json, &field.name)
+                        .unwrap_or_default(),
                 };
 
                 let mut new_combinations = vec![];
@@ -57,30 +56,28 @@ impl<
                         FieldValue::HashMapEntry { key, value } => match &field.r#type {
                             TitoIndexBlockType::String | TitoIndexBlockType::Custom(_) => {
                                 match value.as_str() {
-                                    Some("") => Some(format!("{}:{}.__null__", field.name, key)),
+                                    Some("") => None,
                                     Some(s) => {
                                         Some(format!("{}:{}.{}", field.name, key, safe_encode(s)))
                                     }
-                                    None => Some(format!("{}:{}.__null__", field.name, key)),
+                                    None => None,
                                 }
                             }
-                            TitoIndexBlockType::Number => match value.as_i64() {
-                                Some(n) => Some(format!("{}:{}:{:0>10}", field.name, key, n)),
-                                None => Some(format!("{}:{}:__null__", field.name, key)),
-                            },
+                            TitoIndexBlockType::Number => value
+                                .as_i64()
+                                .map(|n| format!("{}:{}:{:0>10}", field.name, key, n)),
                         },
                         FieldValue::Simple(value) => match &field.r#type {
                             TitoIndexBlockType::String | TitoIndexBlockType::Custom(_) => {
                                 match value.as_str() {
-                                    Some("") => Some(format!("{}:__null__", field.name)),
+                                    Some("") => None,
                                     Some(s) => Some(format!("{}:{}", field.name, safe_encode(s))),
-                                    None => Some(format!("{}:__null__", field.name)),
+                                    None => None,
                                 }
                             }
-                            TitoIndexBlockType::Number => match value.as_i64() {
-                                Some(n) => Some(format!("{}:{:0>10}", field.name, n)),
-                                None => Some(format!("{}:__null__", field.name)),
-                            },
+                            TitoIndexBlockType::Number => {
+                                value.as_i64().map(|n| format!("{}:{:0>10}", field.name, n))
+                            }
                         },
                     };
 
@@ -96,9 +93,12 @@ impl<
                     }
                 }
 
-                if !new_combinations.is_empty() {
-                    combinations = new_combinations;
+                if new_combinations.is_empty() {
+                    combinations.clear();
+                    break;
                 }
+
+                combinations = new_combinations;
             }
 
             for combo in combinations {

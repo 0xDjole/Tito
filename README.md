@@ -9,6 +9,11 @@ A database layer on TiKV with indexing, relationships, transactions, and a built
 - **Relationships**: Embedded relationship hydration
 - **Transactions**: Full ACID transactions
 - **Query Builder**: Fluent API for querying by index
+
+Indexes are sparse. Tito writes an index key only when every configured field contains a value of
+the configured type. Missing fields, JSON `null`, empty strings, empty collections, and values of a
+different type produce no key for that index. A model can use `condition` to apply an additional
+domain-specific inclusion rule.
 - **Transactional Publication**: Queue events can be written atomically with application data
 - **Partitioned Queue**: Horizontal scaling via stable business-key partitions
 - **Event Timestamps**: Each event says when it becomes runnable
@@ -165,6 +170,14 @@ queue cleanup to the application's backup process.
 
 `Reschedule` is not an automatic retry policy. The application decides whether another event exists and supplies the complete event, including its timestamp. Tito creates no successor on its own and never interprets provider or domain state.
 
+An optional `QueueOwner` gives an application a bounded ownership index without changing due-time
+ordering. Tito writes that secondary key in the same transaction as publication, moves it atomically
+on acknowledge/reschedule, and removes it with the queue row. Applications that must erase one
+owner's work can call `delete_by_owner_matching_in_tx`; the scan touches only that owner's Pending
+or Completed keys and the predicate can preserve a currently executing lifecycle invocation. Owner
+kind and ID are opaque, non-empty strings bounded to 512 bytes each. They are routing/erasure
+metadata, not provider identity or domain state.
+
 Workers supervise each handler with a ten-minute timeout by default. Configure `handler_timeout` when a workload has a different bounded execution contract; the timeout is executor protection and never changes queue state or provider policy.
 Worker shutdown stops new pulls and handler starts, then drains every handler that already started
 and applies its outcome before joining. The configured handler timeout bounds that drain. A handler
@@ -196,9 +209,12 @@ Tito may replay a transaction closure after an explicitly retryable, determined 
 
 ### Upgrade contract
 
-This release intentionally removes the former retry/DLQ metadata and changes Pending storage keys
-to include the fixed-width event timestamp and enqueue-version fields. It is not wire-compatible with workers
-using either older queue protocol. Do not run old and new queue protocols together.
+This queue protocol removes the former retry/DLQ metadata, changes Pending storage keys to include
+the fixed-width event timestamp and enqueue-version fields, and writes owner secondary keys for
+newly published invocations. It is not wire-compatible with workers using an older queue protocol.
+Do not run old and new queue protocols together. Owner indexes are not inferred from pre-upgrade
+rows; a deployment that intends to use owner-bounded erasure must reset/drain those rows or ship an
+explicit one-time bridge before enabling that operation.
 
 For the prelaunch cutover, stop publishers and workers, use the old release to drain Pending and clear its Failed/DLQ keyspaces, verify Pending is empty, deploy the replacement environment, and then restart publication and processing. If a future nonempty production environment requires migration, build and deploy a separately named bridge release first; compatibility scaffolding is not part of this queue contract.
 
@@ -219,6 +235,7 @@ fn events(&self) -> Vec<TitoEventConfig> {
 ```
 queue:pending:{partition:04}:{timestamp:020}:{enqueue_version:020}:{event_id}
 queue:completed:{processed_at:020}:{event_timestamp:020}:{event_id}
+queue:owner:{base64url(kind)}:{base64url(id)}:{state}:{base64url(queue_storage_key)}
 ```
 
 ## License

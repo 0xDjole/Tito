@@ -36,8 +36,9 @@ pub use types::{PartitionConfig, TitoEngine, TitoModelOptions, TitoModelTrait, P
 
 pub use queue::{
     run_cluster_worker, ClusterCoordinatorLease, ClusterPartitionAssignment, ClusterWorkerConfig,
-    ClusterWorkerNode, Queue, QueueConfig, QueueEvent, QueueEventState, QueueHandlerOutcome,
-    QueueHandlerResult, QueueScanPage, WorkerConfig, MAX_QUEUE_EVENT_BYTES,
+    ClusterWorkerNode, Queue, QueueConfig, QueueDeletePage, QueueEvent, QueueEventState,
+    QueueHandlerOutcome, QueueHandlerResult, QueueOwner, QueueScanPage, WorkerConfig,
+    MAX_QUEUE_EVENT_BYTES, MAX_QUEUE_OWNER_COMPONENT_BYTES,
 };
 
 pub use utils::next_string_lexicographically;
