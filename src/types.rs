@@ -113,15 +113,6 @@ pub struct TitoUtilsConnectInput {
 }
 
 #[derive(Debug, Clone)]
-pub struct TitoEmbeddedRelationshipConfig {
-    pub source_field_name: String,
-    pub destination_field_name: String,
-    pub model: String,
-}
-
-pub type TitoRelationshipConfig = TitoEmbeddedRelationshipConfig;
-
-#[derive(Debug, Clone)]
 pub enum TitoIndexBlockType {
     String,
     Number,
@@ -163,10 +154,6 @@ pub struct TitoRelIndexConfig {
 }
 
 pub trait TitoModelTrait {
-    fn relationships() -> Vec<TitoRelationshipConfig> {
-        vec![]
-    }
-
     fn indexes(&self) -> Vec<TitoIndexConfig>;
     fn table() -> String;
     fn id(&self) -> String;
@@ -216,14 +203,12 @@ pub struct TitoFindPayload {
     pub end: Option<String>,
     pub limit: Option<u32>,
     pub cursor: Option<String>,
-    pub rels: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TitoFindByIndexPayload {
     pub index: String,
     pub values: Vec<String>,
-    pub rels: Vec<String>,
     pub limit: Option<u32>,
     pub cursor: Option<String>,
 }
@@ -240,7 +225,6 @@ pub struct TitoFindByMultipleIndexQuery {
     pub index: String,
     pub edge_name: Option<String>,
     pub values: Vec<String>,
-    pub rels: Vec<String>,
     pub end: Option<String>,
 }
 
@@ -248,7 +232,6 @@ pub struct TitoFindByMultipleIndexQuery {
 pub struct TitoFindOneByIndexPayload {
     pub index: String,
     pub values: Vec<String>,
-    pub rels: Vec<String>,
 }
 
 #[derive(Default, Serialize, Debug)]

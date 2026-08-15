@@ -251,7 +251,6 @@ async fn find_one_by_index_returns_first_match_or_not_found() {
             TitoFindOneByIndexPayload {
                 index: "author-by-email".to_string(),
                 values: vec!["ada@example.com".to_string()],
-                rels: Vec::new(),
             },
             None,
         )
@@ -264,7 +263,6 @@ async fn find_one_by_index_returns_first_match_or_not_found() {
             TitoFindOneByIndexPayload {
                 index: "author-by-email".to_string(),
                 values: vec!["missing@example.com".to_string()],
-                rels: Vec::new(),
             },
             None,
         )
@@ -282,7 +280,6 @@ async fn unknown_index_and_extra_index_values_return_errors() {
                 TitoFindByIndexPayload {
                     index: "missing".to_string(),
                     values: vec!["x".to_string()],
-                    rels: Vec::new(),
                     limit: None,
                     cursor: None,
                 },
@@ -299,7 +296,6 @@ async fn unknown_index_and_extra_index_values_return_errors() {
                 TitoFindByIndexPayload {
                     index: "author-by-email".to_string(),
                     values: vec!["x".to_string(), "y".to_string()],
-                    rels: Vec::new(),
                     limit: None,
                     cursor: None,
                 },

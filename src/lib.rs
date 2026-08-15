@@ -23,8 +23,6 @@ pub use event::TitoEvent;
 
 pub mod index;
 
-pub mod relationship;
-
 #[cfg(test)]
 mod test_support;
 

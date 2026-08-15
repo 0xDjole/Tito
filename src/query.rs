@@ -20,7 +20,6 @@ where
     model: TitoModel<E, T>,
     index: String,
     values: Vec<String>,
-    rels: Vec<String>,
     limit: Option<u32>,
     cursor: Option<String>,
 }
@@ -42,7 +41,6 @@ where
             model: model.clone(),
             index,
             values: Vec::new(),
-            rels: Vec::new(),
             limit: None,
             cursor: None,
         }
@@ -50,11 +48,6 @@ where
 
     pub fn value(&mut self, value: impl Into<String>) -> &mut Self {
         self.values.push(value.into());
-        self
-    }
-
-    pub fn relationship(&mut self, rel: impl Into<String>) -> &mut Self {
-        self.rels.push(rel.into());
         self
     }
 
@@ -75,7 +68,6 @@ where
         let payload = TitoFindByIndexPayload {
             index: self.index.clone(),
             values: self.values.clone(),
-            rels: self.rels.clone(),
             limit: self.limit,
             cursor: self.cursor.clone(),
         };
@@ -90,7 +82,6 @@ where
         let payload = TitoFindByIndexPayload {
             index: self.index.clone(),
             values: self.values.clone(),
-            rels: self.rels.clone(),
             limit: self.limit,
             cursor: self.cursor.clone(),
         };

@@ -1,12 +1,11 @@
 # Tito
 
-A database layer on TiKV with indexing, relationships, transactions, and a built-in partitioned event queue.
+A database layer on TiKV with indexing, transactions, and a built-in partitioned scheduled queue.
 
 ## Features
 
 - **Data Storage**: Models with CRUD operations
 - **Indexing**: Conditional and composite indexes for efficient queries
-- **Relationships**: Embedded relationship hydration
 - **Transactions**: Full ACID transactions
 - **Query Builder**: Fluent API for querying by index
 
@@ -83,35 +82,8 @@ let mut query = users.query_by_index("by_email");
 let results = query.value(&email).limit(Some(10)).execute().await?;
 ```
 
-## Relationships
-
-```rust
-#[derive(Default, Clone, Serialize, Deserialize)]
-struct Post {
-    id: String,
-    title: String,
-    tag_ids: Vec<String>,
-    #[serde(default)]
-    tags: Vec<Tag>,
-}
-
-impl TitoModelTrait for Post {
-    fn relationships(&self) -> Vec<TitoRelationshipConfig> {
-        vec![TitoRelationshipConfig {
-            source_field_name: "tag_ids".to_string(),
-            destination_field_name: "tags".to_string(),
-            model: "tag".to_string(),
-        }]
-    }
-
-    fn references(&self) -> Vec<String> {
-        self.tag_ids.clone()
-    }
-}
-
-let mut query = posts.query_by_index("by_author");
-let results = query.value(&author_id).relationship("tags").execute().await?;
-```
+Tito reads and writes one model at a time. Applications load related records explicitly so their
+domain and API boundaries determine when an additional read is required.
 
 ## Queue Processing
 

@@ -7,7 +7,7 @@ use crate::{
     query::IndexQueryBuilder,
     types::{
         FieldValue, ReverseIndex, TitoCursor, TitoEngine, TitoFindPayload, TitoKvPair,
-        TitoModelOptions, TitoPaginated, TitoRelationshipConfig, TitoScanPayload, TitoTransaction,
+        TitoModelOptions, TitoPaginated, TitoScanPayload, TitoTransaction,
     },
     utils::{next_string_lexicographically, previous_string_lexicographically},
 };
@@ -46,34 +46,22 @@ impl<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> SetBuilder<'a, E,
 pub struct GetBuilder<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> {
     model: &'a TitoModel<E, T>,
     id: String,
-    rels: Vec<String>,
 }
 
 impl<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> GetBuilder<'a, E, T> {
-    pub fn relationship(mut self, rel: impl Into<String>) -> Self {
-        self.rels.push(rel.into());
-        self
-    }
-
     pub async fn execute(self, tx: Option<&E::Transaction>) -> Result<T, TitoError> {
-        self.model.get_internal(&self.id, self.rels, tx).await
+        self.model.get_internal(&self.id, tx).await
     }
 }
 
 pub struct GetManyBuilder<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> {
     model: &'a TitoModel<E, T>,
     ids: Vec<String>,
-    rels: Vec<String>,
 }
 
 impl<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> GetManyBuilder<'a, E, T> {
-    pub fn relationship(mut self, rel: impl Into<String>) -> Self {
-        self.rels.push(rel.into());
-        self
-    }
-
     pub async fn execute(self, tx: Option<&E::Transaction>) -> Result<Vec<T>, TitoError> {
-        self.model.get_many_internal(self.ids, self.rels, tx).await
+        self.model.get_many_internal(self.ids, tx).await
     }
 }
 
@@ -84,10 +72,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             partition_count: options.partition_count,
             _phantom: PhantomData,
         }
-    }
-
-    pub fn relationships(&self) -> Vec<TitoRelationshipConfig> {
-        T::relationships()
     }
 
     pub fn get_table(&self) -> String {
@@ -383,62 +367,39 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         })
     }
 
-    async fn get_one_with_tx(
-        &self,
-        id: &str,
-        rels: Vec<String>,
-        tx: &E::Transaction,
-    ) -> Result<T, TitoError>
+    async fn get_one_with_tx(&self, id: &str, tx: &E::Transaction) -> Result<T, TitoError>
     where
         T: serde::de::DeserializeOwned,
     {
         let id = format!("{}:{}", self.get_table(), id);
 
-        let value = self.get_raw(&id, tx).await?;
-        let items = self
-            .fetch_and_stitch_relationships(vec![value], rels.clone(), tx)
-            .await?;
-
-        if let Some(value) = items.first() {
-            serde_json::from_value(value.1.clone()).map_err(|err| {
-                TitoError::DeserializationFailed(format!(
-                    "Failed to deserialize record with id '{}': {}",
-                    id, err
-                ))
-            })
-        } else {
-            Err(TitoError::NotFound(format!(
-                "No record found with id '{}'",
-                id
-            )))
-        }
+        let (_, value) = self.get_raw(&id, tx).await?;
+        serde_json::from_value(value).map_err(|err| {
+            TitoError::DeserializationFailed(format!(
+                "Failed to deserialize record with id '{}': {}",
+                id, err
+            ))
+        })
     }
 
     pub fn get(&self, id: &str) -> GetBuilder<'_, E, T> {
         GetBuilder {
             model: self,
             id: id.to_string(),
-            rels: vec![],
         }
     }
 
-    async fn get_internal(
-        &self,
-        id: &str,
-        rels: Vec<String>,
-        tx: Option<&E::Transaction>,
-    ) -> Result<T, TitoError>
+    async fn get_internal(&self, id: &str, tx: Option<&E::Transaction>) -> Result<T, TitoError>
     where
         T: serde::de::DeserializeOwned,
     {
         match tx {
-            Some(tx) => self.get_one_with_tx(id, rels, tx).await,
+            Some(tx) => self.get_one_with_tx(id, tx).await,
             None => {
                 let id = id.to_string();
                 self.tx(|tx| {
                     let id = id.clone();
-                    let rels = rels.clone();
-                    async move { self.get_one_with_tx(&id, rels, &tx).await }
+                    async move { self.get_one_with_tx(&id, &tx).await }
                 })
                 .await
             }
@@ -494,7 +455,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     pub async fn get_many_raw(
         &self,
         ids: Vec<String>,
-        rels: Vec<String>,
         tx: &E::Transaction,
     ) -> Result<Vec<(String, Value)>, TitoError>
     where
@@ -505,22 +465,18 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             .map(|id| format!("{}:{}", self.get_table(), id))
             .collect();
 
-        let items = self.batch_get(ids, tx).await?;
-        let items = self.fetch_and_stitch_relationships(items, rels, tx).await?;
-
-        Ok(items)
+        self.batch_get(ids, tx).await
     }
 
     async fn get_many_with_tx(
         &self,
         ids: Vec<String>,
-        rels: Vec<String>,
         tx: &E::Transaction,
     ) -> Result<Vec<T>, TitoError>
     where
         T: DeserializeOwned,
     {
-        let items = self.get_many_raw(ids, rels, tx).await?;
+        let items = self.get_many_raw(ids, tx).await?;
 
         let mut result = vec![];
 
@@ -534,29 +490,23 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     }
 
     pub fn get_many(&self, ids: Vec<String>) -> GetManyBuilder<'_, E, T> {
-        GetManyBuilder {
-            model: self,
-            ids,
-            rels: vec![],
-        }
+        GetManyBuilder { model: self, ids }
     }
 
     async fn get_many_internal(
         &self,
         ids: Vec<String>,
-        rels: Vec<String>,
         tx: Option<&E::Transaction>,
     ) -> Result<Vec<T>, TitoError>
     where
         T: DeserializeOwned,
     {
         match tx {
-            Some(tx) => self.get_many_with_tx(ids, rels, tx).await,
+            Some(tx) => self.get_many_with_tx(ids, tx).await,
             None => {
                 self.tx(|tx| {
                     let ids = ids.clone();
-                    let rels = rels.clone();
-                    async move { self.get_many_with_tx(ids, rels, &tx).await }
+                    async move { self.get_many_with_tx(ids, &tx).await }
                 })
                 .await
             }
@@ -718,11 +668,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                     )
                     .await?;
 
-                let items = self
-                    .fetch_and_stitch_relationships(scan_stream, payload.rels, &tx)
-                    .await?;
-
-                self.to_paginated_items(items, has_more)
+                self.to_paginated_items(scan_stream, has_more)
             }
         })
         .await
