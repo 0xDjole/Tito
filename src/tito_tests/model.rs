@@ -182,7 +182,6 @@ async fn find_paginates_with_cursor() {
             end: None,
             limit: Some(2),
             cursor: None,
-            rels: Vec::new(),
         })
         .await
         .unwrap();
@@ -195,7 +194,6 @@ async fn find_paginates_with_cursor() {
             end: None,
             limit: Some(2),
             cursor: first.cursor,
-            rels: Vec::new(),
         })
         .await
         .unwrap();
@@ -337,7 +335,6 @@ async fn invalid_find_cursor_returns_deserialization_error() {
             end: None,
             limit: Some(1),
             cursor: Some("not-base64".to_string()),
-            rels: Vec::new(),
         })
         .await
         .unwrap_err();

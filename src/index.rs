@@ -173,10 +173,6 @@ impl<
             )
             .await?;
 
-        let items = self
-            .fetch_and_stitch_relationships(items, payload.rels, tx)
-            .await?;
-
         Ok((items, has_more))
     }
 
@@ -239,10 +235,6 @@ impl<
                 },
                 tx,
             )
-            .await?;
-
-        let items = self
-            .fetch_and_stitch_relationships(items, payload.rels, tx)
             .await?;
 
         Ok((items, has_more))
@@ -331,7 +323,6 @@ impl<
                 TitoFindByIndexPayload {
                     index: payload.index.clone(),
                     values: payload.values.clone(),
-                    rels: payload.rels.clone(),
                     limit: Some(1),
                     cursor: None,
                 },

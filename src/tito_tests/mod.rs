@@ -6,7 +6,7 @@ use crate::test_support::MemoryEngine;
 use crate::types::{
     PartitionConfig, TitoCursor, TitoEngine, TitoFindByIndexPayload, TitoFindOneByIndexPayload,
     TitoFindPayload, TitoId, TitoIndexBlockType, TitoIndexConfig, TitoIndexField, TitoModelOptions,
-    TitoModelTrait, TitoPaginated, TitoRelationshipConfig, TitoScanPayload,
+    TitoModelTrait, TitoPaginated, TitoScanPayload,
 };
 use crate::utils::{next_string_lexicographically, previous_string_lexicographically};
 use crate::{ClusterCoordinatorLease, ClusterWorkerConfig, TitoError};
@@ -181,26 +181,6 @@ struct Post {
 }
 
 impl TitoModelTrait for Post {
-    fn relationships() -> Vec<TitoRelationshipConfig> {
-        vec![
-            TitoRelationshipConfig {
-                source_field_name: "author_id".to_string(),
-                destination_field_name: "author".to_string(),
-                model: "authors".to_string(),
-            },
-            TitoRelationshipConfig {
-                source_field_name: "tag_ids".to_string(),
-                destination_field_name: "tags".to_string(),
-                model: "tags".to_string(),
-            },
-            TitoRelationshipConfig {
-                source_field_name: "blocks.author_id".to_string(),
-                destination_field_name: "blocks.author".to_string(),
-                model: "authors".to_string(),
-            },
-        ]
-    }
-
     fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![
             TitoIndexConfig {
@@ -389,4 +369,3 @@ mod cluster;
 mod index;
 mod model;
 mod queue;
-mod relationship;

@@ -46,14 +46,6 @@ impl TitoModelTrait for Tag {
 }
 
 impl TitoModelTrait for Post {
-    fn relationships() -> Vec<tito::types::TitoEmbeddedRelationshipConfig> {
-        vec![tito::types::TitoRelationshipConfig {
-            source_field_name: "tag_ids".to_string(),
-            destination_field_name: "tags".to_string(),
-            model: "tag".to_string(),
-        }]
-    }
-
     fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![
             TitoIndexConfig {
@@ -146,9 +138,9 @@ async fn main() -> Result<(), TitoError> {
 
     println!("Created post: {}", post.title);
 
-    let post_with_tags = post_model
-        .get(&post.id)
-        .relationship("tags")
+    let mut post_with_tags = post_model.get(&post.id).execute(None).await?;
+    post_with_tags.tags = tag_model
+        .get_many(post_with_tags.tag_ids.clone())
         .execute(None)
         .await?;
 
@@ -159,14 +151,11 @@ async fn main() -> Result<(), TitoError> {
     }
 
     let mut query = post_model.query_by_index("post-by-author");
-    let results = query
-        .value("Alice".to_string())
-        .relationship("tags")
-        .execute(None)
-        .await?;
+    let results = query.value("Alice".to_string()).execute(None).await?;
 
     println!("\nAlice's posts:");
-    for p in &results.items {
+    for mut p in results.items {
+        p.tags = tag_model.get_many(p.tag_ids.clone()).execute(None).await?;
         println!(
             "- {} (tags: {})",
             p.title,
