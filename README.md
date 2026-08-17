@@ -188,7 +188,7 @@ Do not run old and new queue protocols together. Owner indexes are not inferred 
 rows; a deployment that intends to use owner-bounded erasure must reset/drain those rows or ship an
 explicit one-time bridge before enabling that operation.
 
-For the prelaunch cutover, stop publishers and workers, use the old release to drain Pending and clear its Failed/DLQ keyspaces, verify Pending is empty, deploy the replacement environment, and then restart publication and processing. If a future nonempty production environment requires migration, build and deploy a separately named bridge release first; compatibility scaffolding is not part of this queue contract.
+For the prelaunch cutover, stop publishers and workers, use the source release to drain Pending and clear its Failed/DLQ keyspaces, verify Pending is empty, deploy the replacement environment, and then restart publication and processing. A future nonempty production environment requires an explicit, separately named bridge release before this queue contract is enabled.
 
 ## Future Events
 
