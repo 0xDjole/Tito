@@ -1,4 +1,5 @@
 use super::*;
+use crate::types::TitoTransaction;
 
 #[tokio::test]
 async fn model_set_get_and_get_many_round_trip() {
@@ -54,6 +55,29 @@ async fn model_set_can_skip_timestamps() {
 
     assert_eq!(saved.created_at, 0);
     assert_eq!(saved.updated_at, 0);
+}
+
+#[tokio::test]
+async fn model_set_does_not_create_undeclared_timestamp_fields() {
+    let engine = engine();
+    let model = engine.clone().model::<Tag>(TitoModelOptions::default());
+
+    engine
+        .transaction(|tx| {
+            let model = model.clone();
+            async move {
+                model.set(tag("t1", "database")).execute(&tx).await?;
+                let bytes = tx
+                    .get("table:tags:t1")
+                    .await?
+                    .expect("saved tag must exist");
+                let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value, json!({"id": "t1", "name": "database"}));
+                Ok::<_, TitoError>(())
+            }
+        })
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
