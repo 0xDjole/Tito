@@ -122,6 +122,19 @@ Secondary index values intentionally remain complete clones of the primary JSON 
 redundancy requires a separately designed release that rehydrates primary rows and migrates every
 existing index; it is not part of this correctness patch.
 
+Tito updates `created_at` and `updated_at` only when those fields are present in the model's
+serialized shape. Timestamp-bearing models keep automatic create/update timestamps. Models that do
+not declare the fields no longer acquire invisible JSON metadata that their Rust type cannot read
+back. Applications resetting or migrating from 0.16.2 should rewrite affected rows so primary and
+index values exactly match the declared model shape.
+
+### 0.16.3 rollout
+
+Version 0.16.3 preserves timestamp behavior for models that declare `created_at` or `updated_at`
+and stops adding undeclared timestamp fields. The primary and index key formats are unchanged. An
+application enforcing exact typed payloads must reset, migrate, or rewrite older rows that contain
+timestamp fields absent from their model before enabling that enforcement.
+
 ### 0.16.2 rollout
 
 Publish and tag Tito 0.16.2, update the application dependency and lockfile to exactly that patch,
