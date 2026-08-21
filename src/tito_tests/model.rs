@@ -302,6 +302,31 @@ async fn delete_range_removes_keys_inside_range_only() {
 }
 
 #[tokio::test]
+async fn delete_range_rejects_invalid_bounds_before_touching_data() {
+    let engine = engine();
+    engine
+        .put_json("table:authors:a1", &json!({"id": "a1"}))
+        .await;
+
+    for (start, end, message) in [
+        (&[][..], &b"z"[..], "Delete range bounds must not be empty"),
+        (&b"a"[..], &[][..], "Delete range bounds must not be empty"),
+        (
+            &b"table:authors;"[..],
+            &b"table:authors:"[..],
+            "Delete range start must be less than end",
+        ),
+    ] {
+        assert_eq!(
+            engine.delete_range(start, end).await.unwrap_err(),
+            TitoError::InvalidInput(message.to_string())
+        );
+    }
+
+    assert!(engine.contains_key("table:authors:a1").await);
+}
+
+#[tokio::test]
 async fn memory_engine_garbage_collection_preserves_current_values() {
     let engine = engine();
     engine
