@@ -1,4 +1,4 @@
-use crate::types::{TitoEngine, TitoKvPair, TitoTransaction, TitoValue};
+use crate::types::{validate_delete_range, TitoEngine, TitoKvPair, TitoTransaction, TitoValue};
 use crate::TitoError;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -122,6 +122,7 @@ impl TitoEngine for MemoryEngine {
     }
 
     async fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<(), TitoError> {
+        validate_delete_range(start, end)?;
         let mut data = self.data.lock().await;
         let keys: Vec<Vec<u8>> = data
             .range(start.to_vec()..end.to_vec())

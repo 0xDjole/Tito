@@ -29,6 +29,20 @@ pub type TitoValue = Vec<u8>;
 pub type TitoKvPair = (TitoKey, TitoValue);
 pub type TitoRange = Range<TitoKey>;
 
+pub(crate) fn validate_delete_range(start: &[u8], end: &[u8]) -> Result<(), TitoError> {
+    if start.is_empty() || end.is_empty() {
+        return Err(TitoError::InvalidInput(
+            "Delete range bounds must not be empty".to_string(),
+        ));
+    }
+    if start >= end {
+        return Err(TitoError::InvalidInput(
+            "Delete range start must be less than end".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct TitoModelOptions {
     pub partition_count: u32,
@@ -61,6 +75,9 @@ pub trait TitoEngine: Send + Sync + Clone {
 
     async fn clear_active_transactions(&self) -> Result<(), TitoError>;
 
+    /// Irreversibly removes every key in `[start, end)`.
+    ///
+    /// Both bounds must be non-empty and `start` must be less than `end`.
     async fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<(), TitoError>;
 
     async fn garbage_collect(&self, retention: Duration) -> Result<(), TitoError> {

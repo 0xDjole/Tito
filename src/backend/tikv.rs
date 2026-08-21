@@ -1,5 +1,7 @@
 use crate::error::TitoError;
-use crate::types::{DBUuid, TitoEngine, TitoKvPair, TitoTransaction, TitoValue};
+use crate::types::{
+    validate_delete_range, DBUuid, TitoEngine, TitoKvPair, TitoTransaction, TitoValue,
+};
 use async_trait::async_trait;
 use futures::lock::Mutex;
 use rand::Rng;
@@ -208,6 +210,7 @@ impl TitoEngine for TiKVBackend {
     }
 
     async fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<(), TitoError> {
+        validate_delete_range(start, end)?;
         let range: tikv_client::BoundRange = (start.to_vec()..end.to_vec()).into();
 
         self.client
