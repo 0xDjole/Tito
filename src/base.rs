@@ -9,7 +9,7 @@ use crate::{
         FieldValue, ReverseIndex, TitoCursor, TitoEngine, TitoFindPayload, TitoKvPair,
         TitoModelOptions, TitoPaginated, TitoScanPayload, TitoTransaction,
     },
-    utils::{next_string_lexicographically, previous_string_lexicographically},
+    utils::{key_after_bytes, prefix_end_bytes},
 };
 
 use base64::{engine::general_purpose, Engine};
@@ -110,6 +110,43 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         Ok(general_purpose::STANDARD.encode(&json_bytes))
     }
 
+    fn validate_scan_range(&self, start: &[u8], end: &[u8]) -> Result<(), TitoError> {
+        if start.is_empty() || end.is_empty() {
+            return Err(TitoError::InvalidInput(
+                "Scan range bounds must not be empty".to_string(),
+            ));
+        }
+        if start >= end {
+            return Err(TitoError::InvalidInput(
+                "Scan range start must be less than end".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_cursor_in_range(
+        &self,
+        cursor: &[u8],
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<(), TitoError> {
+        if cursor < start || cursor >= end {
+            return Err(TitoError::InvalidInput(
+                "Cursor is outside the requested scan range".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_scan_limit(&self, limit: u32) -> Result<(), TitoError> {
+        if limit == 0 {
+            return Err(TitoError::InvalidInput(
+                "Scan limit must be greater than zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn tx<F, Fut, R, Err>(&self, f: F) -> Result<R, Err>
     where
         F: FnOnce(E::Transaction) -> Fut + Clone + Send,
@@ -126,17 +163,19 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     ) -> Result<Vec<(String, Value)>, TitoError> {
         let mut results = vec![];
         for (key_bytes, value_bytes) in items {
-            let key = match String::from_utf8(key_bytes) {
-                Ok(k) => k,
-                Err(_) => {
-                    continue;
-                }
-            };
-
-            match serde_json::from_slice::<Value>(&value_bytes) {
-                Ok(value) => results.push((key, value)),
-                Err(_err) => continue,
-            }
+            let key = String::from_utf8(key_bytes).map_err(|error| {
+                TitoError::DeserializationFailed(format!(
+                    "Storage scan returned a non-UTF-8 key (valid through byte {})",
+                    error.utf8_error().valid_up_to()
+                ))
+            })?;
+            let value = serde_json::from_slice::<Value>(&value_bytes).map_err(|error| {
+                TitoError::DeserializationFailed(format!(
+                    "Failed to deserialize value for scanned key '{}': {}",
+                    key, error
+                ))
+            })?;
+            results.push((key, value));
         }
 
         Ok(results)
@@ -159,21 +198,25 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     pub async fn get_key(&self, key: &str, tx: &E::Transaction) -> Result<Value, TitoError> {
         let result = tx.get(key.to_string()).await?;
 
-        let result = result.ok_or(TitoError::NotFound("Not found".to_string()))?;
+        let result =
+            result.ok_or_else(|| TitoError::NotFound(format!("Key '{}' not found", key)))?;
 
-        serde_json::from_slice::<Value>(&result)
-            .map_err(|_| TitoError::NotFound("Not found".to_string()))
+        serde_json::from_slice::<Value>(&result).map_err(|error| {
+            TitoError::DeserializationFailed(format!(
+                "Failed to deserialize value for key '{}': {}",
+                key, error
+            ))
+        })
     }
 
-    async fn put_with_options<P>(
+    fn value_with_options<P>(
         &self,
-        key: String,
         payload: P,
         timestamps: bool,
-        tx: &E::Transaction,
+        is_new: bool,
     ) -> Result<Value, TitoError>
     where
-        P: Serialize + Unpin + std::marker::Send + Sync,
+        P: Serialize,
     {
         let mut value = serde_json::to_value(&payload)
             .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
@@ -182,7 +225,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             if let serde_json::Value::Object(ref mut map) = value {
                 let now = Utc::now().timestamp();
 
-                let is_new = !matches!(tx.get(&key).await, Ok(Some(_)));
                 if is_new {
                     map.insert("created_at".to_string(), serde_json::json!(now));
                 }
@@ -190,12 +232,18 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             }
         }
 
-        let bytes = serde_json::to_vec(&value)
-            .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
-
-        tx.put(key, bytes).await?;
-
         Ok(value)
+    }
+
+    async fn put_value(
+        &self,
+        key: String,
+        value: &Value,
+        tx: &E::Transaction,
+    ) -> Result<(), TitoError> {
+        let bytes =
+            serde_json::to_vec(value).map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
+        tx.put(key, bytes).await
     }
 
     pub async fn delete(&self, key: String, tx: &E::Transaction) -> Result<bool, TitoError> {
@@ -211,10 +259,14 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     ) -> Result<TitoPaginated<T>, TitoError> {
         let mut results = vec![];
 
-        for item in items.into_iter() {
-            if let Ok(item) = serde_json::from_value::<T>(item.1) {
-                results.push(item);
-            }
+        for (key, value) in items {
+            let item = serde_json::from_value::<T>(value).map_err(|error| {
+                TitoError::DeserializationFailed(format!(
+                    "Failed to deserialize record for scanned key '{}': {}",
+                    key, error
+                ))
+            })?;
+            results.push(item);
         }
 
         let results = TitoPaginated::new(results, Some(cursor));
@@ -230,11 +282,15 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         let mut results = vec![];
         let mut last_item: Option<String> = None;
 
-        for item in items.into_iter() {
-            last_item = Some(item.0.clone());
-            if let Ok(item) = serde_json::from_value::<T>(item.1) {
-                results.push(item);
-            }
+        for (key, value) in items {
+            let item = serde_json::from_value::<T>(value).map_err(|error| {
+                TitoError::DeserializationFailed(format!(
+                    "Failed to deserialize record for scanned key '{}': {}",
+                    key, error
+                ))
+            })?;
+            last_item = Some(key);
+            results.push(item);
         }
 
         let cursor = match (has_more, last_item) {
@@ -248,24 +304,61 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         Ok(results)
     }
 
-    async fn get_reverse_index(
+    fn deserialize_reverse_index(
         &self,
         key: &str,
-        tx: &E::Transaction,
+        bytes: &[u8],
     ) -> Result<ReverseIndex, TitoError> {
-        let result = tx.get(key.to_string()).await?;
-
-        let result = result.ok_or(TitoError::NotFound(format!(
-            "Reverse index not found for key '{}'",
-            key
-        )))?;
-
-        serde_json::from_slice::<ReverseIndex>(&result).map_err(|e| {
-            TitoError::NotFound(format!(
+        serde_json::from_slice::<ReverseIndex>(bytes).map_err(|error| {
+            TitoError::DeserializationFailed(format!(
                 "Failed to deserialize reverse index for key '{}': {}",
-                key, e
+                key, error
             ))
         })
+    }
+
+    fn validate_reverse_index_keys(
+        &self,
+        primary_key: &str,
+        reverse_index: &ReverseIndex,
+    ) -> Result<(), TitoError> {
+        let expected_suffix = format!(":{}", primary_key);
+        for key in &reverse_index.value {
+            if !key.starts_with("index:") || !key.ends_with(&expected_suffix) {
+                return Err(TitoError::IndexError(format!(
+                    "Reverse index for '{}' contains an invalid index key '{}'",
+                    primary_key, key
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn load_index_state(
+        &self,
+        primary_key: &str,
+        tx: &E::Transaction,
+    ) -> Result<Option<Vec<String>>, TitoError> {
+        let reverse_key = format!("reverse-index:{}", primary_key);
+        let primary = tx.get(primary_key).await?;
+        let reverse = tx.get(&reverse_key).await?;
+
+        match (primary, reverse) {
+            (None, None) => Ok(None),
+            (Some(_), Some(bytes)) => {
+                let reverse_index = self.deserialize_reverse_index(&reverse_key, &bytes)?;
+                self.validate_reverse_index_keys(primary_key, &reverse_index)?;
+                Ok(Some(reverse_index.value))
+            }
+            (Some(_), None) => Err(TitoError::IndexError(format!(
+                "Primary record '{}' exists without reverse index '{}'",
+                primary_key, reverse_key
+            ))),
+            (None, Some(_)) => Err(TitoError::IndexError(format!(
+                "Reverse index '{}' exists without primary record '{}'",
+                reverse_key, primary_key
+            ))),
+        }
     }
     pub fn get_nested_values(&self, json: &Value, field_path: &str) -> Option<Vec<FieldValue>> {
         let mut results = Vec::new();
@@ -332,35 +425,29 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     {
         let raw_id = payload.id();
         let id = format!("{}:{}", self.get_table(), raw_id);
-
-        self.clear_indexes(&raw_id, tx).await?;
-
-        let value = serde_json::to_value(&payload).map_err(|e| {
-            TitoError::SerializationFailed(format!("Failed to serialize payload: {}", e))
-        })?;
-
-        let stored_value = self
-            .put_with_options(id.clone(), &value, timestamps, tx)
-            .await?;
+        let reverse_key = format!("reverse-index:{}", id);
+        let old_index_keys = self.load_index_state(&id, tx).await?;
+        let stored_value =
+            self.value_with_options(&payload, timestamps, old_index_keys.is_none())?;
 
         let all_index_data = self.get_index_keys(id.clone(), &payload, &stored_value)?;
+        let index_json_key = ReverseIndex {
+            value: all_index_data.iter().map(|(key, _)| key.clone()).collect(),
+        };
+        let reverse_value = self.value_with_options(index_json_key, false, true)?;
 
-        let mut all_index_keys = vec![];
-
-        for data in all_index_data {
-            all_index_keys.push(data.0.clone());
-            self.put_with_options(data.0.clone(), &data.1, false, tx)
-                .await?;
+        if let Some(old_index_keys) = old_index_keys {
+            for key in old_index_keys {
+                self.delete(key, tx).await?;
+            }
+            self.delete(reverse_key.clone(), tx).await?;
         }
 
-        let index_json_key = ReverseIndex {
-            value: all_index_keys,
-        };
-
-        let reverse_key = format!("reverse-index:{}", id);
-
-        self.put_with_options(reverse_key, index_json_key, false, tx)
-            .await?;
+        self.put_value(id, &stored_value, tx).await?;
+        for (key, value) in all_index_data {
+            self.put_value(key, &value, tx).await?;
+        }
+        self.put_value(reverse_key, &reverse_value, tx).await?;
 
         serde_json::from_value(stored_value).map_err(|e| {
             TitoError::DeserializationFailed(format!("Failed to deserialize stored value: {}", e))
@@ -414,20 +501,31 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     where
         T: DeserializeOwned,
     {
-        let mut start_bound = payload.start.clone();
-        if let Some(cursor) = payload.cursor.clone() {
-            let cursor = self.decode_cursor(cursor)?.first_id()?;
-            let after_cursor = next_string_lexicographically(cursor);
-            start_bound = after_cursor;
-        }
-
-        let end_bound = if let Some(end) = payload.end.clone() {
-            end
+        let range_start = payload.start.into_bytes();
+        let range_end = if let Some(end) = payload.end {
+            end.into_bytes()
         } else {
-            next_string_lexicographically(payload.start.clone())
+            prefix_end_bytes(&range_start).ok_or_else(|| {
+                TitoError::InvalidInput("Scan prefix has no finite range endpoint".to_string())
+            })?
+        };
+
+        self.validate_scan_range(&range_start, &range_end)?;
+
+        let start_bound = if let Some(cursor) = payload.cursor {
+            let cursor = self.decode_cursor(cursor)?.first_id()?.into_bytes();
+            self.validate_cursor_in_range(&cursor, &range_start, &range_end)?;
+            key_after_bytes(&cursor)
+        } else {
+            range_start
         };
 
         let limit = payload.limit.unwrap_or(u32::MAX);
+        self.validate_scan_limit(limit)?;
+
+        if start_bound >= range_end {
+            return Ok((Vec::new(), false));
+        }
 
         let limit_plus_one = if limit == u32::MAX {
             u32::MAX
@@ -435,7 +533,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             limit + 1
         };
 
-        let scan_stream = tx.scan(start_bound..end_bound, limit_plus_one).await?;
+        let scan_stream = tx.scan(start_bound..range_end, limit_plus_one).await?;
 
         let mut items = self.to_results(scan_stream)?;
 
@@ -480,10 +578,14 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
         let mut result = vec![];
 
-        for value in items.into_iter() {
-            if let Ok(item) = serde_json::from_value::<T>(value.1) {
-                result.push(item);
-            }
+        for (key, value) in items {
+            let item = serde_json::from_value::<T>(value).map_err(|error| {
+                TitoError::DeserializationFailed(format!(
+                    "Failed to deserialize record for key '{}': {}",
+                    key, error
+                ))
+            })?;
+            result.push(item);
         }
 
         Ok(result)
@@ -521,21 +623,31 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     where
         T: DeserializeOwned,
     {
-        let start_bound = payload.start.clone();
-
-        let mut end_bound = if let Some(end) = payload.end {
-            end
+        let start_bound = payload.start.into_bytes();
+        let range_end = if let Some(end) = payload.end {
+            end.into_bytes()
         } else {
-            next_string_lexicographically(payload.start.clone())
+            prefix_end_bytes(&start_bound).ok_or_else(|| {
+                TitoError::InvalidInput("Scan prefix has no finite range endpoint".to_string())
+            })?
         };
 
-        if let Some(cursor) = payload.cursor {
-            let cursor = self.decode_cursor(cursor)?.first_id()?;
-            let after_cursor = previous_string_lexicographically(cursor.clone());
-            end_bound = after_cursor;
-        }
+        self.validate_scan_range(&start_bound, &range_end)?;
+
+        let end_bound = if let Some(cursor) = payload.cursor {
+            let cursor = self.decode_cursor(cursor)?.first_id()?.into_bytes();
+            self.validate_cursor_in_range(&cursor, &start_bound, &range_end)?;
+            cursor
+        } else {
+            range_end
+        };
 
         let limit = payload.limit.unwrap_or(u32::MAX);
+        self.validate_scan_limit(limit)?;
+
+        if end_bound <= start_bound {
+            return Ok((Vec::new(), false));
+        }
 
         let limit_plus_one = if limit == u32::MAX {
             u32::MAX
@@ -560,24 +672,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         }
 
         Ok((items, has_more))
-    }
-
-    async fn clear_indexes(&self, raw_id: &str, tx: &E::Transaction) -> Result<(), TitoError> {
-        let id = format!("{}:{}", self.get_table(), raw_id);
-        let reverse_index_key = format!("reverse-index:{}", id);
-
-        match self.get_reverse_index(&reverse_index_key, tx).await {
-            Ok(reverse_index) => {
-                for key in reverse_index.value {
-                    self.delete(key, tx).await?;
-                }
-                self.delete(reverse_index_key, tx).await?;
-            }
-            Err(TitoError::NotFound(_)) => {}
-            Err(e) => return Err(e),
-        }
-
-        Ok(())
     }
 
     pub fn get_last_id(&self, key: String) -> Option<String> {
@@ -629,12 +723,10 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         let id = format!("{}:{}", self.get_table(), raw_id);
         let reverse_index_key = format!("reverse-index:{}", id);
 
-        let reverse_index = match self.get_reverse_index(&reverse_index_key, tx).await {
-            Ok(idx) => idx,
-            Err(_) => return Err(TitoError::NotFound(format!("Entity not found: {}", id))),
+        let mut keys = match self.load_index_state(&id, tx).await? {
+            Some(keys) => keys,
+            None => return Err(TitoError::NotFound(format!("Entity not found: {}", id))),
         };
-
-        let mut keys = reverse_index.value;
 
         keys.push(id.clone());
         keys.push(reverse_index_key);
@@ -650,17 +742,23 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     where
         T: DeserializeOwned,
     {
-        let start_bound = format!("{}:{}", self.get_table(), payload.start);
+        let table_prefix = format!("{}:", self.get_table());
+        let start_bound = format!("{}{}", table_prefix, payload.start);
+        let end_bound = payload
+            .end
+            .as_ref()
+            .map(|end| format!("{}{}", table_prefix, end));
 
         self.tx(|tx| {
             let start_bound = start_bound.clone();
+            let end_bound = end_bound.clone();
             let payload = payload.clone();
             async move {
                 let (scan_stream, has_more) = self
                     .scan(
                         TitoScanPayload {
                             start: start_bound,
-                            end: None,
+                            end: end_bound,
                             limit: payload.limit,
                             cursor: payload.cursor.clone(),
                         },

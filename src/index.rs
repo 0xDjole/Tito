@@ -333,7 +333,7 @@ impl<
         if let Some(value) = items.first() {
             match serde_json::from_value::<T>(value.1.clone()) {
                 Ok(item) => Ok(item),
-                Err(e) => Err(TitoError::NotFound(format!(
+                Err(e) => Err(TitoError::DeserializationFailed(format!(
                     "Failed to deserialize record for index '{}' with values {:?}: {}",
                     payload.index, payload.values, e
                 ))),

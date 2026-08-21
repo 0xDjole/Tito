@@ -29,11 +29,12 @@ pub(crate) struct MemoryTransaction {
 }
 
 impl MemoryEngine {
+    pub(crate) async fn put_raw_bytes(&self, key: Vec<u8>, value: Vec<u8>) {
+        self.data.lock().await.insert(key, value);
+    }
+
     pub(crate) async fn put_raw(&self, key: &str, value: Vec<u8>) {
-        self.data
-            .lock()
-            .await
-            .insert(key.as_bytes().to_vec(), value);
+        self.put_raw_bytes(key.as_bytes().to_vec(), value).await;
     }
 
     pub(crate) async fn put_json(&self, key: &str, value: &Value) {

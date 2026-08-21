@@ -85,6 +85,53 @@ let results = query.value(&email).limit(Some(10)).execute().await?;
 Tito reads and writes one model at a time. Applications load related records explicitly so their
 domain and API boundaries determine when an additional read is required.
 
+## Storage integrity and pagination
+
+Each persisted model row has a matching `reverse-index:{primary-key}` manifest, including models
+with no secondary indexes. The manifest may name only `index:` keys ending in that exact primary
+key. Updates and removals validate the pair and every listed key before mutating either side. A
+missing, orphaned, malformed, or syntactically cross-record manifest is an integrity error; Tito
+does not reinterpret it as a missing entity or follow it to an unrelated key.
+
+The unchanged manifest format does not contain an index-schema version, so Tito cannot prove that
+a syntactically valid manifest still enumerates every index created by an older application schema.
+Recomputing against the current model would incorrectly reject legitimate index additions,
+removals, and condition changes. Detecting or repairing a valid-shaped but semantically incomplete
+historical manifest therefore requires an application-owned audited rebuild; 0.16.2 deliberately
+does not overstate that guarantee.
+
+Scans fail on malformed JSON, non-UTF-8 keys, and values that do not deserialize into the requested
+model. They never silently shorten a page by dropping corrupt rows. Forward cursors continue from
+the exact key plus a NUL byte; reverse cursors use the exact key as the exclusive upper bound. Both
+directions reject a cursor outside the requested half-open range. `find` applies its optional `end`
+as an exclusive model-key suffix, and a scan limit of zero is invalid.
+
+Prefix endpoints and exact-key continuation are separate operations:
+
+```rust
+let end = tito::prefix_end("index:by_store:store_id:abc:".to_string());
+let after = tito::key_after("index:by_store:store_id:abc:table:item:42".to_string());
+```
+
+`next_string_lexicographically` remains an alias for `prefix_end` for source compatibility. It must
+not be used to continue after an exact key because advancing the final character can skip keys such
+as `a20` after `a2`.
+
+Secondary index values intentionally remain complete clones of the primary JSON document in
+0.16.2. This preserves the existing storage wire format and query behavior. Removing that
+redundancy requires a separately designed release that rehydrates primary rows and migrates every
+existing index; it is not part of this correctness patch.
+
+### 0.16.2 rollout
+
+Publish and tag Tito 0.16.2, update the application dependency and lockfile to exactly that patch,
+and replace application-side ambiguous helper calls with `prefix_end` for prefix ranges or
+`key_after` for exact-row continuation. The primary, reverse-manifest, index-value, and cursor wire
+formats are unchanged, so a rolling binary deployment needs no data migration. Existing missing,
+orphaned, malformed, or unsafe manifest pairs now fail closed and must be repaired by an audited
+rebuild or removed by the planned prelaunch reset before those records can be updated or deleted.
+A clean reset/reseed recreates every manifest from the current index schema.
+
 ## Storage Maintenance
 
 ```rust

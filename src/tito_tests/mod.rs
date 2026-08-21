@@ -8,8 +8,11 @@ use crate::types::{
     TitoFindPayload, TitoId, TitoIndexBlockType, TitoIndexConfig, TitoIndexField, TitoModelOptions,
     TitoModelTrait, TitoPaginated, TitoScanPayload,
 };
-use crate::utils::{next_string_lexicographically, previous_string_lexicographically};
+use crate::utils::{
+    key_after, key_after_bytes, next_string_lexicographically, prefix_end, prefix_end_bytes,
+};
 use crate::{ClusterCoordinatorLease, ClusterWorkerConfig, TitoError};
+use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -229,6 +232,13 @@ impl TitoModelTrait for Post {
 
 fn engine() -> MemoryEngine {
     MemoryEngine::default()
+}
+
+fn cursor_for_key(key: &str) -> String {
+    let cursor = TitoCursor {
+        ids: vec![Some(key.to_string())],
+    };
+    general_purpose::STANDARD.encode(serde_json::to_vec(&cursor).unwrap())
 }
 
 fn author(id: &str, email: &str, age: i64, org_id: &str) -> Author {

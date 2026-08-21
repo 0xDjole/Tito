@@ -172,7 +172,7 @@ async fn get_preserves_backend_read_error() {
 async fn find_paginates_with_cursor() {
     let engine = engine();
     let model = engine.clone().model::<Author>(TitoModelOptions::default());
-    for id in ["a1", "a2", "a3"] {
+    for id in ["a1", "a2", "a20", "a3"] {
         save_author(&engine, author(id, &format!("{id}@example.com"), 1, "org")).await;
     }
 
@@ -197,8 +197,15 @@ async fn find_paginates_with_cursor() {
         })
         .await
         .unwrap();
-    assert_eq!(second.items.len(), 1);
-    assert_eq!(second.items[0].id, "a3");
+    assert_eq!(
+        second
+            .items
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>(),
+        vec!["a20", "a3"]
+    );
+    assert!(second.cursor.is_none());
 }
 
 #[tokio::test]
@@ -230,6 +237,155 @@ async fn scan_reverse_returns_items_in_reverse_key_order() {
             .map(|(_, value)| value["id"].as_str().unwrap().to_string())
             .collect::<Vec<_>>(),
         vec!["a3", "a2"]
+    );
+}
+
+#[tokio::test]
+async fn scan_reverse_cursor_does_not_skip_adjacent_prefix_keys() {
+    let engine = engine();
+    let model = engine.clone().model::<Author>(TitoModelOptions::default());
+    for id in ["a1", "a2", "a20", "a3"] {
+        save_author(&engine, author(id, &format!("{id}@example.com"), 1, "org")).await;
+    }
+
+    let tx = engine.begin_transaction().await.unwrap();
+    let (first_items, has_more) = model
+        .scan_reverse(
+            TitoScanPayload {
+                start: "table:authors:".to_string(),
+                end: None,
+                limit: Some(2),
+                cursor: None,
+            },
+            &tx,
+        )
+        .await
+        .unwrap();
+    let first = model.to_paginated_items(first_items, has_more).unwrap();
+    assert_eq!(
+        first
+            .items
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>(),
+        vec!["a3", "a20"]
+    );
+
+    let (second_items, has_more) = model
+        .scan_reverse(
+            TitoScanPayload {
+                start: "table:authors:".to_string(),
+                end: None,
+                limit: Some(2),
+                cursor: first.cursor,
+            },
+            &tx,
+        )
+        .await
+        .unwrap();
+    let second = model.to_paginated_items(second_items, has_more).unwrap();
+    assert_eq!(
+        second
+            .items
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>(),
+        vec!["a2", "a1"]
+    );
+    assert!(second.cursor.is_none());
+}
+
+#[tokio::test]
+async fn scan_rejects_cursor_outside_requested_range_in_both_directions() {
+    let engine = engine();
+    let model = engine.clone().model::<Author>(TitoModelOptions::default());
+    let cursor = cursor_for_key("table:posts:p1");
+    let tx = engine.begin_transaction().await.unwrap();
+
+    for reverse in [false, true] {
+        let payload = TitoScanPayload {
+            start: "table:authors:".to_string(),
+            end: None,
+            limit: Some(2),
+            cursor: Some(cursor.clone()),
+        };
+        let error = if reverse {
+            model.scan_reverse(payload, &tx).await.unwrap_err()
+        } else {
+            model.scan(payload, &tx).await.unwrap_err()
+        };
+        assert_eq!(
+            error,
+            TitoError::InvalidInput("Cursor is outside the requested scan range".to_string())
+        );
+    }
+}
+
+#[tokio::test]
+async fn scan_validates_bounds_and_nonzero_limit() {
+    let engine = engine();
+    let model = engine.clone().model::<Author>(TitoModelOptions::default());
+    let tx = engine.begin_transaction().await.unwrap();
+
+    let invalid_bounds = model
+        .scan(
+            TitoScanPayload {
+                start: "table:authors:z".to_string(),
+                end: Some("table:authors:a".to_string()),
+                limit: Some(1),
+                cursor: None,
+            },
+            &tx,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        invalid_bounds,
+        TitoError::InvalidInput("Scan range start must be less than end".to_string())
+    );
+
+    let zero_limit = model
+        .scan(
+            TitoScanPayload {
+                start: "table:authors:".to_string(),
+                end: None,
+                limit: Some(0),
+                cursor: None,
+            },
+            &tx,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        zero_limit,
+        TitoError::InvalidInput("Scan limit must be greater than zero".to_string())
+    );
+}
+
+#[tokio::test]
+async fn find_honors_explicit_exclusive_end_bound() {
+    let engine = engine();
+    let model = engine.clone().model::<Author>(TitoModelOptions::default());
+    for id in ["a1", "a2", "a3"] {
+        save_author(&engine, author(id, &format!("{id}@example.com"), 1, "org")).await;
+    }
+
+    let page = model
+        .find(TitoFindPayload {
+            start: "a1".to_string(),
+            end: Some("a3".to_string()),
+            limit: None,
+            cursor: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        page.items
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>(),
+        vec!["a1", "a2"]
     );
 }
 
@@ -276,6 +432,108 @@ async fn get_key_reads_raw_json_by_storage_key() {
         engine.raw_json("table:authors:a1").await.unwrap()["id"],
         "a1"
     );
+}
+
+#[tokio::test]
+async fn get_key_reports_malformed_json_instead_of_not_found() {
+    let engine = engine();
+    let model = engine.clone().model::<Author>(TitoModelOptions::default());
+    engine
+        .put_raw("table:authors:malformed", b"{".to_vec())
+        .await;
+    let tx = engine.begin_transaction().await.unwrap();
+
+    assert!(matches!(
+        model
+            .get_key("table:authors:malformed", &tx)
+            .await
+            .unwrap_err(),
+        TitoError::DeserializationFailed(_)
+    ));
+}
+
+#[tokio::test]
+async fn scans_fail_on_malformed_json_and_non_utf8_storage_keys() {
+    let engine = engine();
+    let model = engine.clone().model::<Author>(TitoModelOptions::default());
+    engine
+        .put_raw("table:authors:malformed", b"{".to_vec())
+        .await;
+    let tx = engine.begin_transaction().await.unwrap();
+
+    assert!(matches!(
+        model
+            .scan(
+                TitoScanPayload {
+                    start: "table:authors:".to_string(),
+                    end: None,
+                    limit: None,
+                    cursor: None,
+                },
+                &tx,
+            )
+            .await
+            .unwrap_err(),
+        TitoError::DeserializationFailed(_)
+    ));
+
+    let engine = MemoryEngine::default();
+    let model = engine.clone().model::<Author>(TitoModelOptions::default());
+    let mut invalid_key = b"table:authors:".to_vec();
+    invalid_key.push(0xff);
+    engine
+        .put_raw_bytes(
+            invalid_key,
+            serde_json::to_vec(&json!({"id": "x"})).unwrap(),
+        )
+        .await;
+    let tx = engine.begin_transaction().await.unwrap();
+
+    assert!(matches!(
+        model
+            .scan(
+                TitoScanPayload {
+                    start: "table:authors:".to_string(),
+                    end: Some("table:authors;".to_string()),
+                    limit: None,
+                    cursor: None,
+                },
+                &tx,
+            )
+            .await
+            .unwrap_err(),
+        TitoError::DeserializationFailed(_)
+    ));
+}
+
+#[tokio::test]
+async fn paginated_find_and_get_many_fail_on_schema_incompatible_rows() {
+    let engine = engine();
+    let model = engine.clone().model::<Author>(TitoModelOptions::default());
+    engine
+        .put_json("table:authors:incompatible", &json!({"id": "incompatible"}))
+        .await;
+
+    assert!(matches!(
+        model
+            .find(TitoFindPayload {
+                start: String::new(),
+                end: None,
+                limit: None,
+                cursor: None,
+            })
+            .await
+            .unwrap_err(),
+        TitoError::DeserializationFailed(_)
+    ));
+    assert!(matches!(
+        model
+            .get_many(vec!["incompatible".to_string()])
+            .execute(None)
+            .await
+            .unwrap_err(),
+        TitoError::DeserializationFailed(_)
+    ));
 }
 
 #[tokio::test]
@@ -430,5 +688,11 @@ fn safe_encode_snake_cases_and_escapes_key_separators() {
 #[test]
 fn lexicographic_helpers_move_string_bounds() {
     assert_eq!(next_string_lexicographically("abc".to_string()), "abd");
-    assert_eq!(previous_string_lexicographically("abd".to_string()), "abc");
+    assert_eq!(prefix_end("abc".to_string()), "abd");
+    assert_eq!(prefix_end("ab\u{10ffff}".to_string()), "ac");
+    assert_eq!(key_after("abc".to_string()).as_bytes(), b"abc\0");
+    assert_eq!(prefix_end_bytes(b"abc"), Some(b"abd".to_vec()));
+    assert_eq!(prefix_end_bytes(&[b'a', 0xff]), Some(b"b".to_vec()));
+    assert_eq!(prefix_end_bytes(&[0xff]), None);
+    assert_eq!(key_after_bytes(b"abc"), b"abc\0".to_vec());
 }

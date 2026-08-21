@@ -39,4 +39,4 @@ pub use queue::{
     MAX_QUEUE_EVENT_BYTES, MAX_QUEUE_OWNER_COMPONENT_BYTES,
 };
 
-pub use utils::next_string_lexicographically;
+pub use utils::{key_after, next_string_lexicographically, prefix_end};
