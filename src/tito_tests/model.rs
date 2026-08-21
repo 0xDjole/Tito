@@ -302,6 +302,31 @@ async fn delete_range_removes_keys_inside_range_only() {
 }
 
 #[tokio::test]
+async fn memory_engine_garbage_collection_preserves_current_values() {
+    let engine = engine();
+    engine
+        .put_json("table:authors:a1", &json!({"id": "a1"}))
+        .await;
+
+    engine
+        .garbage_collect(std::time::Duration::from_secs(24 * 60 * 60))
+        .await
+        .unwrap();
+
+    assert!(engine.contains_key("table:authors:a1").await);
+
+    assert_eq!(
+        engine
+            .garbage_collect(std::time::Duration::ZERO)
+            .await
+            .unwrap_err(),
+        TitoError::InvalidInput(
+            "Garbage collection retention must be greater than zero".to_string()
+        )
+    );
+}
+
+#[tokio::test]
 async fn model_tx_runs_through_engine_transaction() {
     let engine = engine();
     let model = engine.clone().model::<Author>(TitoModelOptions::default());

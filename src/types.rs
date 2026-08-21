@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::future::Future;
 use std::ops::Range;
+use std::time::Duration;
 use uuid::Uuid;
 
 pub trait TitoModelConstraints:
@@ -61,6 +62,15 @@ pub trait TitoEngine: Send + Sync + Clone {
     async fn clear_active_transactions(&self) -> Result<(), TitoError>;
 
     async fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<(), TitoError>;
+
+    async fn garbage_collect(&self, retention: Duration) -> Result<(), TitoError> {
+        if retention.is_zero() {
+            return Err(TitoError::InvalidInput(
+                "Garbage collection retention must be greater than zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
 
     fn model<T: TitoModelConstraints>(self, options: TitoModelOptions) -> TitoModel<Self, T> {
         TitoModel::new(self, options)
