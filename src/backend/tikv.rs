@@ -8,8 +8,9 @@ use std::future::Future;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tikv_client::{ColumnFamily, RawClient, TimestampExt, Transaction, TransactionClient};
-use tokio::time::{sleep, Duration};
+use std::time::Duration;
+use tikv_client::{Timestamp, TimestampExt, Transaction, TransactionClient};
+use tokio::time::sleep;
 
 const MAX_TRANSACTION_RETRIES: u32 = 10;
 const TIKV_GRPC_MAX_DECODING_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
@@ -84,10 +85,16 @@ fn commit_failure_action(error: &TitoError, retries: u32) -> CommitFailureAction
     }
 }
 
+fn gc_safepoint(mut current: Timestamp, retention: Duration) -> Timestamp {
+    let retention_millis = i64::try_from(retention.as_millis()).unwrap_or(i64::MAX);
+    current.physical = current.physical.saturating_sub(retention_millis).max(0);
+    current.logical = 0;
+    current
+}
+
 #[derive(Clone)]
 pub struct TiKVBackend {
     pub client: Arc<TransactionClient>,
-    pub raw_client: Arc<RawClient>,
     pub active_transactions: Arc<Mutex<HashMap<String, TiKVTransaction>>>,
 }
 
@@ -203,31 +210,34 @@ impl TitoEngine for TiKVBackend {
     async fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<(), TitoError> {
         let range: tikv_client::BoundRange = (start.to_vec()..end.to_vec()).into();
 
-        self.raw_client
-            .with_cf(ColumnFamily::Default)
-            .delete_range(range.clone())
+        self.client
+            .unsafe_destroy_range(range)
             .await
-            .map_err(|e| {
-                TitoError::DeleteFailed(format!("Delete range (Default CF) failed: {}", e))
-            })?;
-
-        self.raw_client
-            .with_cf(ColumnFamily::Write)
-            .delete_range(range.clone())
-            .await
-            .map_err(|e| {
-                TitoError::DeleteFailed(format!("Delete range (Write CF) failed: {}", e))
-            })?;
-
-        self.raw_client
-            .with_cf(ColumnFamily::Lock)
-            .delete_range(range)
-            .await
-            .map_err(|e| {
-                TitoError::DeleteFailed(format!("Delete range (Lock CF) failed: {}", e))
-            })?;
+            .map_err(|e| TitoError::DeleteFailed(format!("Delete range failed: {}", e)))?;
 
         Ok(())
+    }
+
+    async fn garbage_collect(&self, retention: Duration) -> Result<(), TitoError> {
+        if retention.is_zero() {
+            return Err(TitoError::InvalidInput(
+                "Garbage collection retention must be greater than zero".to_string(),
+            ));
+        }
+
+        let current = self.client.current_timestamp().await.map_err(|e| {
+            TitoError::TransactionFailed(format!(
+                "Failed to read timestamp for garbage collection: {}",
+                e
+            ))
+        })?;
+        let safepoint = gc_safepoint(current, retention);
+
+        self.client
+            .gc(safepoint)
+            .await
+            .map(|_| ())
+            .map_err(|e| TitoError::TransactionFailed(format!("Garbage collection failed: {}", e)))
     }
 }
 
@@ -284,6 +294,30 @@ mod tests {
             ),
             CommitFailureAction::Return
         );
+    }
+
+    #[test]
+    fn gc_safepoint_subtracts_retention_in_milliseconds_and_saturates() {
+        let current = Timestamp {
+            physical: 1_800_000_000_000,
+            logical: 42,
+            ..Default::default()
+        };
+
+        let retained = gc_safepoint(current, Duration::from_secs(24 * 60 * 60));
+        assert_eq!(retained.physical, 1_799_913_600_000);
+        assert_eq!(retained.logical, 0);
+
+        let saturated = gc_safepoint(
+            Timestamp {
+                physical: 1_000,
+                logical: 42,
+                ..Default::default()
+            },
+            Duration::from_millis(2_000),
+        );
+        assert_eq!(saturated.physical, 0);
+        assert_eq!(saturated.logical, 0);
     }
 }
 
@@ -422,22 +456,14 @@ impl TiKV {
             endpoints.iter().map(|s| s.as_ref().to_string()).collect();
         let client_config = tikv_client::Config::default()
             .with_grpc_max_decoding_message_size(TIKV_GRPC_MAX_DECODING_MESSAGE_BYTES);
-        let client =
-            TransactionClient::new_with_config(endpoint_strings.clone(), client_config.clone())
-                .await
-                .map_err(|e| {
-                    TitoError::ConnectionFailed(format!("Failed to connect to TiKV: {}", e))
-                })?;
-
-        let raw_client = RawClient::new_with_config(endpoint_strings, client_config)
+        let client = TransactionClient::new_with_config(endpoint_strings, client_config)
             .await
             .map_err(|e| {
-                TitoError::ConnectionFailed(format!("Failed to connect RawClient to TiKV: {}", e))
+                TitoError::ConnectionFailed(format!("Failed to connect to TiKV: {}", e))
             })?;
 
         Ok(TiKVBackend {
             client: Arc::new(client),
-            raw_client: Arc::new(raw_client),
             active_transactions: Arc::new(Mutex::new(HashMap::new())),
         })
     }

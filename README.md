@@ -85,6 +85,27 @@ let results = query.value(&email).limit(Some(10)).execute().await?;
 Tito reads and writes one model at a time. Applications load related records explicitly so their
 domain and API boundaries determine when an additional read is required.
 
+## Storage Maintenance
+
+```rust
+use std::time::Duration;
+use tito::TitoEngine;
+
+db.garbage_collect(Duration::from_secs(24 * 60 * 60))
+    .await?;
+```
+
+`garbage_collect` derives an MVCC safe point from TiKV's current timestamp minus the supplied
+nonzero retention window and asks TiKV to apply it. A successful call also succeeds when PD already
+has a newer safe point or the engine has no historical versions to collect. The application owns
+the cluster-wide retention policy and must choose a window older than every transaction or
+historical read it still needs.
+
+`delete_range(start, end)` is an offline destructive operation over the start-inclusive,
+end-exclusive range. The TiKV engine uses the transactional client's unsafe range destruction, so
+all MVCC data in the range is removed. Use model transactions for ordinary deletes and reserve
+range destruction for reset, restore, or drop-style maintenance with application traffic stopped.
+
 ## Queue Processing
 
 Queue events are partitioned by their business key, carry their own non-negative Unix timestamp, and remain pending until the handler explicitly acknowledges them. Tito rejects negative timestamps instead of storing an event that polling cannot reach. Tito has no automatic retry policy, retry counter, backoff, failed state, or DLQ:
