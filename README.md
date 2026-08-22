@@ -174,9 +174,10 @@ Handlers return `QueueHandlerResult<T>`, an alias for `Result<QueueHandlerOutcom
 
 - `Ok(QueueHandlerOutcome::Acknowledge)` completes the current invocation.
 - `Ok(QueueHandlerOutcome::Reschedule(next_event))` atomically completes the current queue row and inserts the supplied replacement row.
+- `Ok(QueueHandlerOutcome::Advance(next_event))` atomically preserves the current row as completed history and inserts the supplied next typed payload.
 - `Err(_)`, a handler panic, executor timeout, lost worker, or queue-commit failure produces no persisted outcome, so the exact current invocation remains pending.
 
-Each event's own timestamp determines when it becomes runnable. Tito indexes that timestamp but never chooses or changes it. A domain that needs another invocation supplies a replacement event carrying the desired timestamp through `Reschedule`; Tito only commits the acknowledge-and-insert transaction. A replacement must preserve the logical event ID, partition key, and payload and may change only the timestamp. `QueueEvent::rescheduled` constructs that replacement, so replay-safe projections keep one identity across queue rows. Provider leases and processing deadlines belong only to domain records.
+Each event's own timestamp determines when it becomes runnable. Tito indexes that timestamp but never chooses or changes it. A domain that needs another invocation supplies a replacement event carrying the desired timestamp; Tito only commits the complete-and-insert transaction. `Reschedule` requires the logical event ID, partition key, owner, and payload to remain identical, so only the timestamp may change. `QueueEvent::rescheduled` constructs that replacement. `Advance` also preserves the ID, key, and owner, but requires the typed payload to change; its replacement timestamp remains application-owned. In both cases the completed row retains the exact prior payload while the new Pending row carries the replacement. Provider leases and processing deadlines belong only to domain records.
 
 Every new invocation must serialize to at most `MAX_QUEUE_EVENT_BYTES` (1 MiB). Publication rejects
 larger events before writing anything. Queue range reads preserve their public logical page size while fetching at most 16
@@ -221,11 +222,11 @@ worker or elected cluster coordinator removes bounded batches of older completed
 normal maintenance tick. Tito does not hardcode the duration, publish cleanup events, or delegate
 queue cleanup to the application's backup process.
 
-`Reschedule` is not an automatic retry policy. The application decides whether another event exists and supplies the complete event, including its timestamp. Tito creates no successor on its own and never interprets provider or domain state.
+`Reschedule` is not an automatic retry policy. The application decides whether another event exists and supplies the complete event, including its timestamp. `Advance` is likewise an explicit application decision to move one logical event to a different typed payload. Tito creates no successor on its own and never interprets provider or domain state.
 
 An optional `QueueOwner` gives an application a bounded ownership index without changing due-time
 ordering. Tito writes that secondary key in the same transaction as publication, moves it atomically
-on acknowledge/reschedule, and removes it with the queue row. Applications that must erase one
+on acknowledge/reschedule/advance, and removes it with the queue row. Applications that must erase one
 owner's work can call `delete_by_owner_matching_in_tx`; the scan touches only that owner's Pending
 or Completed keys and the predicate can preserve a currently executing lifecycle invocation. Owner
 kind and ID are opaque, non-empty strings bounded to 512 bytes each. They are routing/erasure
@@ -268,6 +269,10 @@ newly published invocations. It is not wire-compatible with workers using an old
 Do not run old and new queue protocols together. Owner indexes are not inferred from pre-upgrade
 rows; a deployment that intends to use owner-bounded erasure must reset/drain those rows or ship an
 explicit one-time bridge before enabling that operation.
+
+Tito 0.16.4 adds `Advance` without changing the persisted `QueueEvent` JSON, queue key formats,
+state values, or owner indexes used by 0.16.3. The handler outcome itself is not stored. Upgrading
+from 0.16.3 therefore requires no queue storage migration.
 
 For the prelaunch cutover, stop publishers and workers, use the source release to drain Pending and clear its Failed/DLQ keyspaces, verify Pending is empty, deploy the replacement environment, and then restart publication and processing. A future nonempty production environment requires an explicit, separately named bridge release before this queue contract is enabled.
 

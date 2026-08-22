@@ -17,6 +17,7 @@ pub enum QueueEventState {
 pub enum QueueHandlerOutcome<T> {
     Acknowledge,
     Reschedule(QueueEvent<T>),
+    Advance(QueueEvent<T>),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

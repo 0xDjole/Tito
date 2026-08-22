@@ -34,6 +34,54 @@ pub(crate) const QUEUE_SCAN_RPC_LIMIT: u32 = 16;
 const KEY_NUMBER_DIGITS: usize = 20;
 const OWNER_INDEX_PREFIX: &str = "queue:owner:";
 
+#[derive(Clone, Copy)]
+enum QueueReplacementKind {
+    Reschedule,
+    Advance,
+}
+
+impl QueueReplacementKind {
+    fn action(self) -> &'static str {
+        match self {
+            Self::Reschedule => "reschedule",
+            Self::Advance => "advance",
+        }
+    }
+
+    fn replacement(self) -> &'static str {
+        match self {
+            Self::Reschedule => "rescheduled",
+            Self::Advance => "advanced",
+        }
+    }
+
+    fn completion_error(self) -> &'static str {
+        match self {
+            Self::Reschedule => "Complete rescheduled queue event",
+            Self::Advance => "Complete advanced queue event",
+        }
+    }
+
+    fn validate_payload(self, current: &Value, next: &Value) -> Result<(), TitoError> {
+        match self {
+            Self::Reschedule if current != next => Err(TitoError::InvalidInput(
+                "A rescheduled row must preserve the event payload".to_string(),
+            )),
+            Self::Advance if current == next => Err(TitoError::InvalidInput(
+                "An advanced row must change the event payload".to_string(),
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+struct PendingQueueEntry {
+    value: Value,
+    id: String,
+    timestamp: i64,
+    owner: Option<QueueOwner>,
+}
+
 #[derive(Clone)]
 pub struct Queue<E: TitoEngine> {
     pub engine: E,
@@ -246,6 +294,33 @@ impl<E: TitoEngine> Queue<E> {
         ))
     }
 
+    fn read_pending_entry(value: &[u8]) -> Result<Option<PendingQueueEntry>, TitoError> {
+        let value = Self::read_value_from_entry(value)?;
+        if value.get("state").and_then(Value::as_str) != Some("pending") {
+            return Ok(None);
+        }
+
+        let id = value
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| TitoError::DeserializationFailed("Queue event missing id".to_string()))?
+            .to_string();
+        let timestamp = value
+            .get("timestamp")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| {
+                TitoError::DeserializationFailed("Queue event missing timestamp".to_string())
+            })?;
+        let owner = Self::owner_from_value(&value)?;
+
+        Ok(Some(PendingQueueEntry {
+            value,
+            id,
+            timestamp,
+            owner,
+        }))
+    }
+
     fn serialize_new_event<T: Serialize>(event: &QueueEvent<T>) -> Result<Vec<u8>, TitoError> {
         let bytes =
             serde_json::to_vec(event).map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
@@ -297,6 +372,40 @@ impl<E: TitoEngine> Queue<E> {
         tx.delete(storage_key)
             .await
             .map_err(|e| TitoError::DeleteFailed(format!("Delete queue event: {}", e)))
+    }
+
+    async fn complete_pending_entry(
+        tx: &E::Transaction,
+        storage_key: &[u8],
+        mut current: PendingQueueEntry,
+        completion_error: &str,
+    ) -> Result<(), TitoError> {
+        let processed_at = Utc::now().timestamp();
+        current.value["state"] =
+            Value::String(Self::state_value(QueueEventState::Completed).to_string());
+        current.value["processedAt"] = Value::Number(processed_at.into());
+        let completed_key = Self::completed_key(processed_at, current.timestamp, &current.id);
+        let completed_bytes = serde_json::to_vec(&current.value)
+            .map_err(|error| TitoError::SerializationFailed(error.to_string()))?;
+
+        Self::delete_entry(tx, storage_key).await?;
+        Self::delete_owner_index(
+            tx,
+            current.owner.as_ref(),
+            QueueEventState::Pending,
+            storage_key,
+        )
+        .await?;
+        tx.put(completed_key.as_bytes(), completed_bytes)
+            .await
+            .map_err(|error| TitoError::UpdateFailed(format!("{completion_error}: {error}")))?;
+        Self::put_owner_index(
+            tx,
+            current.owner.as_ref(),
+            QueueEventState::Completed,
+            completed_key.as_bytes(),
+        )
+        .await
     }
 
     pub async fn publish_in_tx<T: Serialize + Clone + Send + Sync + 'static>(
@@ -471,59 +580,17 @@ impl<E: TitoEngine> Queue<E> {
                         return Ok::<_, TitoError>(());
                     };
 
-                    let mut event = Self::read_value_from_entry(&bytes)?;
-
-                    if event.get("state").and_then(Value::as_str) != Some("pending") {
+                    let Some(current) = Self::read_pending_entry(&bytes)? else {
                         return Ok::<_, TitoError>(());
-                    }
+                    };
 
-                    let event_id = event
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| {
-                            TitoError::DeserializationFailed("Queue event missing id".to_string())
-                        })?
-                        .to_string();
-                    let event_timestamp = event
-                        .get("timestamp")
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| {
-                            TitoError::DeserializationFailed(
-                                "Queue event missing timestamp".to_string(),
-                            )
-                        })?;
-                    let owner = Self::owner_from_value(&event)?;
-                    let processed_at = Utc::now().timestamp();
-                    event["state"] =
-                        Value::String(Self::state_value(QueueEventState::Completed).to_string());
-                    event["processedAt"] = Value::Number(processed_at.into());
-                    let completed_key =
-                        Self::completed_key(processed_at, event_timestamp, &event_id);
-                    let completed_bytes = serde_json::to_vec(&event)
-                        .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
-
-                    Self::delete_entry(&tx, key.as_bytes()).await?;
-                    Self::delete_owner_index(
+                    Self::complete_pending_entry(
                         &tx,
-                        owner.as_ref(),
-                        QueueEventState::Pending,
                         key.as_bytes(),
+                        current,
+                        "Create completed event",
                     )
-                    .await?;
-                    tx.put(completed_key.as_bytes(), completed_bytes)
-                        .await
-                        .map_err(|e| {
-                            TitoError::UpdateFailed(format!("Create completed event: {}", e))
-                        })?;
-                    Self::put_owner_index(
-                        &tx,
-                        owner.as_ref(),
-                        QueueEventState::Completed,
-                        completed_key.as_bytes(),
-                    )
-                    .await?;
-
-                    Ok::<_, TitoError>(())
+                    .await
                 }
             })
             .await
@@ -532,16 +599,40 @@ impl<E: TitoEngine> Queue<E> {
     pub async fn reschedule<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static>(
         &self,
         storage_key: &str,
+        next: QueueEvent<T>,
+    ) -> Result<(), TitoError> {
+        self.replace_pending(storage_key, next, QueueReplacementKind::Reschedule)
+            .await
+    }
+
+    /// Completes a pending invocation and atomically inserts its next typed payload.
+    ///
+    /// The replacement must preserve the logical event ID, partition key, and owner while
+    /// changing the payload. Its timestamp remains application-owned.
+    pub async fn advance<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static>(
+        &self,
+        storage_key: &str,
+        next: QueueEvent<T>,
+    ) -> Result<(), TitoError> {
+        self.replace_pending(storage_key, next, QueueReplacementKind::Advance)
+            .await
+    }
+
+    async fn replace_pending<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static>(
+        &self,
+        storage_key: &str,
         mut next: QueueEvent<T>,
+        kind: QueueReplacementKind,
     ) -> Result<(), TitoError> {
         Self::validate_timestamp(next.timestamp)?;
         if let Some(owner) = next.owner.as_ref() {
             owner.validate()?;
         }
         if !storage_key.starts_with(Self::state_prefix(QueueEventState::Pending)) {
-            return Err(TitoError::InvalidInput(
-                "Only pending queue events can be rescheduled".to_string(),
-            ));
+            return Err(TitoError::InvalidInput(format!(
+                "Only pending queue events can be {}",
+                kind.replacement()
+            )));
         }
 
         next.state = QueueEventState::Pending;
@@ -554,96 +645,63 @@ impl<E: TitoEngine> Queue<E> {
                 let next = next.clone();
                 async move {
                     let Some(bytes) = tx.get(storage_key.as_bytes()).await.map_err(|error| {
-                        TitoError::QueryFailed(format!("Get queue event for reschedule: {error}"))
+                        TitoError::QueryFailed(format!(
+                            "Get queue event to {}: {error}",
+                            kind.action()
+                        ))
                     })?
                     else {
                         return Ok::<_, TitoError>(());
                     };
 
-                    let mut current = Self::read_value_from_entry(&bytes)?;
-                    if current.get("state").and_then(Value::as_str) != Some("pending") {
+                    let Some(current) = Self::read_pending_entry(&bytes)? else {
                         return Ok(());
-                    }
+                    };
 
-                    let current_id = current
-                        .get("id")
+                    if current.id != next.id {
+                        return Err(TitoError::InvalidInput(format!(
+                            "A {} row must preserve the logical event id",
+                            kind.replacement()
+                        )));
+                    }
+                    let current_key = current
+                        .value
+                        .get("key")
                         .and_then(Value::as_str)
                         .ok_or_else(|| {
-                            TitoError::DeserializationFailed("Queue event missing id".to_string())
-                        })?
-                        .to_string();
-                    if current_id != next.id {
-                        return Err(TitoError::InvalidInput(
-                            "A rescheduled row must preserve the logical event id".to_string(),
-                        ));
-                    }
-                    let current_key =
-                        current.get("key").and_then(Value::as_str).ok_or_else(|| {
                             TitoError::DeserializationFailed(
                                 "Queue event missing partition key".to_string(),
                             )
                         })?;
                     if current_key != next.key {
-                        return Err(TitoError::InvalidInput(
-                            "A rescheduled row must preserve the event partition key".to_string(),
-                        ));
+                        return Err(TitoError::InvalidInput(format!(
+                            "A {} row must preserve the event partition key",
+                            kind.replacement()
+                        )));
                     }
-                    let current_owner = Self::owner_from_value(&current)?;
-                    if current_owner.as_ref() != next.owner.as_ref() {
-                        return Err(TitoError::InvalidInput(
-                            "A rescheduled row must preserve the event owner".to_string(),
-                        ));
+                    if current.owner.as_ref() != next.owner.as_ref() {
+                        return Err(TitoError::InvalidInput(format!(
+                            "A {} row must preserve the event owner",
+                            kind.replacement()
+                        )));
                     }
                     let next_payload = serde_json::to_value(&next.payload)
                         .map_err(|error| TitoError::SerializationFailed(error.to_string()))?;
-                    if current.get("payload") != Some(&next_payload) {
-                        return Err(TitoError::InvalidInput(
-                            "A rescheduled row must preserve the event payload".to_string(),
-                        ));
-                    }
-                    let current_timestamp = current
-                        .get("timestamp")
-                        .and_then(Value::as_i64)
-                        .ok_or_else(|| {
-                            TitoError::DeserializationFailed(
-                                "Queue event missing timestamp".to_string(),
-                            )
-                        })?;
-
-                    let processed_at = Utc::now().timestamp();
-                    current["state"] =
-                        Value::String(Self::state_value(QueueEventState::Completed).to_string());
-                    current["processedAt"] = Value::Number(processed_at.into());
-                    let completed_key =
-                        Self::completed_key(processed_at, current_timestamp, &current_id);
-                    let completed_bytes = serde_json::to_vec(&current)
-                        .map_err(|error| TitoError::SerializationFailed(error.to_string()))?;
+                    let current_payload = current.value.get("payload").ok_or_else(|| {
+                        TitoError::DeserializationFailed("Queue event missing payload".to_string())
+                    })?;
+                    kind.validate_payload(current_payload, &next_payload)?;
 
                     let partition = self.partition_for_key(&next.key);
                     let pending_key =
                         Self::pending_key(partition, next.timestamp, tx.start_version(), &next.id);
                     let pending_bytes = Self::serialize_new_event(&next)?;
 
-                    Self::delete_entry(&tx, storage_key.as_bytes()).await?;
-                    Self::delete_owner_index(
+                    Self::complete_pending_entry(
                         &tx,
-                        current_owner.as_ref(),
-                        QueueEventState::Pending,
                         storage_key.as_bytes(),
-                    )
-                    .await?;
-                    tx.put(completed_key.as_bytes(), completed_bytes)
-                        .await
-                        .map_err(|error| {
-                            TitoError::UpdateFailed(format!(
-                                "Complete rescheduled queue event: {error}"
-                            ))
-                        })?;
-                    Self::put_owner_index(
-                        &tx,
-                        current_owner.as_ref(),
-                        QueueEventState::Completed,
-                        completed_key.as_bytes(),
+                        current,
+                        kind.completion_error(),
                     )
                     .await?;
                     tx.put(pending_key.as_bytes(), pending_bytes)
