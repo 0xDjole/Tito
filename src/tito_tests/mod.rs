@@ -8,8 +8,11 @@ use crate::types::{
     TitoFindPayload, TitoId, TitoIndexBlockType, TitoIndexConfig, TitoIndexField, TitoModelOptions,
     TitoModelTrait, TitoPaginated, TitoScanPayload,
 };
-use crate::utils::{next_string_lexicographically, previous_string_lexicographically};
+use crate::utils::{
+    key_after, key_after_bytes, next_string_lexicographically, prefix_end, prefix_end_bytes,
+};
 use crate::{ClusterCoordinatorLease, ClusterWorkerConfig, TitoError};
+use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -130,6 +133,77 @@ struct Tag {
     name: String,
 }
 
+#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct UniqueAccount {
+    id: String,
+    tenant_id: String,
+    email: String,
+    verified: bool,
+    display_name: String,
+}
+
+impl TitoModelTrait for UniqueAccount {
+    fn indexes(&self) -> Vec<TitoIndexConfig> {
+        vec![TitoIndexConfig {
+            condition: true,
+            name: "account-by-email".to_string(),
+            fields: vec![TitoIndexField {
+                name: "email".to_string(),
+                r#type: TitoIndexBlockType::String,
+            }],
+        }]
+    }
+
+    fn unique_indexes(&self) -> Vec<TitoIndexConfig> {
+        vec![TitoIndexConfig {
+            condition: self.verified,
+            name: "verified-account-by-tenant-email".to_string(),
+            fields: vec![
+                TitoIndexField {
+                    name: "tenant_id".to_string(),
+                    r#type: TitoIndexBlockType::String,
+                },
+                TitoIndexField {
+                    name: "email".to_string(),
+                    r#type: TitoIndexBlockType::String,
+                },
+            ],
+        }]
+    }
+
+    fn table() -> String {
+        "unique-accounts".to_string()
+    }
+
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+}
+
+fn unique_account(id: &str, tenant_id: &str, email: &str, verified: bool) -> UniqueAccount {
+    UniqueAccount {
+        id: id.to_string(),
+        tenant_id: tenant_id.to_string(),
+        email: email.to_string(),
+        verified,
+        display_name: format!("Account {id}"),
+    }
+}
+
+async fn save_unique_account(engine: &MemoryEngine, value: UniqueAccount) -> UniqueAccount {
+    let model = engine
+        .clone()
+        .model::<UniqueAccount>(TitoModelOptions::default());
+    engine
+        .transaction(|tx| {
+            let model = model.clone();
+            let value = value.clone();
+            async move { model.set(value).timestamps(false).execute(&tx).await }
+        })
+        .await
+        .unwrap()
+}
+
 impl TitoModelTrait for Tag {
     fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![TitoIndexConfig {
@@ -229,6 +303,13 @@ impl TitoModelTrait for Post {
 
 fn engine() -> MemoryEngine {
     MemoryEngine::default()
+}
+
+fn cursor_for_key(key: &str) -> String {
+    let cursor = TitoCursor {
+        ids: vec![Some(key.to_string())],
+    };
+    general_purpose::STANDARD.encode(serde_json::to_vec(&cursor).unwrap())
 }
 
 fn author(id: &str, email: &str, age: i64, org_id: &str) -> Author {

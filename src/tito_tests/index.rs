@@ -1,6 +1,161 @@
 use super::*;
 
 #[tokio::test]
+async fn conditional_unique_index_owns_one_value_and_supports_exact_lookup() {
+    let engine = engine();
+    let model = engine
+        .clone()
+        .model::<UniqueAccount>(TitoModelOptions::default());
+    save_unique_account(
+        &engine,
+        unique_account("a1", "store-1", "Ada@Example.com", true),
+    )
+    .await;
+
+    let found = model
+        .find_one_by_unique_index(
+            TitoFindOneByIndexPayload {
+                index: "verified-account-by-tenant-email".to_string(),
+                values: vec!["store-1".to_string(), "ada@example.com".to_string()],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(found.id, "a1");
+    assert!(
+        engine
+            .contains_key(
+                "unique-index:unique-accounts:verified-account-by-tenant-email:tenant_id:store-1:email:ada@example.com",
+            )
+            .await
+    );
+}
+
+#[tokio::test]
+async fn unique_index_rejects_another_owner_without_exposing_the_value() {
+    let engine = engine();
+    save_unique_account(
+        &engine,
+        unique_account("a1", "store-1", "ada@example.com", true),
+    )
+    .await;
+    let model = engine
+        .clone()
+        .model::<UniqueAccount>(TitoModelOptions::default());
+
+    let error = engine
+        .transaction(|tx| {
+            let model = model.clone();
+            async move {
+                model
+                    .set(unique_account("a2", "store-1", "ada@example.com", true))
+                    .timestamps(false)
+                    .execute(&tx)
+                    .await
+            }
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        TitoError::UniqueViolation {
+            model: "unique-accounts".to_string(),
+            index: "verified-account-by-tenant-email".to_string(),
+        }
+    );
+    assert!(!error.to_string().contains("ada@example.com"));
+}
+
+#[tokio::test]
+async fn unique_index_changes_and_releases_ownership_atomically() {
+    let engine = engine();
+    let model = engine
+        .clone()
+        .model::<UniqueAccount>(TitoModelOptions::default());
+    save_unique_account(
+        &engine,
+        unique_account("a1", "store-1", "old@example.com", true),
+    )
+    .await;
+
+    save_unique_account(
+        &engine,
+        unique_account("a1", "store-1", "new@example.com", true),
+    )
+    .await;
+    save_unique_account(
+        &engine,
+        unique_account("a2", "store-1", "old@example.com", true),
+    )
+    .await;
+
+    assert_eq!(
+        model
+            .find_one_by_unique_index(
+                TitoFindOneByIndexPayload {
+                    index: "verified-account-by-tenant-email".to_string(),
+                    values: vec!["store-1".to_string(), "new@example.com".to_string()],
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .id,
+        "a1"
+    );
+    assert_eq!(
+        model
+            .find_one_by_unique_index(
+                TitoFindOneByIndexPayload {
+                    index: "verified-account-by-tenant-email".to_string(),
+                    values: vec!["store-1".to_string(), "old@example.com".to_string()],
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .id,
+        "a2"
+    );
+
+    engine
+        .transaction(|tx| {
+            let model = model.clone();
+            async move { model.remove("a1", &tx).await }
+        })
+        .await
+        .unwrap();
+    save_unique_account(
+        &engine,
+        unique_account("a3", "store-1", "new@example.com", true),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn disabled_unique_index_does_not_claim_the_value() {
+    let engine = engine();
+    save_unique_account(
+        &engine,
+        unique_account("a1", "store-1", "shared@example.com", false),
+    )
+    .await;
+    save_unique_account(
+        &engine,
+        unique_account("a2", "store-1", "shared@example.com", false),
+    )
+    .await;
+
+    assert!(engine
+        .keys_with_prefix("unique-index:unique-accounts:")
+        .await
+        .is_empty());
+}
+
+#[tokio::test]
 async fn string_index_queries_are_case_normalized_and_escape_colons() {
     let engine = engine();
     let model = engine.clone().model::<Author>(TitoModelOptions::default());
@@ -196,6 +351,177 @@ async fn updating_record_replaces_old_index_keys() {
 }
 
 #[tokio::test]
+async fn malformed_reverse_manifest_blocks_update_and_remove_without_mutation() {
+    let engine = engine();
+    let model = engine.clone().model::<Author>(TitoModelOptions::default());
+    save_author(&engine, author("a1", "old@example.com", 36, "org-a")).await;
+    engine
+        .put_raw("reverse-index:table:authors:a1", b"{".to_vec())
+        .await;
+
+    let update_error = engine
+        .transaction(|tx| {
+            let model = model.clone();
+            async move {
+                model
+                    .set(author("a1", "new@example.com", 36, "org-a"))
+                    .execute(&tx)
+                    .await
+            }
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(update_error, TitoError::DeserializationFailed(_)));
+    assert_eq!(
+        engine.raw_json("table:authors:a1").await.unwrap()["email"],
+        "old@example.com"
+    );
+    assert!(
+        engine
+            .contains_key("index:author-by-email:email:old@example.com:table:authors:a1")
+            .await
+    );
+    assert!(
+        !engine
+            .contains_key("index:author-by-email:email:new@example.com:table:authors:a1")
+            .await
+    );
+
+    let remove_error = engine
+        .transaction(|tx| {
+            let model = model.clone();
+            async move { model.remove("a1", &tx).await }
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(remove_error, TitoError::DeserializationFailed(_)));
+    assert!(engine.contains_key("table:authors:a1").await);
+}
+
+#[tokio::test]
+async fn missing_or_orphaned_reverse_manifest_is_an_integrity_error() {
+    let engine = engine();
+    let model = engine.clone().model::<Author>(TitoModelOptions::default());
+    engine
+        .put_json(
+            "table:authors:a1",
+            &serde_json::to_value(author("a1", "old@example.com", 36, "org-a")).unwrap(),
+        )
+        .await;
+
+    let update_error = engine
+        .transaction(|tx| {
+            let model = model.clone();
+            async move {
+                model
+                    .set(author("a1", "new@example.com", 36, "org-a"))
+                    .execute(&tx)
+                    .await
+            }
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(update_error, TitoError::IndexError(_)));
+
+    let remove_error = engine
+        .transaction(|tx| {
+            let model = model.clone();
+            async move { model.remove("a1", &tx).await }
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(remove_error, TitoError::IndexError(_)));
+    assert!(engine.contains_key("table:authors:a1").await);
+
+    let engine = MemoryEngine::default();
+    let model = engine.clone().model::<Author>(TitoModelOptions::default());
+    engine
+        .put_json("reverse-index:table:authors:a1", &json!({"value": []}))
+        .await;
+    let orphan_error = engine
+        .transaction(|tx| {
+            let model = model.clone();
+            async move {
+                model
+                    .set(author("a1", "new@example.com", 36, "org-a"))
+                    .execute(&tx)
+                    .await
+            }
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(orphan_error, TitoError::IndexError(_)));
+    assert!(!engine.contains_key("table:authors:a1").await);
+    assert!(engine.contains_key("reverse-index:table:authors:a1").await);
+}
+
+#[tokio::test]
+async fn reverse_manifest_cannot_delete_keys_outside_its_own_index_set() {
+    let engine = engine();
+    let model = engine.clone().model::<Author>(TitoModelOptions::default());
+    save_author(&engine, author("a1", "a1@example.com", 36, "org-a")).await;
+    save_author(&engine, author("a2", "a2@example.com", 36, "org-a")).await;
+    engine
+        .put_json(
+            "reverse-index:table:authors:a1",
+            &json!({"value": ["table:authors:a2"]}),
+        )
+        .await;
+
+    let error = engine
+        .transaction(|tx| {
+            let model = model.clone();
+            async move { model.remove("a1", &tx).await }
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, TitoError::IndexError(_)));
+    assert!(engine.contains_key("table:authors:a1").await);
+    assert!(engine.contains_key("table:authors:a2").await);
+}
+
+#[tokio::test]
+async fn set_propagates_index_state_read_failures_without_writing() {
+    let engine = engine();
+    let model = engine.clone().model::<Author>(TitoModelOptions::default());
+    engine.fail_next_get("manifest state read failed").await;
+
+    let error = engine
+        .transaction(|tx| {
+            let model = model.clone();
+            async move {
+                model
+                    .set(author("a1", "a1@example.com", 36, "org-a"))
+                    .execute(&tx)
+                    .await
+            }
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        TitoError::QueryFailed("manifest state read failed".to_string())
+    );
+    assert!(!engine.contains_key("table:authors:a1").await);
+    assert!(engine.keys_with_prefix("index:").await.is_empty());
+}
+
+#[tokio::test]
+async fn secondary_index_wire_value_remains_the_complete_primary_json() {
+    let engine = engine();
+    save_author(&engine, author("a1", "a1@example.com", 36, "org-a")).await;
+
+    assert_eq!(
+        engine
+            .raw_json("index:author-by-email:email:a1@example.com:table:authors:a1")
+            .await,
+        engine.raw_json("table:authors:a1").await
+    );
+}
+
+#[tokio::test]
 async fn removing_record_deletes_row_reverse_index_and_index_keys() {
     let engine = engine();
     let model = engine.clone().model::<Author>(TitoModelOptions::default());
@@ -313,6 +639,7 @@ async fn index_reverse_query_returns_reverse_index_order() {
     let model = engine.clone().model::<Author>(TitoModelOptions::default());
     save_author(&engine, author("a1", "a@example.com", 7, "org")).await;
     save_author(&engine, author("a2", "b@example.com", 7, "org")).await;
+    save_author(&engine, author("a20", "bb@example.com", 7, "org")).await;
     save_author(&engine, author("a3", "c@example.com", 7, "org")).await;
 
     let mut query = model.query_by_index("author-by-age");
@@ -325,8 +652,90 @@ async fn index_reverse_query_returns_reverse_index_order() {
 
     assert_eq!(page.items.len(), 2);
     assert_eq!(page.items[0].id, "a3");
-    assert_eq!(page.items[1].id, "a2");
-    assert!(page.cursor.is_some());
+    assert_eq!(page.items[1].id, "a20");
+    let cursor = page.cursor;
+    assert!(cursor.is_some());
+
+    query.cursor(cursor);
+    let second = query.execute_reverse(None).await.unwrap();
+    assert_eq!(
+        second
+            .items
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>(),
+        vec!["a2", "a1"]
+    );
+    assert!(second.cursor.is_none());
+}
+
+#[tokio::test]
+async fn index_queries_fail_on_malformed_and_schema_incompatible_rows() {
+    let engine = engine();
+    let model = engine.clone().model::<Author>(TitoModelOptions::default());
+    engine
+        .put_raw(
+            "index:author-by-age:age:0000000007:table:authors:malformed",
+            b"{".to_vec(),
+        )
+        .await;
+
+    let mut malformed_query = model.query_by_index("author-by-age");
+    assert!(matches!(
+        malformed_query.value("7").execute(None).await.unwrap_err(),
+        TitoError::DeserializationFailed(_)
+    ));
+
+    let engine = MemoryEngine::default();
+    let model = engine.clone().model::<Author>(TitoModelOptions::default());
+    engine
+        .put_json(
+            "index:author-by-age:age:0000000007:table:authors:incompatible",
+            &json!({"id": "incompatible"}),
+        )
+        .await;
+
+    let mut incompatible_query = model.query_by_index("author-by-age");
+    assert!(matches!(
+        incompatible_query
+            .value("7")
+            .execute(None)
+            .await
+            .unwrap_err(),
+        TitoError::DeserializationFailed(_)
+    ));
+    assert!(matches!(
+        model
+            .find_one_by_index(
+                TitoFindOneByIndexPayload {
+                    index: "author-by-age".to_string(),
+                    values: vec!["7".to_string()],
+                },
+                None,
+            )
+            .await
+            .unwrap_err(),
+        TitoError::DeserializationFailed(_)
+    ));
+}
+
+#[tokio::test]
+async fn index_query_rejects_cursor_from_a_different_index_value_scope() {
+    let model = engine().model::<Author>(TitoModelOptions::default());
+    let mut query = model.query_by_index("author-by-age");
+    let error = query
+        .value("7")
+        .cursor(Some(cursor_for_key(
+            "index:author-by-age:age:0000000008:table:authors:a1",
+        )))
+        .execute(None)
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        TitoError::InvalidInput("Cursor is outside the requested scan range".to_string())
+    );
 }
 
 #[tokio::test]

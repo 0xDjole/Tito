@@ -114,6 +114,7 @@ pub(crate) async fn apply_handler_outcome<E, T>(
     let result = match outcome {
         QueueHandlerOutcome::Acknowledge => queue.ack(storage_key).await,
         QueueHandlerOutcome::Reschedule(next) => queue.reschedule(storage_key, next).await,
+        QueueHandlerOutcome::Advance(next) => queue.advance(storage_key, next).await,
     };
     if let Err(error) = result {
         log::error!(

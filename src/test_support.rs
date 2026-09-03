@@ -1,4 +1,4 @@
-use crate::types::{TitoEngine, TitoKvPair, TitoTransaction, TitoValue};
+use crate::types::{validate_delete_range, TitoEngine, TitoKvPair, TitoTransaction, TitoValue};
 use crate::TitoError;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -29,11 +29,12 @@ pub(crate) struct MemoryTransaction {
 }
 
 impl MemoryEngine {
+    pub(crate) async fn put_raw_bytes(&self, key: Vec<u8>, value: Vec<u8>) {
+        self.data.lock().await.insert(key, value);
+    }
+
     pub(crate) async fn put_raw(&self, key: &str, value: Vec<u8>) {
-        self.data
-            .lock()
-            .await
-            .insert(key.as_bytes().to_vec(), value);
+        self.put_raw_bytes(key.as_bytes().to_vec(), value).await;
     }
 
     pub(crate) async fn put_json(&self, key: &str, value: &Value) {
@@ -122,6 +123,7 @@ impl TitoEngine for MemoryEngine {
     }
 
     async fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<(), TitoError> {
+        validate_delete_range(start, end)?;
         let mut data = self.data.lock().await;
         let keys: Vec<Vec<u8>> = data
             .range(start.to_vec()..end.to_vec())

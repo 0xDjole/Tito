@@ -5,7 +5,7 @@ A database layer on TiKV with indexing, transactions, and a built-in partitioned
 ## Features
 
 - **Data Storage**: Models with CRUD operations
-- **Indexing**: Conditional and composite indexes for efficient queries
+- **Indexing**: Conditional ordinary and unique composite indexes for efficient queries
 - **Transactions**: Full ACID transactions
 - **Query Builder**: Fluent API for querying by index
 
@@ -13,6 +13,14 @@ Indexes are sparse. Tito writes an index key only when every configured field co
 the configured type. Missing fields, JSON `null`, empty strings, empty collections, and values of a
 different type produce no key for that index. A model can use `condition` to apply an additional
 domain-specific inclusion rule.
+
+Ordinary indexes are declared by `indexes`; their keys include the primary record identity and may
+have many owners. Exclusive value ownership is declared separately by `unique_indexes`; its key
+includes the model, index name, and complete indexed value but not the claimant ID. A competing
+claim therefore conflicts on one real ownership key and returns `TitoError::UniqueViolation`
+without exposing the indexed value. `find_one_by_unique_index` performs an exact key read and then
+loads the authoritative primary record. Conditional unique indexes are omitted when their model
+instance sets `condition` to false.
 - **Transactional Publication**: Queue events can be written atomically with application data
 - **Partitioned Queue**: Horizontal scaling via stable business-key partitions
 - **Event Timestamps**: Each event says when it becomes runnable
@@ -83,7 +91,99 @@ let results = query.value(&email).limit(Some(10)).execute().await?;
 ```
 
 Tito reads and writes one model at a time. Applications load related records explicitly so their
-domain and API boundaries determine when an additional read is required.
+domain and API boundaries determine when an additional read is required. When a transaction
+depends on an existing record remaining unchanged, `model.assert_current(id, &tx)` reads and stages
+the exact primary bytes without deserializing, changing timestamps, touching indexes, or creating a
+second lock record.
+
+## Storage integrity and pagination
+
+Each persisted model row has a matching `reverse-index:{primary-key}` manifest, including models
+with no secondary indexes. The manifest may name ordinary `index:` keys ending in that exact
+primary key and model-scoped `unique-index:` keys whose stored owner matches that primary record.
+Updates and removals validate the pair and every unique owner before mutating either side. A
+missing, orphaned, malformed, or syntactically cross-record manifest is an integrity error; Tito
+does not reinterpret it as a missing entity or follow it to an unrelated key.
+
+The unchanged manifest format does not contain an index-schema version, so Tito cannot prove that
+a syntactically valid manifest still enumerates every index created by an older application schema.
+Recomputing against the current model would incorrectly reject legitimate index additions,
+removals, and condition changes. Detecting or repairing a valid-shaped but semantically incomplete
+historical manifest therefore requires an application-owned audited rebuild; 0.16.2 deliberately
+does not overstate that guarantee.
+
+Scans fail on malformed JSON, non-UTF-8 keys, and values that do not deserialize into the requested
+model. They never silently shorten a page by dropping corrupt rows. Forward cursors continue from
+the exact key plus a NUL byte; reverse cursors use the exact key as the exclusive upper bound. Both
+directions reject a cursor outside the requested half-open range. `find` applies its optional `end`
+as an exclusive model-key suffix, and a scan limit of zero is invalid.
+
+Prefix endpoints and exact-key continuation are separate operations:
+
+```rust
+let end = tito::prefix_end("index:by_store:store_id:abc:".to_string());
+let after = tito::key_after("index:by_store:store_id:abc:table:item:42".to_string());
+```
+
+`next_string_lexicographically` remains an alias for `prefix_end` for source compatibility. It must
+not be used to continue after an exact key because advancing the final character can skip keys such
+as `a20` after `a2`.
+
+Secondary index values intentionally remain complete clones of the primary JSON document in
+0.16.2. This preserves the existing storage wire format and query behavior. Removing that
+redundancy requires a separately designed release that rehydrates primary rows and migrates every
+existing index; it is not part of this correctness patch.
+
+### 0.17.0 rollout
+
+Version 0.17.0 adds conditional unique indexes, exact unique lookup, and `assert_current`. Existing
+ordinary index keys remain unchanged. Models adopting a unique index must rewrite or reset their
+records before relying on the new key because Tito never invents index entries for stored rows.
+The release also includes 0.16.4's queue `Advance` outcome without changing persisted queue rows.
+
+Tito updates `created_at` and `updated_at` only when those fields are present in the model's
+serialized shape. Timestamp-bearing models keep automatic create/update timestamps. Models that do
+not declare the fields no longer acquire invisible JSON metadata that their Rust type cannot read
+back. Applications resetting or migrating from 0.16.2 should rewrite affected rows so primary and
+index values exactly match the declared model shape.
+
+### 0.16.3 rollout
+
+Version 0.16.3 preserves timestamp behavior for models that declare `created_at` or `updated_at`
+and stops adding undeclared timestamp fields. The primary and index key formats are unchanged. An
+application enforcing exact typed payloads must reset, migrate, or rewrite older rows that contain
+timestamp fields absent from their model before enabling that enforcement.
+
+### 0.16.2 rollout
+
+Publish and tag Tito 0.16.2, update the application dependency and lockfile to exactly that patch,
+and replace application-side ambiguous helper calls with `prefix_end` for prefix ranges or
+`key_after` for exact-row continuation. The primary, reverse-manifest, index-value, and cursor wire
+formats are unchanged, so a rolling binary deployment needs no data migration. Existing missing,
+orphaned, malformed, or unsafe manifest pairs now fail closed and must be repaired by an audited
+rebuild or removed by the planned prelaunch reset before those records can be updated or deleted.
+A clean reset/reseed recreates every manifest from the current index schema.
+
+## Storage Maintenance
+
+```rust
+use std::time::Duration;
+use tito::TitoEngine;
+
+db.garbage_collect(Duration::from_secs(24 * 60 * 60))
+    .await?;
+```
+
+`garbage_collect` derives an MVCC safe point from TiKV's current timestamp minus the supplied
+nonzero retention window and asks TiKV to apply it. A successful call also succeeds when PD already
+has a newer safe point or the engine has no historical versions to collect. The application owns
+the cluster-wide retention policy and must choose a window older than every transaction or
+historical read it still needs.
+
+`delete_range(start, end)` is an offline destructive operation over the start-inclusive,
+end-exclusive range. The TiKV engine uses the transactional client's unsafe range destruction, so
+all MVCC data in the range is removed. Use model transactions for ordinary deletes and reserve
+range destruction for reset, restore, or drop-style maintenance with application traffic stopped.
 
 ## Queue Processing
 
@@ -93,9 +193,10 @@ Handlers return `QueueHandlerResult<T>`, an alias for `Result<QueueHandlerOutcom
 
 - `Ok(QueueHandlerOutcome::Acknowledge)` completes the current invocation.
 - `Ok(QueueHandlerOutcome::Reschedule(next_event))` atomically completes the current queue row and inserts the supplied replacement row.
+- `Ok(QueueHandlerOutcome::Advance(next_event))` atomically preserves the current row as completed history and inserts the supplied next typed payload.
 - `Err(_)`, a handler panic, executor timeout, lost worker, or queue-commit failure produces no persisted outcome, so the exact current invocation remains pending.
 
-Each event's own timestamp determines when it becomes runnable. Tito indexes that timestamp but never chooses or changes it. A domain that needs another invocation supplies a replacement event carrying the desired timestamp through `Reschedule`; Tito only commits the acknowledge-and-insert transaction. A replacement must preserve the logical event ID, partition key, and payload and may change only the timestamp. `QueueEvent::rescheduled` constructs that replacement, so replay-safe projections keep one identity across queue rows. Provider leases and processing deadlines belong only to domain records.
+Each event's own timestamp determines when it becomes runnable. Tito indexes that timestamp but never chooses or changes it. A domain that needs another invocation supplies a replacement event carrying the desired timestamp; Tito only commits the complete-and-insert transaction. `Reschedule` requires the logical event ID, partition key, owner, and payload to remain identical, so only the timestamp may change. `QueueEvent::rescheduled` constructs that replacement. `Advance` also preserves the ID, key, and owner, but requires the typed payload to change; its replacement timestamp remains application-owned. In both cases the completed row retains the exact prior payload while the new Pending row carries the replacement. Provider leases and processing deadlines belong only to domain records.
 
 Every new invocation must serialize to at most `MAX_QUEUE_EVENT_BYTES` (1 MiB). Publication rejects
 larger events before writing anything. Queue range reads preserve their public logical page size while fetching at most 16
@@ -140,11 +241,11 @@ worker or elected cluster coordinator removes bounded batches of older completed
 normal maintenance tick. Tito does not hardcode the duration, publish cleanup events, or delegate
 queue cleanup to the application's backup process.
 
-`Reschedule` is not an automatic retry policy. The application decides whether another event exists and supplies the complete event, including its timestamp. Tito creates no successor on its own and never interprets provider or domain state.
+`Reschedule` is not an automatic retry policy. The application decides whether another event exists and supplies the complete event, including its timestamp. `Advance` is likewise an explicit application decision to move one logical event to a different typed payload. Tito creates no successor on its own and never interprets provider or domain state.
 
 An optional `QueueOwner` gives an application a bounded ownership index without changing due-time
 ordering. Tito writes that secondary key in the same transaction as publication, moves it atomically
-on acknowledge/reschedule, and removes it with the queue row. Applications that must erase one
+on acknowledge/reschedule/advance, and removes it with the queue row. Applications that must erase one
 owner's work can call `delete_by_owner_matching_in_tx`; the scan touches only that owner's Pending
 or Completed keys and the predicate can preserve a currently executing lifecycle invocation. Owner
 kind and ID are opaque, non-empty strings bounded to 512 bytes each. They are routing/erasure
@@ -188,7 +289,11 @@ Do not run old and new queue protocols together. Owner indexes are not inferred 
 rows; a deployment that intends to use owner-bounded erasure must reset/drain those rows or ship an
 explicit one-time bridge before enabling that operation.
 
-For the prelaunch cutover, stop publishers and workers, use the old release to drain Pending and clear its Failed/DLQ keyspaces, verify Pending is empty, deploy the replacement environment, and then restart publication and processing. If a future nonempty production environment requires migration, build and deploy a separately named bridge release first; compatibility scaffolding is not part of this queue contract.
+Tito 0.16.4 adds `Advance` without changing the persisted `QueueEvent` JSON, queue key formats,
+state values, or owner indexes used by 0.16.3. The handler outcome itself is not stored. Upgrading
+from 0.16.3 therefore requires no queue storage migration.
+
+For the prelaunch cutover, stop publishers and workers, use the source release to drain Pending and clear its Failed/DLQ keyspaces, verify Pending is empty, deploy the replacement environment, and then restart publication and processing. A future nonempty production environment requires an explicit, separately named bridge release before this queue contract is enabled.
 
 ## Future Events
 

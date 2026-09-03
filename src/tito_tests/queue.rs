@@ -181,6 +181,150 @@ async fn queue_reschedule_rejects_a_different_logical_event() {
 }
 
 #[tokio::test]
+async fn queue_reschedule_still_rejects_a_changed_payload() {
+    let engine = engine();
+    let queue = queue(engine, 1);
+    let now = Utc::now().timestamp();
+    queue
+        .publish(queue_event("reschedule-payload", "entry:1", now - 1))
+        .await
+        .unwrap();
+    let (storage_key, current) = queue
+        .pull::<QueuePayload>(0, None, 10)
+        .await
+        .unwrap()
+        .events
+        .into_iter()
+        .next()
+        .unwrap();
+    let mut next = current.rescheduled(now + 60);
+    next.payload = queue_payload("changed");
+
+    let error = queue.reschedule(&storage_key, next).await.unwrap_err();
+
+    assert!(matches!(error, TitoError::InvalidInput(message)
+        if message == "A rescheduled row must preserve the event payload"));
+    assert_eq!(
+        queue
+            .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+            .await
+            .unwrap()
+            .events,
+        vec![(storage_key, current)]
+    );
+    assert!(queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
+        .await
+        .unwrap()
+        .events
+        .is_empty());
+}
+
+#[tokio::test]
+async fn queue_advance_atomically_preserves_current_history_and_owner() {
+    let engine = engine();
+    let queue = queue(engine.clone(), 1);
+    let now = Utc::now().timestamp();
+    let owner = QueueOwner::new("store", "advance-owner").unwrap();
+    queue
+        .publish(queue_event("advance", "entry:1", now - 1).with_owner(owner.clone()))
+        .await
+        .unwrap();
+    let (storage_key, current) = queue
+        .pull::<QueuePayload>(0, None, 10)
+        .await
+        .unwrap()
+        .events
+        .into_iter()
+        .next()
+        .unwrap();
+    let mut next = current.rescheduled(now + 60);
+    next.payload = queue_payload("advanced");
+
+    queue.advance(&storage_key, next.clone()).await.unwrap();
+
+    let pending = queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(pending.events.len(), 1);
+    assert_eq!(pending.events[0].1, next);
+    let completed = queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(completed.events.len(), 1);
+    assert_eq!(completed.events[0].1.id, current.id);
+    assert_eq!(completed.events[0].1.key, current.key);
+    assert_eq!(completed.events[0].1.owner, Some(owner));
+    assert_eq!(completed.events[0].1.payload, current.payload);
+    assert_eq!(completed.events[0].1.timestamp, current.timestamp);
+    assert_eq!(completed.events[0].1.state, QueueEventState::Completed);
+    assert!(completed.events[0].1.processed_at.is_some());
+
+    let owner_indexes = engine.keys_with_prefix("queue:owner:").await;
+    assert_eq!(owner_indexes.len(), 2);
+    assert!(owner_indexes.iter().any(|key| key.contains(":pending:")));
+    assert!(owner_indexes.iter().any(|key| key.contains(":completed:")));
+}
+
+#[tokio::test]
+async fn queue_advance_rejects_unchanged_payload_and_identity_changes() {
+    for mutation in ["payload", "id", "key", "owner"] {
+        let engine = engine();
+        let queue = queue(engine.clone(), 1);
+        let now = Utc::now().timestamp();
+        let owner = QueueOwner::new("store", "original-owner").unwrap();
+        queue
+            .publish(queue_event("advance-reject", "entry:1", now - 1).with_owner(owner.clone()))
+            .await
+            .unwrap();
+        let (storage_key, current) = queue
+            .pull::<QueuePayload>(0, None, 10)
+            .await
+            .unwrap()
+            .events
+            .into_iter()
+            .next()
+            .unwrap();
+        let mut next = current.rescheduled(now + 60);
+        if mutation != "payload" {
+            next.payload = queue_payload("changed");
+        }
+        match mutation {
+            "payload" => {}
+            "id" => next.id = "different-id".to_string(),
+            "key" => next.key = "entry:different".to_string(),
+            "owner" => {
+                next.owner = Some(QueueOwner::new("store", "different-owner").unwrap());
+            }
+            _ => unreachable!(),
+        }
+
+        let error = queue.advance(&storage_key, next).await.unwrap_err();
+
+        assert!(matches!(error, TitoError::InvalidInput(_)), "{mutation}");
+        assert_eq!(
+            queue
+                .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+                .await
+                .unwrap()
+                .events,
+            vec![(storage_key, current)]
+        );
+        assert!(queue
+            .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
+            .await
+            .unwrap()
+            .events
+            .is_empty());
+        let owner_indexes = engine.keys_with_prefix("queue:owner:").await;
+        assert_eq!(owner_indexes.len(), 1);
+        assert!(owner_indexes[0].contains(":pending:"));
+    }
+}
+
+#[tokio::test]
 async fn queue_rejects_negative_timestamps_without_creating_unreachable_rows() {
     let engine = engine();
     let queue = queue(engine.clone(), 1);
@@ -478,6 +622,57 @@ async fn queue_worker_acknowledges_successful_jobs() {
         .unwrap()
         .events
         .is_empty());
+}
+
+#[tokio::test]
+async fn queue_worker_applies_an_advance_outcome() {
+    let engine = engine();
+    let queue = Arc::new(queue(engine, 1));
+    let now = Utc::now().timestamp();
+    let owner = QueueOwner::new("store", "worker-advance").unwrap();
+    queue
+        .publish(
+            queue_event("worker-advance", "entry:worker-advance", now - 10)
+                .with_owner(owner.clone()),
+        )
+        .await
+        .unwrap();
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+
+    let handle = run_worker::<_, QueuePayload, _>(
+        queue.clone(),
+        WorkerConfig::new(0..1),
+        move |event| {
+            Box::pin(async move {
+                let mut next = event.rescheduled(now + 3600);
+                next.payload = queue_payload("worker-advanced");
+                Ok(QueueHandlerOutcome::Advance(next))
+            })
+        },
+        shutdown_rx,
+    )
+    .await;
+
+    wait_for_completed(&queue, "worker-advance").await;
+    let pending = queue
+        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(pending.events.len(), 1);
+    assert_eq!(pending.events[0].1.id, "worker-advance");
+    assert_eq!(pending.events[0].1.key, "entry:worker-advance");
+    assert_eq!(pending.events[0].1.owner, Some(owner));
+    assert_eq!(
+        pending.events[0].1.payload,
+        queue_payload("worker-advanced")
+    );
+    assert_eq!(pending.events[0].1.timestamp, now + 3600);
+
+    let _ = shutdown_tx.send(());
+    timeout(Duration::from_secs(2), handle)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]

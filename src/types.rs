@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::future::Future;
 use std::ops::Range;
+use std::time::Duration;
 use uuid::Uuid;
 
 pub trait TitoModelConstraints:
@@ -27,6 +28,20 @@ pub type TitoKey = Vec<u8>;
 pub type TitoValue = Vec<u8>;
 pub type TitoKvPair = (TitoKey, TitoValue);
 pub type TitoRange = Range<TitoKey>;
+
+pub(crate) fn validate_delete_range(start: &[u8], end: &[u8]) -> Result<(), TitoError> {
+    if start.is_empty() || end.is_empty() {
+        return Err(TitoError::InvalidInput(
+            "Delete range bounds must not be empty".to_string(),
+        ));
+    }
+    if start >= end {
+        return Err(TitoError::InvalidInput(
+            "Delete range start must be less than end".to_string(),
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub struct TitoModelOptions {
@@ -60,7 +75,19 @@ pub trait TitoEngine: Send + Sync + Clone {
 
     async fn clear_active_transactions(&self) -> Result<(), TitoError>;
 
+    /// Irreversibly removes every key in `[start, end)`.
+    ///
+    /// Both bounds must be non-empty and `start` must be less than `end`.
     async fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<(), TitoError>;
+
+    async fn garbage_collect(&self, retention: Duration) -> Result<(), TitoError> {
+        if retention.is_zero() {
+            return Err(TitoError::InvalidInput(
+                "Garbage collection retention must be greater than zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
 
     fn model<T: TitoModelConstraints>(self, options: TitoModelOptions) -> TitoModel<Self, T> {
         TitoModel::new(self, options)
@@ -155,6 +182,9 @@ pub struct TitoRelIndexConfig {
 
 pub trait TitoModelTrait {
     fn indexes(&self) -> Vec<TitoIndexConfig>;
+    fn unique_indexes(&self) -> Vec<TitoIndexConfig> {
+        Vec::new()
+    }
     fn table() -> String;
     fn id(&self) -> String;
 
