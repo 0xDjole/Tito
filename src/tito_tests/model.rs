@@ -2,6 +2,58 @@ use super::*;
 use crate::types::TitoTransaction;
 
 #[tokio::test]
+async fn assert_current_requires_an_existing_record_and_preserves_exact_bytes() {
+    let engine = engine();
+    let model = engine.clone().model::<Tag>(TitoModelOptions::default());
+    save_tag(&engine, tag("t1", "database")).await;
+    let before = engine.raw_bytes("table:tags:t1").await.unwrap();
+
+    engine
+        .transaction(|tx| {
+            let model = model.clone();
+            async move { model.assert_current("t1", &tx).await }
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(engine.raw_bytes("table:tags:t1").await.unwrap(), before);
+    let missing = engine
+        .transaction(|tx| {
+            let model = model.clone();
+            async move { model.assert_current("missing", &tx).await }
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(missing, TitoError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn assert_current_observes_a_write_already_staged_in_the_transaction() {
+    let engine = engine();
+    let model = engine.clone().model::<Tag>(TitoModelOptions::default());
+
+    engine
+        .transaction(|tx| {
+            let model = model.clone();
+            async move {
+                model
+                    .set(tag("t1", "database"))
+                    .timestamps(false)
+                    .execute(&tx)
+                    .await?;
+                model.assert_current("t1", &tx).await
+            }
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        model.get("t1").execute(None).await.unwrap().name,
+        "database"
+    );
+}
+
+#[tokio::test]
 async fn model_set_get_and_get_many_round_trip() {
     let engine = engine();
     let model = engine.clone().model::<Author>(TitoModelOptions::default());

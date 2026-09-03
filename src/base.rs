@@ -325,8 +325,11 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         reverse_index: &ReverseIndex,
     ) -> Result<(), TitoError> {
         let expected_suffix = format!(":{}", primary_key);
+        let unique_prefix = format!("unique-index:{}:", T::table());
         for key in &reverse_index.value {
-            if !key.starts_with("index:") || !key.ends_with(&expected_suffix) {
+            let ordinary = key.starts_with("index:") && key.ends_with(&expected_suffix);
+            let unique = key.starts_with(&unique_prefix);
+            if !ordinary && !unique {
                 return Err(TitoError::IndexError(format!(
                     "Reverse index for '{}' contains an invalid index key '{}'",
                     primary_key, key
@@ -334,6 +337,41 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             }
         }
         Ok(())
+    }
+
+    fn unique_index_name(key: &str) -> Option<&str> {
+        let prefix = format!("unique-index:{}:", T::table());
+        key.strip_prefix(&prefix)?.split(':').next()
+    }
+
+    async fn validate_unique_owner(
+        &self,
+        key: &str,
+        expected_id: &str,
+        tx: &E::Transaction,
+    ) -> Result<bool, TitoError> {
+        let Some(bytes) = tx.get(key).await? else {
+            return Ok(false);
+        };
+        let owner: T = serde_json::from_slice(&bytes).map_err(|error| {
+            TitoError::DeserializationFailed(format!(
+                "Failed to deserialize unique index on model '{}': {}",
+                T::table(),
+                error
+            ))
+        })?;
+        if owner.id() != expected_id {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    pub async fn assert_current(&self, id: &str, tx: &E::Transaction) -> Result<(), TitoError> {
+        let primary_key = format!("{}:{id}", self.get_table());
+        let bytes = tx.get(&primary_key).await?.ok_or_else(|| {
+            TitoError::NotFound(format!("Record '{primary_key}' not found in database"))
+        })?;
+        tx.put(primary_key, bytes).await
     }
 
     async fn load_index_state(
@@ -438,8 +476,39 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         };
         let reverse_value = self.value_with_options(index_json_key, false, true)?;
 
+        for (key, _) in &all_index_data {
+            if let Some(index) = Self::unique_index_name(key) {
+                if tx.get(key).await?.is_some() {
+                    if !self.validate_unique_owner(key, &raw_id, tx).await? {
+                        return Err(TitoError::UniqueViolation {
+                            model: T::table(),
+                            index: index.to_string(),
+                        });
+                    }
+                    if old_index_keys
+                        .as_ref()
+                        .is_none_or(|keys| !keys.contains(key))
+                    {
+                        return Err(TitoError::IndexError(format!(
+                            "Unique index '{}' on model '{}' is not declared by its owner",
+                            index,
+                            T::table()
+                        )));
+                    }
+                }
+            }
+        }
+
         if let Some(old_index_keys) = old_index_keys {
             for key in old_index_keys {
+                if Self::unique_index_name(&key).is_some()
+                    && !self.validate_unique_owner(&key, &raw_id, tx).await?
+                {
+                    return Err(TitoError::IndexError(format!(
+                        "Unique index on model '{}' is missing or owned by another record",
+                        T::table()
+                    )));
+                }
                 self.delete(key, tx).await?;
             }
             self.delete(reverse_key.clone(), tx).await?;
@@ -733,7 +802,18 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         keys.push(id.clone());
         keys.push(reverse_index_key);
 
-        for key in keys.into_iter() {
+        for key in &keys {
+            if Self::unique_index_name(key).is_some()
+                && !self.validate_unique_owner(key, raw_id, tx).await?
+            {
+                return Err(TitoError::IndexError(format!(
+                    "Unique index on model '{}' is missing or owned by another record",
+                    T::table()
+                )));
+            }
+        }
+
+        for key in keys {
             self.delete(key, tx).await?;
         }
 

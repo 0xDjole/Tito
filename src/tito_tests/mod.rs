@@ -133,6 +133,77 @@ struct Tag {
     name: String,
 }
 
+#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct UniqueAccount {
+    id: String,
+    tenant_id: String,
+    email: String,
+    verified: bool,
+    display_name: String,
+}
+
+impl TitoModelTrait for UniqueAccount {
+    fn indexes(&self) -> Vec<TitoIndexConfig> {
+        vec![TitoIndexConfig {
+            condition: true,
+            name: "account-by-email".to_string(),
+            fields: vec![TitoIndexField {
+                name: "email".to_string(),
+                r#type: TitoIndexBlockType::String,
+            }],
+        }]
+    }
+
+    fn unique_indexes(&self) -> Vec<TitoIndexConfig> {
+        vec![TitoIndexConfig {
+            condition: self.verified,
+            name: "verified-account-by-tenant-email".to_string(),
+            fields: vec![
+                TitoIndexField {
+                    name: "tenant_id".to_string(),
+                    r#type: TitoIndexBlockType::String,
+                },
+                TitoIndexField {
+                    name: "email".to_string(),
+                    r#type: TitoIndexBlockType::String,
+                },
+            ],
+        }]
+    }
+
+    fn table() -> String {
+        "unique-accounts".to_string()
+    }
+
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+}
+
+fn unique_account(id: &str, tenant_id: &str, email: &str, verified: bool) -> UniqueAccount {
+    UniqueAccount {
+        id: id.to_string(),
+        tenant_id: tenant_id.to_string(),
+        email: email.to_string(),
+        verified,
+        display_name: format!("Account {id}"),
+    }
+}
+
+async fn save_unique_account(engine: &MemoryEngine, value: UniqueAccount) -> UniqueAccount {
+    let model = engine
+        .clone()
+        .model::<UniqueAccount>(TitoModelOptions::default());
+    engine
+        .transaction(|tx| {
+            let model = model.clone();
+            let value = value.clone();
+            async move { model.set(value).timestamps(false).execute(&tx).await }
+        })
+        .await
+        .unwrap()
+}
+
 impl TitoModelTrait for Tag {
     fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![TitoIndexConfig {

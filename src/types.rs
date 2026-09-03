@@ -182,6 +182,9 @@ pub struct TitoRelIndexConfig {
 
 pub trait TitoModelTrait {
     fn indexes(&self) -> Vec<TitoIndexConfig>;
+    fn unique_indexes(&self) -> Vec<TitoIndexConfig> {
+        Vec::new()
+    }
     fn table() -> String;
     fn id(&self) -> String;
 

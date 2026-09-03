@@ -1,6 +1,161 @@
 use super::*;
 
 #[tokio::test]
+async fn conditional_unique_index_owns_one_value_and_supports_exact_lookup() {
+    let engine = engine();
+    let model = engine
+        .clone()
+        .model::<UniqueAccount>(TitoModelOptions::default());
+    save_unique_account(
+        &engine,
+        unique_account("a1", "store-1", "Ada@Example.com", true),
+    )
+    .await;
+
+    let found = model
+        .find_one_by_unique_index(
+            TitoFindOneByIndexPayload {
+                index: "verified-account-by-tenant-email".to_string(),
+                values: vec!["store-1".to_string(), "ada@example.com".to_string()],
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(found.id, "a1");
+    assert!(
+        engine
+            .contains_key(
+                "unique-index:unique-accounts:verified-account-by-tenant-email:tenant_id:store-1:email:ada@example.com",
+            )
+            .await
+    );
+}
+
+#[tokio::test]
+async fn unique_index_rejects_another_owner_without_exposing_the_value() {
+    let engine = engine();
+    save_unique_account(
+        &engine,
+        unique_account("a1", "store-1", "ada@example.com", true),
+    )
+    .await;
+    let model = engine
+        .clone()
+        .model::<UniqueAccount>(TitoModelOptions::default());
+
+    let error = engine
+        .transaction(|tx| {
+            let model = model.clone();
+            async move {
+                model
+                    .set(unique_account("a2", "store-1", "ada@example.com", true))
+                    .timestamps(false)
+                    .execute(&tx)
+                    .await
+            }
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        TitoError::UniqueViolation {
+            model: "unique-accounts".to_string(),
+            index: "verified-account-by-tenant-email".to_string(),
+        }
+    );
+    assert!(!error.to_string().contains("ada@example.com"));
+}
+
+#[tokio::test]
+async fn unique_index_changes_and_releases_ownership_atomically() {
+    let engine = engine();
+    let model = engine
+        .clone()
+        .model::<UniqueAccount>(TitoModelOptions::default());
+    save_unique_account(
+        &engine,
+        unique_account("a1", "store-1", "old@example.com", true),
+    )
+    .await;
+
+    save_unique_account(
+        &engine,
+        unique_account("a1", "store-1", "new@example.com", true),
+    )
+    .await;
+    save_unique_account(
+        &engine,
+        unique_account("a2", "store-1", "old@example.com", true),
+    )
+    .await;
+
+    assert_eq!(
+        model
+            .find_one_by_unique_index(
+                TitoFindOneByIndexPayload {
+                    index: "verified-account-by-tenant-email".to_string(),
+                    values: vec!["store-1".to_string(), "new@example.com".to_string()],
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .id,
+        "a1"
+    );
+    assert_eq!(
+        model
+            .find_one_by_unique_index(
+                TitoFindOneByIndexPayload {
+                    index: "verified-account-by-tenant-email".to_string(),
+                    values: vec!["store-1".to_string(), "old@example.com".to_string()],
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .id,
+        "a2"
+    );
+
+    engine
+        .transaction(|tx| {
+            let model = model.clone();
+            async move { model.remove("a1", &tx).await }
+        })
+        .await
+        .unwrap();
+    save_unique_account(
+        &engine,
+        unique_account("a3", "store-1", "new@example.com", true),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn disabled_unique_index_does_not_claim_the_value() {
+    let engine = engine();
+    save_unique_account(
+        &engine,
+        unique_account("a1", "store-1", "shared@example.com", false),
+    )
+    .await;
+    save_unique_account(
+        &engine,
+        unique_account("a2", "store-1", "shared@example.com", false),
+    )
+    .await;
+
+    assert!(engine
+        .keys_with_prefix("unique-index:unique-accounts:")
+        .await
+        .is_empty());
+}
+
+#[tokio::test]
 async fn string_index_queries_are_case_normalized_and_escape_colons() {
     let engine = engine();
     let model = engine.clone().model::<Author>(TitoModelOptions::default());

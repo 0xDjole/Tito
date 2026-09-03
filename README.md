@@ -5,7 +5,7 @@ A database layer on TiKV with indexing, transactions, and a built-in partitioned
 ## Features
 
 - **Data Storage**: Models with CRUD operations
-- **Indexing**: Conditional and composite indexes for efficient queries
+- **Indexing**: Conditional ordinary and unique composite indexes for efficient queries
 - **Transactions**: Full ACID transactions
 - **Query Builder**: Fluent API for querying by index
 
@@ -13,6 +13,14 @@ Indexes are sparse. Tito writes an index key only when every configured field co
 the configured type. Missing fields, JSON `null`, empty strings, empty collections, and values of a
 different type produce no key for that index. A model can use `condition` to apply an additional
 domain-specific inclusion rule.
+
+Ordinary indexes are declared by `indexes`; their keys include the primary record identity and may
+have many owners. Exclusive value ownership is declared separately by `unique_indexes`; its key
+includes the model, index name, and complete indexed value but not the claimant ID. A competing
+claim therefore conflicts on one real ownership key and returns `TitoError::UniqueViolation`
+without exposing the indexed value. `find_one_by_unique_index` performs an exact key read and then
+loads the authoritative primary record. Conditional unique indexes are omitted when their model
+instance sets `condition` to false.
 - **Transactional Publication**: Queue events can be written atomically with application data
 - **Partitioned Queue**: Horizontal scaling via stable business-key partitions
 - **Event Timestamps**: Each event says when it becomes runnable
@@ -83,13 +91,17 @@ let results = query.value(&email).limit(Some(10)).execute().await?;
 ```
 
 Tito reads and writes one model at a time. Applications load related records explicitly so their
-domain and API boundaries determine when an additional read is required.
+domain and API boundaries determine when an additional read is required. When a transaction
+depends on an existing record remaining unchanged, `model.assert_current(id, &tx)` reads and stages
+the exact primary bytes without deserializing, changing timestamps, touching indexes, or creating a
+second lock record.
 
 ## Storage integrity and pagination
 
 Each persisted model row has a matching `reverse-index:{primary-key}` manifest, including models
-with no secondary indexes. The manifest may name only `index:` keys ending in that exact primary
-key. Updates and removals validate the pair and every listed key before mutating either side. A
+with no secondary indexes. The manifest may name ordinary `index:` keys ending in that exact
+primary key and model-scoped `unique-index:` keys whose stored owner matches that primary record.
+Updates and removals validate the pair and every unique owner before mutating either side. A
 missing, orphaned, malformed, or syntactically cross-record manifest is an integrity error; Tito
 does not reinterpret it as a missing entity or follow it to an unrelated key.
 
@@ -121,6 +133,13 @@ Secondary index values intentionally remain complete clones of the primary JSON 
 0.16.2. This preserves the existing storage wire format and query behavior. Removing that
 redundancy requires a separately designed release that rehydrates primary rows and migrates every
 existing index; it is not part of this correctness patch.
+
+### 0.17.0 rollout
+
+Version 0.17.0 adds conditional unique indexes, exact unique lookup, and `assert_current`. Existing
+ordinary index keys remain unchanged. Models adopting a unique index must rewrite or reset their
+records before relying on the new key because Tito never invents index entries for stored rows.
+The release also includes 0.16.4's queue `Advance` outcome without changing persisted queue rows.
 
 Tito updates `created_at` and `updated_at` only when those fields are present in the model's
 serialized shape. Timestamp-bearing models keep automatic create/update timestamps. Models that do

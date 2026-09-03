@@ -41,6 +41,9 @@ pub enum TitoError {
     #[error("Index error: {0}")]
     IndexError(String),
 
+    #[error("Unique index '{index}' on model '{model}' is already owned")]
+    UniqueViolation { model: String, index: String },
+
     #[error("Relationship error: {0}")]
     RelationshipError(String),
 

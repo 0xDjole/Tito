@@ -3,7 +3,7 @@ use crate::{
     key_encoder::safe_encode,
     types::{
         FieldValue, TitoEngine, TitoFindByIndexPayload, TitoFindOneByIndexPayload,
-        TitoIndexBlockType, TitoModelTrait, TitoPaginated, TitoScanPayload,
+        TitoIndexBlockType, TitoModelTrait, TitoPaginated, TitoScanPayload, TitoTransaction,
     },
     TitoModel,
 };
@@ -22,24 +22,29 @@ impl<
             + TitoModelTrait,
     > TitoModel<E, T>
 {
-    pub fn get_index_keys(
+    fn build_index_keys(
         &self,
-        id: String,
-        value: &T,
+        id: &str,
+        indexes: &[crate::types::TitoIndexConfig],
         json: &Value,
-    ) -> Result<Vec<(String, Value)>, TitoError> {
+        unique: bool,
+    ) -> Vec<(String, Value)> {
         let mut all_index_keys = vec![];
 
-        for index_config in value.indexes().iter() {
+        for index_config in indexes {
             if !index_config.condition {
                 continue;
             }
 
-            let base_key = format!("index:{}:", index_config.name);
+            let base_key = if unique {
+                format!("unique-index:{}:{}:", T::table(), index_config.name)
+            } else {
+                format!("index:{}:", index_config.name)
+            };
 
             let mut combinations: Vec<String> = vec![String::new()];
 
-            for field in index_config.fields.iter() {
+            for field in &index_config.fields {
                 let field_values = match &field.r#type {
                     TitoIndexBlockType::Custom(value) => {
                         vec![FieldValue::Simple(Value::String(value.clone()))]
@@ -54,30 +59,24 @@ impl<
                 for field_value in field_values {
                     let field_str = match field_value {
                         FieldValue::HashMapEntry { key, value } => match &field.r#type {
-                            TitoIndexBlockType::String | TitoIndexBlockType::Custom(_) => {
-                                match value.as_str() {
-                                    Some("") => None,
-                                    Some(s) => {
-                                        Some(format!("{}:{}.{}", field.name, key, safe_encode(s)))
-                                    }
-                                    None => None,
-                                }
-                            }
+                            TitoIndexBlockType::String | TitoIndexBlockType::Custom(_) => value
+                                .as_str()
+                                .filter(|value| !value.is_empty())
+                                .map(|value| {
+                                    format!("{}:{}.{}", field.name, key, safe_encode(value))
+                                }),
                             TitoIndexBlockType::Number => value
                                 .as_i64()
-                                .map(|n| format!("{}:{}:{:0>10}", field.name, key, n)),
+                                .map(|value| format!("{}:{}:{value:0>10}", field.name, key)),
                         },
                         FieldValue::Simple(value) => match &field.r#type {
-                            TitoIndexBlockType::String | TitoIndexBlockType::Custom(_) => {
-                                match value.as_str() {
-                                    Some("") => None,
-                                    Some(s) => Some(format!("{}:{}", field.name, safe_encode(s))),
-                                    None => None,
-                                }
-                            }
-                            TitoIndexBlockType::Number => {
-                                value.as_i64().map(|n| format!("{}:{:0>10}", field.name, n))
-                            }
+                            TitoIndexBlockType::String | TitoIndexBlockType::Custom(_) => value
+                                .as_str()
+                                .filter(|value| !value.is_empty())
+                                .map(|value| format!("{}:{}", field.name, safe_encode(value))),
+                            TitoIndexBlockType::Number => value
+                                .as_i64()
+                                .map(|value| format!("{}:{value:0>10}", field.name)),
                         },
                     };
 
@@ -103,12 +102,120 @@ impl<
 
             for combo in combinations {
                 if !combo.is_empty() {
-                    all_index_keys.push((format!("{}{}:{}", base_key, combo, id), json.clone()));
+                    let key = if unique {
+                        format!("{base_key}{combo}")
+                    } else {
+                        format!("{base_key}{combo}:{id}")
+                    };
+                    all_index_keys.push((key, json.clone()));
                 }
             }
         }
 
+        all_index_keys
+    }
+
+    pub fn get_index_keys(
+        &self,
+        id: String,
+        value: &T,
+        json: &Value,
+    ) -> Result<Vec<(String, Value)>, TitoError> {
+        let mut all_index_keys = self.build_index_keys(&id, &value.indexes(), json, false);
+        all_index_keys.extend(self.build_index_keys(&id, &value.unique_indexes(), json, true));
         Ok(all_index_keys)
+    }
+
+    fn unique_index_key(&self, payload: &TitoFindOneByIndexPayload) -> Result<String, TitoError> {
+        let schema = T::default();
+        let indexes = schema.unique_indexes();
+        let index = indexes
+            .iter()
+            .find(|index| index.name == payload.index)
+            .ok_or_else(|| {
+                TitoError::IndexError(format!(
+                    "Unique index '{}' not found on model '{}'",
+                    payload.index,
+                    T::table()
+                ))
+            })?;
+
+        if payload.values.len() != index.fields.len() {
+            return Err(TitoError::IndexError(format!(
+                "Unique index '{}' has {} fields but {} values were provided",
+                payload.index,
+                index.fields.len(),
+                payload.values.len()
+            )));
+        }
+
+        let mut parts = Vec::with_capacity(index.fields.len());
+        for (field, value) in index.fields.iter().zip(&payload.values) {
+            let encoded = match field.r#type {
+                TitoIndexBlockType::String | TitoIndexBlockType::Custom(_) => safe_encode(value),
+                TitoIndexBlockType::Number => format!("{value:0>10}"),
+            };
+            parts.push(format!("{}:{encoded}", field.name));
+        }
+
+        Ok(format!(
+            "unique-index:{}:{}:{}",
+            T::table(),
+            payload.index,
+            parts.join(":")
+        ))
+    }
+
+    pub async fn find_one_by_unique_index(
+        &self,
+        payload: TitoFindOneByIndexPayload,
+        tx: Option<&E::Transaction>,
+    ) -> Result<T, TitoError> {
+        match tx {
+            Some(tx) => self.find_one_by_unique_index_with_tx(&payload, tx).await,
+            None => {
+                self.tx(|tx| {
+                    let payload = payload.clone();
+                    async move { self.find_one_by_unique_index_with_tx(&payload, &tx).await }
+                })
+                .await
+            }
+        }
+    }
+
+    async fn find_one_by_unique_index_with_tx(
+        &self,
+        payload: &TitoFindOneByIndexPayload,
+        tx: &E::Transaction,
+    ) -> Result<T, TitoError> {
+        let key = self.unique_index_key(payload)?;
+        let index_bytes = tx.get(&key).await?.ok_or_else(|| {
+            TitoError::NotFound(format!(
+                "No record found for unique index '{}'",
+                payload.index
+            ))
+        })?;
+        let indexed: T = serde_json::from_slice(&index_bytes).map_err(|error| {
+            TitoError::DeserializationFailed(format!(
+                "Failed to deserialize unique index '{}': {}",
+                payload.index, error
+            ))
+        })?;
+        let owner_id = indexed.id();
+        let primary_key = format!("{}:{owner_id}", self.get_table());
+        let primary_bytes = tx.get(&primary_key).await?.ok_or_else(|| {
+            TitoError::IndexError(format!(
+                "Unique index '{}' on model '{}' points to a missing owner",
+                payload.index,
+                T::table()
+            ))
+        })?;
+        serde_json::from_slice(&primary_bytes).map_err(|error| {
+            TitoError::DeserializationFailed(format!(
+                "Failed to deserialize owner of unique index '{}': {}",
+                payload.index, error
+            ))
+        })
     }
 
     pub async fn find_by_index_raw(
