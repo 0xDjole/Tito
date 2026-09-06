@@ -79,11 +79,48 @@ async fn model_set_get_and_get_many_round_trip() {
 #[tokio::test]
 async fn model_set_adds_timestamps_by_default() {
     let engine = engine();
+    let before = Utc::now().timestamp_millis();
 
     let saved = save_author(&engine, author("a1", "ada@example.com", 36, "org-a")).await;
+    let after = Utc::now().timestamp_millis();
 
-    assert!(saved.created_at > 0);
-    assert!(saved.updated_at >= saved.created_at);
+    assert!((before..=after).contains(&saved.created_at));
+    assert_eq!(saved.updated_at, saved.created_at);
+
+    let mut changed = saved.clone();
+    changed.name = "Updated".to_string();
+    let before_update = Utc::now().timestamp_millis();
+    let updated = save_author(&engine, changed).await;
+    let after_update = Utc::now().timestamp_millis();
+    assert_eq!(updated.created_at, saved.created_at);
+    assert!((before_update..=after_update).contains(&updated.updated_at));
+    let stored = engine.raw_json("table:authors:a1").await.unwrap();
+    assert_eq!(stored["created_at"], json!(saved.created_at));
+    assert_eq!(stored["updated_at"], json!(updated.updated_at));
+}
+
+#[tokio::test]
+async fn model_explicit_signed_epoch_milliseconds_round_trip_without_unit_guessing() {
+    let engine = engine();
+    let model = engine.clone().model::<Author>(TitoModelOptions::default());
+
+    for timestamp in [-1, 0, 123, 1_700_000_000_123] {
+        let mut item = author(&format!("at-{timestamp}"), "ada@example.com", 36, "org-a");
+        item.created_at = timestamp;
+        item.updated_at = timestamp;
+        let saved = engine
+            .transaction(|tx| {
+                let model = model.clone();
+                let item = item.clone();
+                async move { model.set(item).timestamps(false).execute(&tx).await }
+            })
+            .await
+            .unwrap();
+        let restored = model.get(&saved.id).execute(None).await.unwrap();
+        assert_eq!(saved.created_at, timestamp);
+        assert_eq!(restored.created_at, timestamp);
+        assert_eq!(restored.updated_at, timestamp);
+    }
 }
 
 #[tokio::test]

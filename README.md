@@ -66,7 +66,7 @@ impl TitoModelTrait for User {
     }
 
     fn events(&self) -> Vec<TitoEventConfig> {
-        let now = chrono::Utc::now().timestamp();
+        let now = chrono::Utc::now().timestamp_millis();
         vec![
             TitoEventConfig { name: "user".to_string(), timestamp: now },
             TitoEventConfig { name: "analytics".to_string(), timestamp: now },
@@ -134,6 +134,44 @@ Secondary index values intentionally remain complete clones of the primary JSON 
 redundancy requires a separately designed release that rehydrates primary rows and migrates every
 existing index; it is not part of this correctness patch.
 
+### 0.18.0 development cutover
+
+Version 0.18.0 changes every Tito-owned wall-clock instant to signed UTC Unix epoch milliseconds:
+automatic model `created_at` and `updated_at`, queue `timestamp` and `processedAt`, cluster
+heartbeats, lease deadlines, and assignment timestamps. Timestamp-bearing models receive automatic
+millisecond stamps unless a write explicitly uses `.timestamps(false)` to preserve application-owned
+values. No undeclared timestamp fields are added.
+
+Queue scheduling still accepts only non-negative `i64` instants, including zero and early-epoch
+millisecond values. The requested due time is stored exactly, including its millisecond component;
+Tito never guesses units, scales caller values, or rounds them to whole seconds. Completed-retention
+cutoffs and cluster leases convert their configured `Duration` to milliseconds. Oversized durations
+saturate rather than wrapping into an earlier deadline. Fractional milliseconds round up so a
+configured positive span never becomes zero or expires early. Runtime sleeps, handler budgets, and monotonic measurements remain
+`Duration`/`Instant` values.
+
+TiKV transaction versions and native physical/logical timestamps do not change. Queue IDs keep their
+opaque microsecond prefix and UUID suffix; `created_at_millis()` converts that prefix to milliseconds
+and otherwise returns the exact millisecond queue timestamp without another scale conversion.
+
+The same candidate applies the canonical queue lifecycle vocabulary: `QueueEvent.status` uses
+`QueueEventStatus`, serialized as `{"type":"pending"}` or `{"type":"completed"}`. The field is
+required; neither the old `state` field nor a string-valued status is accepted. `QueueOwner.r#type`
+serializes as `type`, never `kind`. Owner records and queue envelopes reject unknown fields.
+Query methods are `scan_by_status` and `delete_by_status_before`; derived owner index segments use
+the scalar status type while the event itself retains its tagged status object. There are no old
+API aliases or dual readers.
+
+This is an incompatible data and worker contract: instant units and queue JSON fields change while
+fixed-width key layouts remain unchanged. Do not mix 0.17.x and 0.18.x publishers, workers, model data, queue rows,
+cluster records, or backup artifacts. The pre-production cutover stops traffic and workers, verifies
+the authorized reset, and reseeds the complete affected state. There is no mixed-unit decoder,
+magnitude heuristic, migration, or legacy compatibility mode in 0.18.0.
+
+The current 0.18.0 candidate is a development change, not a registry publication or release tag.
+Applications can verify it through a reviewed exact Git revision and lockfile; a sibling checkout or
+a moving branch name is not a reproducible dependency pin. Publication is a separate authorized step.
+
 ### 0.17.0 rollout
 
 Version 0.17.0 adds conditional unique indexes, exact unique lookup, and `assert_current`. Existing
@@ -187,7 +225,7 @@ range destruction for reset, restore, or drop-style maintenance with application
 
 ## Queue Processing
 
-Queue events are partitioned by their business key, carry their own non-negative Unix timestamp, and remain pending until the handler explicitly acknowledges them. Tito rejects negative timestamps instead of storing an event that polling cannot reach. Tito has no automatic retry policy, retry counter, backoff, failed state, or DLQ:
+Queue events are partitioned by their business key, carry their own non-negative Unix epoch-millisecond timestamp, and remain pending until the handler explicitly acknowledges them. Tito rejects negative timestamps instead of storing an event that polling cannot reach. Tito has no automatic retry policy, retry counter, backoff, failed state, or DLQ:
 
 Handlers return `QueueHandlerResult<T>`, an alias for `Result<QueueHandlerOutcome<T>, TitoError>`.
 
@@ -201,7 +239,7 @@ Each event's own timestamp determines when it becomes runnable. Tito indexes tha
 Every new invocation must serialize to at most `MAX_QUEUE_EVENT_BYTES` (1 MiB). Publication rejects
 larger events before writing anything. Queue range reads preserve their public logical page size while fetching at most 16
 invocations per datastore scan. Tito configures both TiKV clients with a 32 MiB decoding budget, so
-the maximum 16 MiB of valid invocation bytes has at least 2x transport headroom for completed-state
+the maximum 16 MiB of valid invocation bytes has at least 2x transport headroom for completed-status
 metadata, keys, and protobuf framing. This keeps one logical page from becoming one unbounded RPC
 without turning a 50-event worker pull into dozens of sequential datastore calls.
 
@@ -221,7 +259,7 @@ queue
     .publish(QueueEvent::new(
         "user:123",
         UserCreated { id: "123".into() },
-        chrono::Utc::now().timestamp(),
+        chrono::Utc::now().timestamp_millis(),
     ))
     .await?;
 
@@ -248,7 +286,7 @@ ordering. Tito writes that secondary key in the same transaction as publication,
 on acknowledge/reschedule/advance, and removes it with the queue row. Applications that must erase one
 owner's work can call `delete_by_owner_matching_in_tx`; the scan touches only that owner's Pending
 or Completed keys and the predicate can preserve a currently executing lifecycle invocation. Owner
-kind and ID are opaque, non-empty strings bounded to 512 bytes each. They are routing/erasure
+type and ID are opaque, non-empty strings bounded to 512 bytes each. They are routing/erasure
 metadata, not provider identity or domain state.
 
 Workers supervise each handler with a ten-minute timeout by default. Configure `handler_timeout` when a workload has a different bounded execution contract; the timeout is executor protection and never changes queue state or provider policy.
@@ -271,7 +309,7 @@ eligible. The cursor is executor state only: it is not persisted and does not en
 Completed invocation history uses the retention supplied by the application in `QueueConfig`.
 Standalone workers and the elected cluster coordinator delete older rows in bounded passes. A full
 pass yields and continues immediately until the expired range is caught up; the 30-second interval
-applies only after a short pass. Maintenance uses the completed-state/processed-time key range
+applies only after a short pass. Maintenance uses the completed-status/processed-time key range
 directly, never inspects pending work, and has no retry, recovery, or provider semantics. Malformed
 values inside an expired completed-row key are also removed so corrupt terminal history cannot pin
 newer cleanup work.
@@ -299,7 +337,7 @@ For the prelaunch cutover, stop publishers and workers, use the source release t
 
 ```rust
 fn events(&self) -> Vec<TitoEventConfig> {
-    let in_one_hour = chrono::Utc::now().timestamp() + 3600;
+    let in_one_hour = chrono::Utc::now().timestamp_millis() + 3_600_000;
     vec![TitoEventConfig {
         name: "reminder".to_string(),
         timestamp: in_one_hour,
@@ -312,8 +350,22 @@ fn events(&self) -> Vec<TitoEventConfig> {
 ```
 queue:pending:{partition:04}:{timestamp:020}:{enqueue_version:020}:{event_id}
 queue:completed:{processed_at:020}:{event_timestamp:020}:{event_id}
-queue:owner:{base64url(kind)}:{base64url(id)}:{state}:{base64url(queue_storage_key)}
+queue:owner:{base64url(type)}:{base64url(id)}:{status_type}:{base64url(queue_storage_key)}
 ```
+
+## Verification
+
+Run the complete crate checks from this repository:
+
+```sh
+cargo test --all-targets
+```
+
+The tests use the in-memory engine and cover model/index writes, queue transitions, exact
+millisecond scheduling and completion, configured retention, cluster ownership and leases, worker
+shutdown, and ambiguous transaction outcomes. Examples are compiled but not run against a live
+database. Application-level TiKV, provider-effect, backup, and restore evidence belongs to the
+application's complete suite against this exact dependency candidate.
 
 ## License
 

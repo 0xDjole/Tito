@@ -223,7 +223,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
         if timestamps {
             if let serde_json::Value::Object(ref mut map) = value {
-                let now = Utc::now().timestamp();
+                let now = Utc::now().timestamp_millis();
 
                 if is_new && map.contains_key("created_at") {
                     map.insert("created_at".to_string(), serde_json::json!(now));

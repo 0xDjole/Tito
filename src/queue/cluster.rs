@@ -13,7 +13,8 @@ use super::worker::{
     apply_handler_outcome, execute_handler, handler_outcome_or_log, DEFAULT_HANDLER_TIMEOUT,
 };
 use super::{
-    Queue, QueueEvent, QueueHandlerResult, QueuePullCursor, COMPLETED_EVENT_MAINTENANCE_INTERVAL,
+    duration_millis, Queue, QueueEvent, QueueHandlerResult, QueuePullCursor,
+    COMPLETED_EVENT_MAINTENANCE_INTERVAL,
 };
 use crate::key_encoder::safe_encode;
 use crate::types::{TitoEngine, TitoTransaction, PARTITION_DIGITS};
@@ -82,7 +83,7 @@ pub struct ClusterPartitionAssignment {
 
 impl ClusterPartitionAssignment {
     fn new(partition: u32) -> Self {
-        let now = Utc::now().timestamp();
+        let now = Utc::now().timestamp_millis();
         Self {
             partition,
             desired_node_id: None,
@@ -170,7 +171,7 @@ impl<E: TitoEngine> Queue<E> {
                 async move {
                     let node = ClusterWorkerNode {
                         node_id: config.node_id.clone(),
-                        heartbeat_at: Utc::now().timestamp(),
+                        heartbeat_at: Utc::now().timestamp_millis(),
                     };
                     Self::put_json(&tx, &Self::node_key(&config.node_id), &node).await
                 }
@@ -187,7 +188,7 @@ impl<E: TitoEngine> Queue<E> {
             .transaction(|tx| {
                 let config = config.clone();
                 async move {
-                    let now = Utc::now().timestamp();
+                    let now = Utc::now().timestamp_millis();
                     let key = Self::coordinator_key();
                     let lease = Self::read_json::<ClusterCoordinatorLease>(&tx, &key).await?;
                     let can_claim = match lease {
@@ -203,7 +204,7 @@ impl<E: TitoEngine> Queue<E> {
 
                     let lease = ClusterCoordinatorLease {
                         owner_node_id: config.node_id.clone(),
-                        lease_until: now + config.lease_ttl.as_secs() as i64,
+                        lease_until: now.saturating_add(duration_millis(config.lease_ttl)),
                         updated_at: now,
                     };
                     Self::put_json(&tx, &key, &lease).await?;
@@ -222,8 +223,8 @@ impl<E: TitoEngine> Queue<E> {
             .transaction(|tx| {
                 let config = config.clone();
                 async move {
-                    let now = Utc::now().timestamp();
-                    let stale_before = now - config.lease_ttl.as_secs() as i64;
+                    let now = Utc::now().timestamp_millis();
+                    let stale_before = now.saturating_sub(duration_millis(config.lease_ttl));
                     let prefix = Self::nodes_prefix();
                     let entries = tx
                         .scan(
@@ -260,10 +261,11 @@ impl<E: TitoEngine> Queue<E> {
             .transaction(|tx| {
                 let config = config.clone();
                 async move {
-                    let now = Utc::now().timestamp();
+                    let now = Utc::now().timestamp_millis();
                     let nodes = {
-                        let stale_before = now - config.lease_ttl.as_secs() as i64;
-                        let remove_before = now - config.stale_node_ttl.as_secs() as i64;
+                        let stale_before = now.saturating_sub(duration_millis(config.lease_ttl));
+                        let remove_before =
+                            now.saturating_sub(duration_millis(config.stale_node_ttl));
                         let prefix = Self::nodes_prefix();
                         let entries = tx
                             .scan(
@@ -345,7 +347,7 @@ impl<E: TitoEngine> Queue<E> {
             .transaction(|tx| {
                 let config = config.clone();
                 async move {
-                    let now = Utc::now().timestamp();
+                    let now = Utc::now().timestamp_millis();
                     let prefix = Self::partitions_prefix();
                     let entries = tx
                         .scan(
@@ -390,7 +392,8 @@ impl<E: TitoEngine> Queue<E> {
                                 assignment.generation = assignment.generation.saturating_add(1);
                             }
                             assignment.owner_node_id = Some(config.node_id.clone());
-                            assignment.lease_until = now + config.lease_ttl.as_secs() as i64;
+                            assignment.lease_until =
+                                now.saturating_add(duration_millis(config.lease_ttl));
                             assignment.updated_at = now;
                             Self::put_json(&tx, &key, &assignment).await?;
                             owned.push(assignment);
@@ -425,7 +428,7 @@ impl<E: TitoEngine> Queue<E> {
             .transaction(|tx| {
                 let config = config.clone();
                 async move {
-                    let now = Utc::now().timestamp();
+                    let now = Utc::now().timestamp_millis();
                     let prefix = Self::partitions_prefix();
                     let entries = tx
                         .scan(
@@ -467,7 +470,7 @@ impl<E: TitoEngine> Queue<E> {
             .transaction(|tx| {
                 let config = config.clone();
                 async move {
-                    let now = Utc::now().timestamp();
+                    let now = Utc::now().timestamp_millis();
                     let key = Self::partition_key(partition);
                     let Some(assignment) =
                         Self::read_json::<ClusterPartitionAssignment>(&tx, &key).await?
@@ -779,7 +782,7 @@ async fn maintain_cluster_worker<E>(
                 if now >= next_completed_event_maintenance {
                     loop {
                         match queue
-                            .maintain_completed_event_retention(Utc::now().timestamp())
+                            .maintain_completed_event_retention(Utc::now().timestamp_millis())
                             .await
                         {
                             Ok(true) => {

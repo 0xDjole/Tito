@@ -5,12 +5,35 @@ use crate::TitoError;
 
 pub const MAX_QUEUE_OWNER_COMPONENT_BYTES: usize = 512;
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum QueueEventState {
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum QueueEventStatus {
     #[default]
     Pending,
     Completed,
+}
+
+impl<'de> Deserialize<'de> for QueueEventStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct StatusWire {
+            r#type: String,
+        }
+
+        let wire = StatusWire::deserialize(deserializer)?;
+        match wire.r#type.as_str() {
+            "pending" => Ok(Self::Pending),
+            "completed" => Ok(Self::Completed),
+            value => Err(serde::de::Error::unknown_variant(
+                value,
+                &["pending", "completed"],
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,16 +44,16 @@ pub enum QueueHandlerOutcome<T> {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QueueOwner {
-    pub kind: String,
+    pub r#type: String,
     pub id: String,
 }
 
 impl QueueOwner {
-    pub fn new(kind: impl Into<String>, id: impl Into<String>) -> Result<Self, TitoError> {
+    pub fn new(r#type: impl Into<String>, id: impl Into<String>) -> Result<Self, TitoError> {
         let owner = Self {
-            kind: kind.into(),
+            r#type: r#type.into(),
             id: id.into(),
         };
         owner.validate()?;
@@ -38,16 +61,16 @@ impl QueueOwner {
     }
 
     pub fn validate(&self) -> Result<(), TitoError> {
-        if self.kind.trim().is_empty() || self.id.trim().is_empty() {
+        if self.r#type.trim().is_empty() || self.id.trim().is_empty() {
             return Err(TitoError::InvalidInput(
-                "Queue owner kind and id must be non-empty".to_string(),
+                "Queue owner type and id must be non-empty".to_string(),
             ));
         }
-        if self.kind.len() > MAX_QUEUE_OWNER_COMPONENT_BYTES
+        if self.r#type.len() > MAX_QUEUE_OWNER_COMPONENT_BYTES
             || self.id.len() > MAX_QUEUE_OWNER_COMPONENT_BYTES
         {
             return Err(TitoError::InvalidInput(format!(
-                "Queue owner kind and id must each be at most {MAX_QUEUE_OWNER_COMPONENT_BYTES} bytes"
+                "Queue owner type and id must each be at most {MAX_QUEUE_OWNER_COMPONENT_BYTES} bytes"
             )));
         }
         Ok(())
@@ -60,7 +83,7 @@ impl QueueOwner {
 pub type QueueHandlerResult<T> = Result<QueueHandlerOutcome<T>, TitoError>;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[non_exhaustive]
 pub struct QueueEvent<T> {
     pub id: String,
@@ -69,8 +92,7 @@ pub struct QueueEvent<T> {
     pub owner: Option<QueueOwner>,
     pub payload: T,
     pub timestamp: i64,
-    #[serde(default)]
-    pub state: QueueEventState,
+    pub status: QueueEventStatus,
     #[serde(default)]
     pub processed_at: Option<i64>,
 }
@@ -108,7 +130,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent
             owner: None,
             payload,
             timestamp,
-            state: QueueEventState::Pending,
+            status: QueueEventStatus::Pending,
             processed_at: None,
         }
     }
@@ -135,7 +157,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent
             .split_once('-')
             .and_then(|(micros, _)| micros.parse::<i64>().ok())
             .map(|micros| micros / 1_000)
-            .unwrap_or_else(|| self.timestamp.saturating_mul(1_000))
+            .unwrap_or(self.timestamp)
     }
 
     pub fn rescheduled(&self, timestamp: i64) -> Self {
@@ -145,7 +167,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent
             owner: self.owner.clone(),
             payload: self.payload.clone(),
             timestamp,
-            state: QueueEventState::Pending,
+            status: QueueEventStatus::Pending,
             processed_at: None,
         }
     }

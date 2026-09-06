@@ -1,6 +1,142 @@
 use super::*;
 
 #[tokio::test]
+async fn cluster_clock_and_subsecond_lease_durations_use_epoch_milliseconds() {
+    let engine = engine();
+    let queue = queue(engine.clone(), 1);
+    let mut config = cluster_config("millisecond-node");
+    config.lease_ttl = Duration::from_millis(60_501);
+    config.stale_node_ttl = Duration::from_millis(90_501);
+    let before = Utc::now().timestamp_millis();
+    queue.heartbeat_cluster_worker(&config).await.unwrap();
+    assert!(queue
+        .try_acquire_cluster_coordinator(&config)
+        .await
+        .unwrap());
+    let after = Utc::now().timestamp_millis();
+
+    let node = engine
+        .raw_json("tito:queue:cluster:nodes:millisecond-node")
+        .await
+        .unwrap();
+    assert!((before..=after).contains(&node["heartbeat_at"].as_i64().unwrap()));
+    let lease: ClusterCoordinatorLease = serde_json::from_value(
+        engine
+            .raw_json("tito:queue:cluster:coordinator")
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!((before..=after).contains(&lease.updated_at));
+    assert_eq!(lease.lease_until - lease.updated_at, 60_501);
+
+    engine
+        .put_json(
+            "tito:queue:cluster:nodes:dormant",
+            &json!({"node_id": "dormant", "heartbeat_at": before - 70_000}),
+        )
+        .await;
+    engine
+        .put_json(
+            "tito:queue:cluster:nodes:expired",
+            &json!({"node_id": "expired", "heartbeat_at": before - 120_000}),
+        )
+        .await;
+    let active = queue.active_cluster_workers(&config).await.unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].node_id, config.node_id);
+
+    queue.rebalance_cluster_partitions(&config).await.unwrap();
+    assert!(
+        engine
+            .contains_key("tito:queue:cluster:nodes:dormant")
+            .await
+    );
+    assert!(
+        !engine
+            .contains_key("tito:queue:cluster:nodes:expired")
+            .await
+    );
+    let owned = queue.sync_cluster_partition_leases(&config).await.unwrap();
+    assert_eq!(owned.len(), 1);
+    assert_eq!(owned[0].lease_until - owned[0].updated_at, 60_501);
+    assert_eq!(
+        queue.owned_cluster_partitions(&config).await.unwrap(),
+        vec![0]
+    );
+
+    let mut expired = owned[0].clone();
+    expired.lease_until = Utc::now().timestamp_millis() - 1;
+    engine
+        .put_json("tito:queue:cluster:partitions:0000", &json!(expired))
+        .await;
+    assert!(queue
+        .owned_cluster_partitions(&config)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn cluster_lease_durations_round_fractional_milliseconds_up() {
+    let engine = engine();
+    let queue = queue(engine.clone(), 1);
+    let mut config = cluster_config("rounded-duration-node");
+
+    for (duration, expected_ms) in [
+        (Duration::ZERO, 0),
+        (Duration::from_nanos(1), 1),
+        (Duration::from_nanos(999_999), 1),
+        (Duration::from_nanos(1_000_000), 1),
+        (Duration::from_nanos(1_000_001), 2),
+        (Duration::from_nanos(1_501_000_001), 1_502),
+    ] {
+        config.lease_ttl = duration;
+        assert!(queue
+            .try_acquire_cluster_coordinator(&config)
+            .await
+            .unwrap());
+        let lease: ClusterCoordinatorLease = serde_json::from_value(
+            engine
+                .raw_json("tito:queue:cluster:coordinator")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(lease.lease_until - lease.updated_at, expected_ms);
+    }
+}
+
+#[tokio::test]
+async fn cluster_oversized_durations_saturate_without_wrapping_clock_values() {
+    let engine = engine();
+    let queue = queue(engine.clone(), 1);
+    let mut config = cluster_config("large-duration-node");
+    config.lease_ttl = Duration::MAX;
+    config.stale_node_ttl = Duration::MAX;
+    queue.heartbeat_cluster_worker(&config).await.unwrap();
+    assert!(queue
+        .try_acquire_cluster_coordinator(&config)
+        .await
+        .unwrap());
+    let lease: ClusterCoordinatorLease = serde_json::from_value(
+        engine
+            .raw_json("tito:queue:cluster:coordinator")
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(lease.lease_until, i64::MAX);
+    assert_eq!(
+        queue.active_cluster_workers(&config).await.unwrap().len(),
+        1
+    );
+    queue.rebalance_cluster_partitions(&config).await.unwrap();
+    let owned = queue.sync_cluster_partition_leases(&config).await.unwrap();
+    assert_eq!(owned[0].lease_until, i64::MAX);
+}
+
+#[tokio::test]
 async fn cluster_coordinator_lease_blocks_other_nodes_until_expired() {
     let engine = engine();
     let queue = queue(engine.clone(), 2);
@@ -22,8 +158,8 @@ async fn cluster_coordinator_lease_blocks_other_nodes_until_expired() {
 
     let expired = ClusterCoordinatorLease {
         owner_node_id: "node-a".to_string(),
-        lease_until: Utc::now().timestamp() - 1,
-        updated_at: Utc::now().timestamp() - 2,
+        lease_until: Utc::now().timestamp_millis() - 1,
+        updated_at: Utc::now().timestamp_millis() - 2,
     };
     engine
         .put_json("tito:queue:cluster:coordinator", &json!(expired))
@@ -91,7 +227,7 @@ async fn cluster_worker_contains_handler_panic_and_redelivers_pending_invocation
         .publish(queue_event(
             "cluster-panic",
             "entry:cluster-panic",
-            Utc::now().timestamp() - 10,
+            Utc::now().timestamp_millis() - 10_000,
         ))
         .await
         .unwrap();
@@ -127,7 +263,7 @@ async fn cluster_worker_contains_handler_panic_and_redelivers_pending_invocation
     timeout(Duration::from_secs(2), async {
         loop {
             let completed = queue
-                .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
+                .scan_by_status::<QueuePayload>(QueueEventStatus::Completed, None, 10)
                 .await
                 .unwrap();
             if completed
@@ -159,7 +295,7 @@ async fn cluster_worker_shutdown_drains_started_handler_and_persists_outcome_bef
         .publish(queue_event(
             "cluster-drain",
             "entry:cluster-drain",
-            Utc::now().timestamp() - 10,
+            Utc::now().timestamp_millis() - 10_000,
         ))
         .await
         .unwrap();
@@ -167,7 +303,7 @@ async fn cluster_worker_shutdown_drains_started_handler_and_persists_outcome_bef
         .publish(queue_event(
             "cluster-already-pulled",
             "entry:cluster-already-pulled",
-            Utc::now().timestamp() - 10,
+            Utc::now().timestamp_millis() - 10_000,
         ))
         .await
         .unwrap();
@@ -206,7 +342,7 @@ async fn cluster_worker_shutdown_drains_started_handler_and_persists_outcome_bef
         .publish(queue_event(
             "cluster-not-pulled",
             "entry:cluster-not-pulled",
-            Utc::now().timestamp() - 10,
+            Utc::now().timestamp_millis() - 10_000,
         ))
         .await
         .unwrap();
@@ -236,14 +372,14 @@ async fn cluster_worker_shutdown_drains_started_handler_and_persists_outcome_bef
         "shutdown allowed another handler to start"
     );
     let completed = queue
-        .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
+        .scan_by_status::<QueuePayload>(QueueEventStatus::Completed, None, 10)
         .await
         .unwrap();
     assert_eq!(completed.events.len(), 1);
     assert_eq!(completed.events[0].1.id, "cluster-drain");
-    assert_eq!(completed.events[0].1.state, QueueEventState::Completed);
+    assert_eq!(completed.events[0].1.status, QueueEventStatus::Completed);
     let pending = queue
-        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+        .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 10)
         .await
         .unwrap();
     assert_eq!(pending.events.len(), 2);
@@ -268,7 +404,7 @@ async fn cluster_worker_shutdown_bounds_a_blocked_handler_by_its_timeout() {
         .publish(queue_event(
             "cluster-timeout-drain",
             "entry:cluster-timeout-drain",
-            Utc::now().timestamp() - 10,
+            Utc::now().timestamp_millis() - 10_000,
         ))
         .await
         .unwrap();
@@ -303,13 +439,13 @@ async fn cluster_worker_shutdown_bounds_a_blocked_handler_by_its_timeout() {
         .unwrap();
 
     let pending = queue
-        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+        .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 10)
         .await
         .unwrap();
     assert_eq!(pending.events.len(), 1);
     assert_eq!(pending.events[0].1.id, "cluster-timeout-drain");
     assert!(queue
-        .scan_by_state::<QueuePayload>(QueueEventState::Completed, None, 10)
+        .scan_by_status::<QueuePayload>(QueueEventStatus::Completed, None, 10)
         .await
         .unwrap()
         .events
@@ -324,7 +460,7 @@ async fn cluster_worker_observes_shutdown_sent_immediately_after_start() {
         .publish(queue_event(
             "cluster-immediate-shutdown",
             "entry:cluster-immediate-shutdown",
-            Utc::now().timestamp() - 10,
+            Utc::now().timestamp_millis() - 10_000,
         ))
         .await
         .unwrap();
@@ -359,7 +495,7 @@ async fn cluster_worker_observes_shutdown_sent_immediately_after_start() {
     );
     assert_eq!(engine.pending_queue_scan_count(), 0);
     let pending = queue
-        .scan_by_state::<QueuePayload>(QueueEventState::Pending, None, 10)
+        .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 10)
         .await
         .unwrap();
     assert_eq!(pending.events.len(), 1);
@@ -374,7 +510,7 @@ async fn cluster_coordinator_enforces_configured_completed_history_retention() {
         engine.clone(),
         QueueConfig::new(1, Duration::from_secs(RETENTION_SECONDS as u64)),
     ));
-    let now = Utc::now().timestamp();
+    let now = Utc::now().timestamp_millis();
     let expired_count = crate::queue::COMPLETED_EVENT_MAINTENANCE_BATCH_SIZE as usize
         * crate::queue::COMPLETED_EVENT_MAINTENANCE_MAX_BATCHES
         + 1;
@@ -383,12 +519,16 @@ async fn cluster_coordinator_enforces_configured_completed_history_retention() {
         last_expired_key = put_completed_queue_event(
             &engine,
             &format!("cluster-expired-{index:05}"),
-            now - RETENTION_SECONDS - 1,
+            now - RETENTION_SECONDS * 1_000 - 1,
         )
         .await;
     }
-    let retained_key =
-        put_completed_queue_event(&engine, "cluster-retained", now - RETENTION_SECONDS + 60).await;
+    let retained_key = put_completed_queue_event(
+        &engine,
+        "cluster-retained",
+        now - RETENTION_SECONDS * 1_000 + 60_000,
+    )
+    .await;
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
     let handle = crate::run_cluster_worker(

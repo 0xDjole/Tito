@@ -153,7 +153,7 @@ where
                     _ = maintenance_shutdown.recv() => break,
                     _ = sleep(wait) => {
                         wait = match maintenance_queue
-                            .maintain_completed_event_retention(chrono::Utc::now().timestamp())
+                            .maintain_completed_event_retention(chrono::Utc::now().timestamp_millis())
                             .await
                         {
                             Ok(true) => {
