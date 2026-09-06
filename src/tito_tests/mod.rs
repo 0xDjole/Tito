@@ -449,4 +449,5 @@ fn cluster_config(node_id: &str) -> ClusterWorkerConfig {
 mod cluster;
 mod index;
 mod model;
+mod numeric_index;
 mod queue;

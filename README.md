@@ -14,6 +14,20 @@ the configured type. Missing fields, JSON `null`, empty strings, empty collectio
 different type produce no key for that index. A model can use `condition` to apply an additional
 domain-specific inclusion rule.
 
+`Number` indexes accept signed 64-bit integers. JSON unsigned integers through `i64::MAX` have the
+same exact indexed identity; larger unsigned values and all floating-point numbers (including
+`1.0`) fail the write instead of silently losing the index. Non-number values retain sparse
+behavior, and a disabled index condition omits the index without validating its values. Numeric
+query values must be canonical signed decimal strings: no leading plus, leading zeros, negative
+zero, fractional or exponent notation, whitespace, or out-of-range values.
+
+`encode_index_integer(i64)` encodes the full signed range by flipping the sign bit and writing the
+result as exactly 20 decimal digits. Byte ordering therefore matches signed integer ordering,
+including negative values, zero, and decimal-width boundaries. Use this exported encoder for
+manual numeric range endpoints; never pad the original integer directly. Half-open scans and exact
+cursor continuation retain their existing semantics. String index encoding and opaque record IDs
+are unchanged.
+
 Ordinary indexes are declared by `indexes`; their keys include the primary record identity and may
 have many owners. Exclusive value ownership is declared separately by `unique_indexes`; its key
 includes the model, index name, and complete indexed value but not the claimant ID. A competing
@@ -162,8 +176,15 @@ Query methods are `scan_by_status` and `delete_by_status_before`; derived owner 
 the scalar status type while the event itself retains its tagged status object. There are no old
 API aliases or dual readers.
 
-This is an incompatible data and worker contract: instant units and queue JSON fields change while
-fixed-width key layouts remain unchanged. Do not mix 0.17.x and 0.18.x publishers, workers, model data, queue rows,
+The same candidate replaces the old minimum-width decimal numeric-index keys with the signed-sortable
+encoding above. Ordinary, unique, array, and map numeric index writes and numeric queries use the
+same integer encoding. The previous implementation silently omitted floating-point and oversized
+unsigned values; these unsupported numbers now fail explicitly before any model/index mutation.
+Numeric secondary index keys must be rebuilt through the authorized reset/reseed. Queue keys and
+opaque microsecond queue IDs retain their existing key layouts.
+
+This is an incompatible data and worker contract: instant units, numeric index keys, and queue JSON
+fields change. Do not mix 0.17.x and 0.18.x publishers, workers, model data, queue rows,
 cluster records, or backup artifacts. The pre-production cutover stops traffic and workers, verifies
 the authorized reset, and reseeds the complete affected state. There is no mixed-unit decoder,
 magnitude heuristic, migration, or legacy compatibility mode in 0.18.0.

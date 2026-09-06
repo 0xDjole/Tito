@@ -1,6 +1,6 @@
 use crate::{
     error::TitoError,
-    key_encoder::safe_encode,
+    key_encoder::{encode_index_integer_query, encode_index_number, safe_encode},
     types::{
         FieldValue, TitoEngine, TitoFindByIndexPayload, TitoFindOneByIndexPayload,
         TitoIndexBlockType, TitoModelTrait, TitoPaginated, TitoScanPayload, TitoTransaction,
@@ -28,7 +28,7 @@ impl<
         indexes: &[crate::types::TitoIndexConfig],
         json: &Value,
         unique: bool,
-    ) -> Vec<(String, Value)> {
+    ) -> Result<Vec<(String, Value)>, TitoError> {
         let mut all_index_keys = vec![];
 
         for index_config in indexes {
@@ -65,18 +65,16 @@ impl<
                                 .map(|value| {
                                     format!("{}:{}.{}", field.name, key, safe_encode(value))
                                 }),
-                            TitoIndexBlockType::Number => value
-                                .as_i64()
-                                .map(|value| format!("{}:{}:{value:0>10}", field.name, key)),
+                            TitoIndexBlockType::Number => encode_index_number(&value)?
+                                .map(|value| format!("{}:{}:{value}", field.name, key)),
                         },
                         FieldValue::Simple(value) => match &field.r#type {
                             TitoIndexBlockType::String | TitoIndexBlockType::Custom(_) => value
                                 .as_str()
                                 .filter(|value| !value.is_empty())
                                 .map(|value| format!("{}:{}", field.name, safe_encode(value))),
-                            TitoIndexBlockType::Number => value
-                                .as_i64()
-                                .map(|value| format!("{}:{value:0>10}", field.name)),
+                            TitoIndexBlockType::Number => encode_index_number(&value)?
+                                .map(|value| format!("{}:{value}", field.name)),
                         },
                     };
 
@@ -112,7 +110,7 @@ impl<
             }
         }
 
-        all_index_keys
+        Ok(all_index_keys)
     }
 
     pub fn get_index_keys(
@@ -121,8 +119,8 @@ impl<
         value: &T,
         json: &Value,
     ) -> Result<Vec<(String, Value)>, TitoError> {
-        let mut all_index_keys = self.build_index_keys(&id, &value.indexes(), json, false);
-        all_index_keys.extend(self.build_index_keys(&id, &value.unique_indexes(), json, true));
+        let mut all_index_keys = self.build_index_keys(&id, &value.indexes(), json, false)?;
+        all_index_keys.extend(self.build_index_keys(&id, &value.unique_indexes(), json, true)?);
         Ok(all_index_keys)
     }
 
@@ -153,7 +151,7 @@ impl<
         for (field, value) in index.fields.iter().zip(&payload.values) {
             let encoded = match field.r#type {
                 TitoIndexBlockType::String | TitoIndexBlockType::Custom(_) => safe_encode(value),
-                TitoIndexBlockType::Number => format!("{value:0>10}"),
+                TitoIndexBlockType::Number => encode_index_integer_query(value)?,
             };
             parts.push(format!("{}:{encoded}", field.name));
         }
@@ -256,7 +254,7 @@ impl<
 
             let value = match index_field_type {
                 TitoIndexBlockType::String | TitoIndexBlockType::Custom(_) => safe_encode(value),
-                TitoIndexBlockType::Number => format!("{:0>10}", value),
+                TitoIndexBlockType::Number => encode_index_integer_query(value)?,
             };
 
             let field_name = index_field.name.clone();
@@ -320,7 +318,7 @@ impl<
 
             let value = match index_field_type {
                 TitoIndexBlockType::String | TitoIndexBlockType::Custom(_) => safe_encode(value),
-                TitoIndexBlockType::Number => format!("{:0>10}", value),
+                TitoIndexBlockType::Number => encode_index_integer_query(value)?,
             };
 
             let field_name = index_field.name.clone();

@@ -15,6 +15,7 @@ pub mod queue;
 pub mod query;
 
 mod key_encoder;
+pub use key_encoder::encode_index_integer;
 
 mod error;
 

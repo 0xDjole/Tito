@@ -178,7 +178,7 @@ async fn string_index_queries_are_case_normalized_and_escape_colons() {
 }
 
 #[tokio::test]
-async fn number_index_queries_sort_and_match_padded_values() {
+async fn number_index_queries_match_signed_sortable_values() {
     let engine = engine();
     let model = engine.clone().model::<Author>(TitoModelOptions::default());
     save_author(&engine, author("a9", "nine@example.com", 9, "org-a")).await;
@@ -191,7 +191,7 @@ async fn number_index_queries_sort_and_match_padded_values() {
     assert_eq!(found.items[0].id, "a9");
     assert!(
         engine
-            .contains_key("index:author-by-age:age:0000000009:table:authors:a9")
+            .contains_key("index:author-by-age:age:09223372036854775817:table:authors:a9")
             .await
     );
 }
@@ -675,7 +675,7 @@ async fn index_queries_fail_on_malformed_and_schema_incompatible_rows() {
     let model = engine.clone().model::<Author>(TitoModelOptions::default());
     engine
         .put_raw(
-            "index:author-by-age:age:0000000007:table:authors:malformed",
+            "index:author-by-age:age:09223372036854775815:table:authors:malformed",
             b"{".to_vec(),
         )
         .await;
@@ -690,7 +690,7 @@ async fn index_queries_fail_on_malformed_and_schema_incompatible_rows() {
     let model = engine.clone().model::<Author>(TitoModelOptions::default());
     engine
         .put_json(
-            "index:author-by-age:age:0000000007:table:authors:incompatible",
+            "index:author-by-age:age:09223372036854775815:table:authors:incompatible",
             &json!({"id": "incompatible"}),
         )
         .await;
@@ -726,7 +726,7 @@ async fn index_query_rejects_cursor_from_a_different_index_value_scope() {
     let error = query
         .value("7")
         .cursor(Some(cursor_for_key(
-            "index:author-by-age:age:0000000008:table:authors:a1",
+            "index:author-by-age:age:09223372036854775816:table:authors:a1",
         )))
         .execute(None)
         .await
