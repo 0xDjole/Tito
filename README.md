@@ -156,7 +156,7 @@ heartbeats, lease deadlines, and assignment timestamps. Timestamp-bearing models
 millisecond stamps unless a write explicitly uses `.timestamps(false)` to preserve application-owned
 values. No undeclared timestamp fields are added.
 
-Queue scheduling still accepts only non-negative `i64` instants, including zero and early-epoch
+Queue scheduling accepts the full signed `i64` instant range, including negative, zero, and early-epoch
 millisecond values. The requested due time is stored exactly, including its millisecond component;
 Tito never guesses units, scales caller values, or rounds them to whole seconds. Completed-retention
 cutoffs and cluster leases convert their configured `Duration` to milliseconds. Oversized durations
@@ -180,8 +180,12 @@ The same candidate replaces the old minimum-width decimal numeric-index keys wit
 encoding above. Ordinary, unique, array, and map numeric index writes and numeric queries use the
 same integer encoding. The previous implementation silently omitted floating-point and oversized
 unsigned values; these unsupported numbers now fail explicitly before any model/index mutation.
-Numeric secondary index keys must be rebuilt through the authorized reset/reseed. Queue keys and
-opaque microsecond queue IDs retain their existing key layouts.
+Numeric secondary index keys and queue timestamp key segments use the same signed-sortable encoder
+and must be rebuilt through the authorized reset/reseed. Pending queue keys encode the due time;
+completed keys encode both the completion time and original due time. Due and completed-retention
+scans include their exact cutoff bucket across the full signed range, without adding one to the
+timestamp or overflowing at `i64::MAX`. Queue partition and unsigned transaction-version segments,
+opaque microsecond queue IDs, and handler dispatch/claim/redelivery policy are unchanged.
 
 This is an incompatible data and worker contract: instant units, numeric index keys, and queue JSON
 fields change. Do not mix 0.17.x and 0.18.x publishers, workers, model data, queue rows,
@@ -246,7 +250,7 @@ range destruction for reset, restore, or drop-style maintenance with application
 
 ## Queue Processing
 
-Queue events are partitioned by their business key, carry their own non-negative Unix epoch-millisecond timestamp, and remain pending until the handler explicitly acknowledges them. Tito rejects negative timestamps instead of storing an event that polling cannot reach. Tito has no automatic retry policy, retry counter, backoff, failed state, or DLQ:
+Queue events are partitioned by their business key, carry their own signed Unix epoch-millisecond timestamp, and remain pending until the handler explicitly acknowledges them. The full `i64` range is stored and ordered exactly; negative timestamps are reachable due times, not invalid values. Tito has no automatic retry policy, retry counter, backoff, failed state, or DLQ:
 
 Handlers return `QueueHandlerResult<T>`, an alias for `Result<QueueHandlerOutcome<T>, TitoError>`.
 
@@ -317,7 +321,7 @@ error, panic, timeout, lost worker, lost cluster partition lease, or queue-outco
 leaves the exact invocation Pending.
 
 Partition polling is fair across due rows. Pending storage keys are ordered as
-`queue:pending:{partition:04}:{timestamp:020}:{enqueue_version:020}:{event_id}`. The enqueue version is
+`queue:pending:{partition:04}:{encode_index_integer(timestamp)}:{enqueue_version:020}:{event_id}`. The enqueue version is
 the datastore transaction's globally ordered start version; it is internal ordering metadata, not
 an invocation ID, provider identity, lease, or domain state. Each worker keeps an in-memory cursor
 for one bounded pass. The first pull freezes both the runnable timestamp boundary and transaction-version
@@ -369,8 +373,8 @@ fn events(&self) -> Vec<TitoEventConfig> {
 ## Event Key Format
 
 ```
-queue:pending:{partition:04}:{timestamp:020}:{enqueue_version:020}:{event_id}
-queue:completed:{processed_at:020}:{event_timestamp:020}:{event_id}
+queue:pending:{partition:04}:{encode_index_integer(timestamp)}:{enqueue_version:020}:{event_id}
+queue:completed:{encode_index_integer(processed_at)}:{encode_index_integer(event_timestamp)}:{event_id}
 queue:owner:{base64url(type)}:{base64url(id)}:{status_type}:{base64url(queue_storage_key)}
 ```
 
@@ -383,7 +387,8 @@ cargo test --all-targets
 ```
 
 The tests use the in-memory engine and cover model/index writes, queue transitions, exact
-millisecond scheduling and completion, configured retention, cluster ownership and leases, worker
+signed millisecond scheduling and completion, exact inclusive cutoff buckets and signed extrema,
+configured retention, cluster ownership and leases, worker
 shutdown, and ambiguous transaction outcomes. Examples are compiled but not run against a live
 database. Application-level TiKV, provider-effect, backup, and restore evidence belongs to the
 application's complete suite against this exact dependency candidate.

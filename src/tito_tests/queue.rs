@@ -1,5 +1,5 @@
 use super::*;
-use crate::QueueOwner;
+use crate::{encode_index_integer, QueueOwner};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[test]
@@ -22,7 +22,15 @@ fn queue_created_at_milliseconds_preserves_native_id_precision_and_exact_fallbac
         1_700_000_000_123
     );
 
-    for timestamp in [0, 123, 1_700_000_000_123, i64::MAX] {
+    for timestamp in [
+        i64::MIN,
+        -9_007_199_254_740_991,
+        -1,
+        0,
+        123,
+        1_700_000_000_123,
+        i64::MAX,
+    ] {
         let event = queue_event("opaque-event-id", "entry:clock", timestamp);
         assert_eq!(event.created_at_millis(), timestamp);
         let encoded = serde_json::to_value(&event).unwrap();
@@ -33,14 +41,36 @@ fn queue_created_at_milliseconds_preserves_native_id_precision_and_exact_fallbac
 }
 
 #[tokio::test]
-async fn queue_millisecond_due_times_are_reachable_ordered_and_never_rounded() {
+async fn queue_signed_millisecond_due_times_are_reachable_ordered_paged_and_never_rounded() {
     let engine = engine();
     let queue = queue(engine, 1);
     let now = Utc::now().timestamp_millis();
     let past = now.div_euclid(1_000) * 1_000 - 60_000;
     let future = now.div_euclid(1_000) * 1_000 + 60_123;
-    let timestamps = [0, 123, past + 122, past + 123, future, i64::MAX];
-    for timestamp in timestamps {
+    let timestamps = [
+        i64::MIN,
+        i64::MIN + 1,
+        -9_007_199_254_740_991,
+        -1_000,
+        -999,
+        -123,
+        -100,
+        -10,
+        -1,
+        0,
+        1,
+        9,
+        10,
+        99,
+        100,
+        123,
+        past + 122,
+        past + 123,
+        future,
+        i64::MAX - 1,
+        i64::MAX,
+    ];
+    for timestamp in timestamps.into_iter().rev() {
         queue
             .publish(queue_event(
                 &format!("at-{timestamp}"),
@@ -51,22 +81,42 @@ async fn queue_millisecond_due_times_are_reachable_ordered_and_never_rounded() {
             .unwrap();
     }
 
-    let due = queue.pull::<QueuePayload>(0, None, 10).await.unwrap();
-    assert_eq!(
-        due.events
-            .iter()
-            .map(|(_, event)| event.timestamp)
-            .collect::<Vec<_>>(),
-        timestamps[..4],
-    );
-    let stored = queue
-        .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 10)
-        .await
-        .unwrap();
-    assert_eq!(stored.events.len(), timestamps.len());
-    for ((key, event), timestamp) in stored.events.iter().zip(timestamps) {
+    let mut cursor = None;
+    let mut due = Vec::new();
+    loop {
+        let page = queue.pull::<QueuePayload>(0, cursor, 3).await.unwrap();
+        assert!(page.events.len() <= 3);
+        due.extend(page.events.into_iter().map(|(_, event)| event.timestamp));
+        assert!(due.len() <= timestamps.len());
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(due, timestamps[..timestamps.len() - 3]);
+
+    let mut cursor = None;
+    let mut stored = Vec::new();
+    loop {
+        let page = queue
+            .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, cursor, 4)
+            .await
+            .unwrap();
+        assert!(page.events.len() <= 4);
+        stored.extend(page.events);
+        assert!(stored.len() <= timestamps.len());
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(stored.len(), timestamps.len());
+    for ((key, event), timestamp) in stored.iter().zip(timestamps) {
         assert_eq!(event.timestamp, timestamp);
-        assert_eq!(key.split(':').nth(3).unwrap(), format!("{timestamp:020}"));
+        assert_eq!(
+            key.split(':').nth(3).unwrap(),
+            encode_index_integer(timestamp)
+        );
     }
 }
 
@@ -126,7 +176,7 @@ async fn queue_legacy_lifecycle_rows_fail_closed_without_acknowledgement_or_repl
     for malformed in [old_field, old_string, duplicate_field, missing] {
         let engine = engine();
         let queue = queue(engine.clone(), 1);
-        let key = "queue:pending:0000:00000000000000000123:00000000000000000000:legacy";
+        let key = "queue:pending:0000:09223372036854775931:00000000000000000000:legacy";
         let bytes = serde_json::to_vec(&malformed).unwrap();
         engine.put_raw(key, bytes.clone()).await;
         assert!(serde_json::from_value::<QueueEvent<QueuePayload>>(malformed).is_err());
@@ -196,7 +246,7 @@ async fn queue_pending_key_orders_by_event_timestamp_and_enqueue_generation() {
     assert_eq!(fields.len(), 6);
     assert_eq!(
         &fields[..4],
-        ["queue", "pending", "0000", "00000000000000000123"]
+        ["queue", "pending", "0000", &encode_index_integer(123)]
     );
     assert_eq!(fields[4].len(), 20);
     assert!(fields[4].bytes().all(|byte| byte.is_ascii_digit()));
@@ -210,7 +260,7 @@ async fn queue_ack_missing_key_is_noop() {
     let queue = queue(engine, 1);
 
     queue
-        .ack("queue:pending:0000:00000000000000000001:00000000000000000000:missing")
+        .ack("queue:pending:0000:09223372036854775809:00000000000000000000:missing")
         .await
         .unwrap();
 }
@@ -219,7 +269,7 @@ async fn queue_ack_missing_key_is_noop() {
 async fn queue_ack_preserves_malformed_pending_bytes() {
     let engine = engine();
     let queue = queue(engine.clone(), 1);
-    let key = "queue:pending:0000:00000000000000000001:00000000000000000000:bad";
+    let key = "queue:pending:0000:09223372036854775809:00000000000000000000:bad";
     engine.put_raw(key, b"not-json".to_vec()).await;
 
     let error = queue.ack(key).await.unwrap_err();
@@ -529,15 +579,192 @@ async fn queue_advance_rejects_unchanged_payload_and_identity_changes() {
 }
 
 #[tokio::test]
-async fn queue_rejects_negative_timestamps_without_creating_unreachable_rows() {
-    let engine = engine();
-    let queue = queue(engine.clone(), 1);
-    let error = queue
-        .publish(queue_event("negative-event", "entry:negative", -1))
+async fn queue_signed_reschedule_and_advance_preserve_identity_owner_and_atomic_history() {
+    for advance in [false, true] {
+        for (current_at, next_at) in [(i64::MIN, -1), (0, i64::MIN), (1, i64::MAX), (i64::MAX, 0)] {
+            let engine = engine();
+            let queue = queue(engine.clone(), 1);
+            let owner = QueueOwner::new("store", "signed-owner").unwrap();
+            let original =
+                queue_event("signed-event", "entry:signed", current_at).with_owner(owner.clone());
+            queue.publish(original.clone()).await.unwrap();
+            let initial = queue
+                .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 10)
+                .await
+                .unwrap();
+            let storage_key = initial.events[0].0.clone();
+            let mut next = original.rescheduled(next_at);
+            if advance {
+                next.payload = queue_payload("advanced");
+                queue.advance(&storage_key, next.clone()).await.unwrap();
+            } else {
+                queue.reschedule(&storage_key, next.clone()).await.unwrap();
+            }
+            assert!(!engine.contains_key(&storage_key).await);
+            let pending = queue
+                .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 10)
+                .await
+                .unwrap();
+            assert_eq!(pending.events.len(), 1);
+            assert_eq!(pending.events[0].1, next);
+            let completed = queue
+                .scan_by_status::<QueuePayload>(QueueEventStatus::Completed, None, 10)
+                .await
+                .unwrap();
+            assert_eq!(completed.events.len(), 1);
+            let (completed_key, completed_event) = &completed.events[0];
+            assert_eq!(completed_event.id, original.id);
+            assert_eq!(completed_event.key, original.key);
+            assert_eq!(completed_event.owner, original.owner);
+            assert_eq!(completed_event.payload, original.payload);
+            assert_eq!(completed_event.timestamp, current_at);
+            assert_eq!(completed_event.status, QueueEventStatus::Completed);
+            assert_eq!(
+                completed_key.split(':').nth(2).unwrap(),
+                encode_index_integer(completed_event.processed_at.unwrap())
+            );
+            assert_eq!(
+                completed_key.split(':').nth(3).unwrap(),
+                encode_index_integer(current_at)
+            );
+            let indexes = engine.keys_with_prefix("queue:owner:").await;
+            assert_eq!(indexes.len(), 2);
+            for key in [completed_key, &pending.events[0].0] {
+                let encoded_key = general_purpose::URL_SAFE_NO_PAD.encode(key);
+                assert!(indexes.iter().any(|index| index.ends_with(&encoded_key)));
+            }
+            let due = queue.pull::<QueuePayload>(0, None, 10).await.unwrap();
+            if next_at == i64::MAX {
+                assert!(due.events.is_empty());
+            } else {
+                assert_eq!(due.events, pending.events);
+            }
+            queue.ack(&pending.events[0].0).await.unwrap();
+            assert_eq!(
+                queue
+                    .delete_by_status_before(QueueEventStatus::Completed, i64::MAX, 10)
+                    .await
+                    .unwrap(),
+                2
+            );
+            assert!(engine.keys_with_prefix("queue:").await.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn queue_negative_due_bucket_preserves_the_frozen_enqueue_horizon() {
+    let queue = queue(engine(), 1);
+    queue
+        .publish(queue_event("early", "entry:early", -10))
         .await
-        .unwrap_err();
-    assert!(matches!(error, TitoError::InvalidInput(_)));
-    assert!(engine.keys_with_prefix("queue:").await.is_empty());
+        .unwrap();
+    queue
+        .publish(queue_event("later", "entry:later", -9))
+        .await
+        .unwrap();
+    let first = queue.pull::<QueuePayload>(0, None, 1).await.unwrap();
+    assert_eq!(first.events.len(), 1);
+    assert_eq!(first.events[0].1.id, "early");
+    let successor = first.events[0].1.rescheduled(-10);
+    queue
+        .reschedule(&first.events[0].0, successor.clone())
+        .await
+        .unwrap();
+
+    let mut cursor = first.next_cursor;
+    assert!(cursor.is_some());
+    let mut remaining = Vec::new();
+    for _ in 0..4 {
+        let page = queue.pull::<QueuePayload>(0, cursor, 1).await.unwrap();
+        remaining.extend(page.events.into_iter().map(|(_, event)| event.id));
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert!(cursor.is_none());
+    assert_eq!(remaining, ["later"]);
+    let wrapped = queue.pull::<QueuePayload>(0, None, 1).await.unwrap();
+    assert_eq!(wrapped.events[0].1, successor);
+}
+
+#[tokio::test]
+async fn queue_completed_retention_includes_exact_signed_cutoffs_and_extrema_in_bounded_pages() {
+    let timestamps = [
+        i64::MIN,
+        i64::MIN + 1,
+        -1_000,
+        -1,
+        0,
+        1,
+        1_000,
+        i64::MAX - 1,
+        i64::MAX,
+    ];
+    for cutoff in timestamps {
+        let engine = engine();
+        let queue = queue(engine.clone(), 1);
+        for (index, at) in timestamps.into_iter().enumerate().rev() {
+            put_completed_queue_event(&engine, &format!("at-{index}"), at).await;
+            if at == cutoff {
+                put_completed_queue_event(&engine, "same-cutoff", at).await;
+            }
+        }
+        queue
+            .publish(queue_event("pending", "entry:pending", i64::MIN))
+            .await
+            .unwrap();
+        let mut deleted = 0;
+        loop {
+            let count = queue
+                .delete_by_status_before(QueueEventStatus::Completed, cutoff, 2)
+                .await
+                .unwrap();
+            assert!(count <= 2);
+            deleted += count;
+            assert!(deleted <= timestamps.len() + 1);
+            if count < 2 {
+                break;
+            }
+        }
+        assert_eq!(
+            deleted,
+            timestamps.iter().filter(|at| **at <= cutoff).count() + 1
+        );
+        let retained = queue
+            .scan_by_status::<QueuePayload>(QueueEventStatus::Completed, None, 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            retained
+                .events
+                .iter()
+                .map(|(_, event)| event.processed_at.unwrap())
+                .collect::<Vec<_>>(),
+            timestamps
+                .into_iter()
+                .filter(|at| *at > cutoff)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(engine.keys_with_prefix("queue:pending:").await.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn queue_retention_duration_can_cross_zero_without_skipping_negative_history() {
+    let engine = engine();
+    let queue = Queue::new(
+        engine.clone(),
+        QueueConfig::new(1, Duration::from_millis(1_000)),
+    );
+    let old = put_completed_queue_event(&engine, "old", -501).await;
+    let boundary = put_completed_queue_event(&engine, "boundary", -500).await;
+    let retained = put_completed_queue_event(&engine, "retained", -499).await;
+    assert!(!queue.maintain_completed_event_retention(500).await.unwrap());
+    assert!(!engine.contains_key(&old).await);
+    assert!(!engine.contains_key(&boundary).await);
+    assert!(engine.contains_key(&retained).await);
 }
 
 #[tokio::test]
@@ -653,13 +880,20 @@ async fn queue_clear_removes_pending_and_completed_rows() {
 
     engine
         .put_raw(
-            "queue:pending:0000:00000000000000000001:00000000000000000000:pending",
+            &format!(
+                "queue:pending:0000:{}:00000000000000000000:pending",
+                encode_index_integer(now)
+            ),
             serde_json::to_vec(&pending).unwrap(),
         )
         .await;
     engine
         .put_raw(
-            "queue:completed:00000000000000000001:completed",
+            &format!(
+                "queue:completed:{}:{}:completed",
+                encode_index_integer(now),
+                encode_index_integer(now)
+            ),
             serde_json::to_vec(&completed).unwrap(),
         )
         .await;
@@ -687,8 +921,9 @@ async fn queue_completed_retention_uses_the_terminal_time_index_not_value_decodi
     let queue = queue(engine.clone(), 1);
     let cutoff = Utc::now().timestamp_millis() - 1;
     let malformed_key = format!(
-        "queue:completed:{:020}:00000000000000000000:malformed",
-        cutoff - 1
+        "queue:completed:{}:{}:malformed",
+        encode_index_integer(cutoff - 1),
+        encode_index_integer(0),
     );
     engine.put_raw(&malformed_key, b"not-json".to_vec()).await;
 

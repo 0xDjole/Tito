@@ -418,7 +418,11 @@ fn queue_event(id: &str, key: &str, timestamp: i64) -> QueueEvent<QueuePayload> 
 
 async fn put_completed_queue_event(engine: &MemoryEngine, id: &str, processed_at: i64) -> String {
     let event_timestamp = processed_at.saturating_sub(1);
-    let storage_key = format!("queue:completed:{processed_at:020}:{event_timestamp:020}:{id}");
+    let storage_key = format!(
+        "queue:completed:{}:{}:{id}",
+        crate::encode_index_integer(processed_at),
+        crate::encode_index_integer(event_timestamp),
+    );
     let mut event = queue_event(id, &format!("entry:{id}"), event_timestamp);
     event.status = QueueEventStatus::Completed;
     event.processed_at = Some(processed_at);

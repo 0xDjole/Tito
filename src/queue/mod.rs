@@ -24,7 +24,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::types::{TitoEngine, TitoKvPair, TitoTransaction, PARTITION_DIGITS};
-use crate::TitoError;
+use crate::{encode_index_integer, TitoError};
 
 pub(crate) const COMPLETED_EVENT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
 pub(crate) const COMPLETED_EVENT_MAINTENANCE_BATCH_SIZE: u32 = 1_000;
@@ -106,24 +106,22 @@ impl<E: TitoEngine> Queue<E> {
 
     fn pending_key(partition: u32, timestamp: i64, enqueue_version: u64, event_id: &str) -> String {
         format!(
-            "queue:pending:{:0pwidth$}:{:0twidth$}:{:0vwidth$}:{}",
+            "queue:pending:{:0pwidth$}:{}:{:0vwidth$}:{}",
             partition,
-            timestamp,
+            encode_index_integer(timestamp),
             enqueue_version,
             event_id,
             pwidth = PARTITION_DIGITS,
-            twidth = KEY_NUMBER_DIGITS,
             vwidth = KEY_NUMBER_DIGITS,
         )
     }
 
     fn pending_partition_start(partition: u32, timestamp: i64) -> Vec<u8> {
         format!(
-            "queue:pending:{:0pwidth$}:{:0twidth$}",
+            "queue:pending:{:0pwidth$}:{}",
             partition,
-            timestamp,
+            encode_index_integer(timestamp),
             pwidth = PARTITION_DIGITS,
-            twidth = KEY_NUMBER_DIGITS,
         )
         .into_bytes()
     }
@@ -161,11 +159,10 @@ impl<E: TitoEngine> Queue<E> {
 
     fn completed_key(processed_at: i64, event_timestamp: i64, event_id: &str) -> String {
         format!(
-            "queue:completed:{:0width$}:{:0width$}:{}",
-            processed_at,
-            event_timestamp,
+            "queue:completed:{}:{}:{}",
+            encode_index_integer(processed_at),
+            encode_index_integer(event_timestamp),
             event_id,
-            width = KEY_NUMBER_DIGITS,
         )
     }
 
@@ -265,15 +262,6 @@ impl<E: TitoEngine> Queue<E> {
         tx.delete(index_key.as_bytes())
             .await
             .map_err(|error| TitoError::DeleteFailed(format!("Delete queue owner index: {error}")))
-    }
-
-    fn validate_timestamp(timestamp: i64) -> Result<(), TitoError> {
-        if timestamp < 0 {
-            return Err(TitoError::InvalidInput(
-                "Queue timestamps must be non-negative Unix epoch milliseconds".to_string(),
-            ));
-        }
-        Ok(())
     }
 
     fn prefix_end(prefix: &str) -> Vec<u8> {
@@ -412,7 +400,6 @@ impl<E: TitoEngine> Queue<E> {
         mut event: QueueEvent<T>,
         tx: &E::Transaction,
     ) -> Result<(), TitoError> {
-        Self::validate_timestamp(event.timestamp)?;
         if let Some(owner) = event.owner.as_ref() {
             owner.validate()?;
         }
@@ -473,8 +460,8 @@ impl<E: TitoEngine> Queue<E> {
                     })
                     .unwrap_or_else(|| {
                         (
-                            Self::pending_partition_start(partition, 0),
-                            Self::pending_partition_start(partition, now.saturating_add(1)),
+                            Self::pending_partition_start(partition, i64::MIN),
+                            Self::pending_timestamp_bucket_end(partition, &encode_index_integer(now)),
                             tx.start_version(),
                         )
                     });
@@ -623,7 +610,6 @@ impl<E: TitoEngine> Queue<E> {
         mut next: QueueEvent<T>,
         replacement_type: QueueReplacementType,
     ) -> Result<(), TitoError> {
-        Self::validate_timestamp(next.timestamp)?;
         if let Some(owner) = next.owner.as_ref() {
             owner.validate()?;
         }
@@ -768,15 +754,14 @@ impl<E: TitoEngine> Queue<E> {
 
         self.engine
             .transaction(|tx| async move {
-                let start = format!(
-                    "queue:completed:{:0width$}:",
-                    cutoff.saturating_add(1),
-                    width = KEY_NUMBER_DIGITS,
-                );
+                let end = Self::prefix_end(&format!(
+                    "queue:completed:{}:",
+                    encode_index_integer(cutoff),
+                ));
                 let entries = Self::scan_queue_entries(
                     &tx,
-                    "queue:completed:00000000000000000000".as_bytes().to_vec(),
-                    start.as_bytes().to_vec(),
+                    "queue:completed:".as_bytes().to_vec(),
+                    end,
                     limit,
                 )
                 .await
