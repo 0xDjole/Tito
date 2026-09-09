@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tito::{
     types::{
-        DBUuid, TitoEngine, TitoIndexBlockType, TitoIndexConfig, TitoIndexField, TitoModelTrait,
+        DBUuid, TitoEngine, TitoIndexConfig, TitoIndexField, TitoIndexFieldType, TitoModelTrait,
     },
     TiKV, TitoError, TitoModelOptions,
 };
@@ -20,7 +20,7 @@ impl TitoModelTrait for User {
             name: "by_email".to_string(),
             fields: vec![TitoIndexField {
                 name: "email".to_string(),
-                r#type: TitoIndexBlockType::String,
+                r#type: TitoIndexFieldType::String,
             }],
         }]
     }

@@ -140,10 +140,10 @@ pub struct TitoUtilsConnectInput {
 }
 
 #[derive(Debug, Clone)]
-pub enum TitoIndexBlockType {
+pub enum TitoIndexFieldType {
     String,
     Number,
-    Custom(std::string::String),
+    CustomString(std::string::String),
 }
 
 #[derive(Debug, Clone)]
@@ -158,7 +158,7 @@ pub enum FieldValue {
 #[derive(Debug, Clone)]
 pub struct TitoIndexField {
     pub name: String,
-    pub r#type: TitoIndexBlockType,
+    pub r#type: TitoIndexFieldType,
 }
 
 #[derive(Debug, Clone)]
@@ -194,6 +194,7 @@ pub trait TitoModelTrait {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReverseIndex {
     pub value: Vec<String>,
 }

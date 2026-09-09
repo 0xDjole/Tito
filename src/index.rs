@@ -2,8 +2,8 @@ use crate::{
     error::TitoError,
     key_encoder::{encode_index_integer_query, encode_index_number, safe_encode},
     types::{
-        FieldValue, TitoEngine, TitoFindByIndexPayload, TitoFindOneByIndexPayload,
-        TitoIndexBlockType, TitoModelTrait, TitoPaginated, TitoScanPayload, TitoTransaction,
+        FieldValue, TitoEngine, TitoFindByIndexPayload, TitoFindOneByIndexPayload, TitoIndexConfig,
+        TitoIndexFieldType, TitoModelTrait, TitoPaginated, TitoScanPayload, TitoTransaction,
     },
     TitoModel,
 };
@@ -46,7 +46,7 @@ impl<
 
             for field in &index_config.fields {
                 let field_values = match &field.r#type {
-                    TitoIndexBlockType::Custom(value) => {
+                    TitoIndexFieldType::CustomString(value) => {
                         vec![FieldValue::Simple(Value::String(value.clone()))]
                     }
                     _ => self
@@ -57,26 +57,29 @@ impl<
                 let mut new_combinations = vec![];
 
                 for field_value in field_values {
-                    let field_str = match field_value {
-                        FieldValue::HashMapEntry { key, value } => match &field.r#type {
-                            TitoIndexBlockType::String | TitoIndexBlockType::Custom(_) => value
-                                .as_str()
-                                .filter(|value| !value.is_empty())
-                                .map(|value| {
-                                    format!("{}:{}.{}", field.name, key, safe_encode(value))
-                                }),
-                            TitoIndexBlockType::Number => encode_index_number(&value)?
-                                .map(|value| format!("{}:{}:{value}", field.name, key)),
-                        },
-                        FieldValue::Simple(value) => match &field.r#type {
-                            TitoIndexBlockType::String | TitoIndexBlockType::Custom(_) => value
-                                .as_str()
-                                .filter(|value| !value.is_empty())
-                                .map(|value| format!("{}:{}", field.name, safe_encode(value))),
-                            TitoIndexBlockType::Number => encode_index_number(&value)?
-                                .map(|value| format!("{}:{value}", field.name)),
-                        },
-                    };
+                    let field_str =
+                        match field_value {
+                            FieldValue::HashMapEntry { key, value } => match &field.r#type {
+                                TitoIndexFieldType::String
+                                | TitoIndexFieldType::CustomString(_) => value
+                                    .as_str()
+                                    .filter(|value| !value.is_empty())
+                                    .map(|value| {
+                                        format!("{}:{}.{}", field.name, key, safe_encode(value))
+                                    }),
+                                TitoIndexFieldType::Number => encode_index_number(&value)?
+                                    .map(|value| format!("{}:{}:{value}", field.name, key)),
+                            },
+                            FieldValue::Simple(value) => match &field.r#type {
+                                TitoIndexFieldType::String
+                                | TitoIndexFieldType::CustomString(_) => value
+                                    .as_str()
+                                    .filter(|value| !value.is_empty())
+                                    .map(|value| format!("{}:{}", field.name, safe_encode(value))),
+                                TitoIndexFieldType::Number => encode_index_number(&value)?
+                                    .map(|value| format!("{}:{value}", field.name)),
+                            },
+                        };
 
                     if let Some(field_str) = field_str {
                         for existing_combo in &combinations {
@@ -138,30 +141,71 @@ impl<
                 ))
             })?;
 
-        if payload.values.len() != index.fields.len() {
-            return Err(TitoError::IndexError(format!(
-                "Unique index '{}' has {} fields but {} values were provided",
-                payload.index,
-                index.fields.len(),
-                payload.values.len()
-            )));
-        }
-
-        let mut parts = Vec::with_capacity(index.fields.len());
-        for (field, value) in index.fields.iter().zip(&payload.values) {
-            let encoded = match field.r#type {
-                TitoIndexBlockType::String | TitoIndexBlockType::Custom(_) => safe_encode(value),
-                TitoIndexBlockType::Number => encode_index_integer_query(value)?,
-            };
-            parts.push(format!("{}:{encoded}", field.name));
-        }
-
+        let fields = Self::exact_index_fields(index, &payload.values)?;
         Ok(format!(
             "unique-index:{}:{}:{}",
             T::table(),
             payload.index,
-            parts.join(":")
+            fields
         ))
+    }
+
+    fn exact_index_fields(index: &TitoIndexConfig, values: &[String]) -> Result<String, TitoError> {
+        if values.len() != index.fields.len() || values.is_empty() {
+            return Err(TitoError::IndexError(format!(
+                "Index '{}' has {} fields but {} values were provided",
+                index.name,
+                index.fields.len(),
+                values.len()
+            )));
+        }
+
+        let mut parts = Vec::with_capacity(index.fields.len());
+        for (field, value) in index.fields.iter().zip(values) {
+            let encoded = match field.r#type {
+                TitoIndexFieldType::String | TitoIndexFieldType::CustomString(_) => {
+                    safe_encode(value)
+                }
+                TitoIndexFieldType::Number => encode_index_integer_query(value)?,
+            };
+            parts.push(format!("{}:{encoded}", field.name));
+        }
+
+        Ok(parts.join(":"))
+    }
+
+    pub async fn assert_index_match(
+        &self,
+        id: &str,
+        payload: TitoFindOneByIndexPayload,
+        tx: &E::Transaction,
+    ) -> Result<bool, TitoError> {
+        if id.is_empty() || id.len() > 512 || payload.values.iter().any(|value| value.len() > 4096)
+        {
+            return Err(TitoError::InvalidInput(
+                "Invalid indexed-record assertion".to_string(),
+            ));
+        }
+        let indexes = T::default().indexes();
+        let mut matching = indexes.iter().filter(|index| index.name == payload.index);
+        let index = matching.next().ok_or_else(|| {
+            TitoError::IndexError(format!(
+                "Index '{}' not found on model '{}'",
+                payload.index,
+                T::table()
+            ))
+        })?;
+        if matching.next().is_some() || payload.values.iter().any(String::is_empty) {
+            return Err(TitoError::IndexError(
+                "Indexed-record assertion requires one exact nonempty index value".to_string(),
+            ));
+        }
+        let fields = Self::exact_index_fields(index, &payload.values)?;
+        let primary_key = format!("{}:{id}", self.get_table());
+        let prefix = format!("index:{}:", payload.index);
+        let expected = format!("{prefix}{fields}:{primary_key}");
+        self.assert_reverse_index_key(&primary_key, &prefix, &expected, tx)
+            .await
     }
 
     pub async fn find_one_by_unique_index(
@@ -253,8 +297,10 @@ impl<
             let index_field_type = index_field.r#type;
 
             let value = match index_field_type {
-                TitoIndexBlockType::String | TitoIndexBlockType::Custom(_) => safe_encode(value),
-                TitoIndexBlockType::Number => encode_index_integer_query(value)?,
+                TitoIndexFieldType::String | TitoIndexFieldType::CustomString(_) => {
+                    safe_encode(value)
+                }
+                TitoIndexFieldType::Number => encode_index_integer_query(value)?,
             };
 
             let field_name = index_field.name.clone();
@@ -317,8 +363,10 @@ impl<
             let index_field_type = index_field.r#type;
 
             let value = match index_field_type {
-                TitoIndexBlockType::String | TitoIndexBlockType::Custom(_) => safe_encode(value),
-                TitoIndexBlockType::Number => encode_index_integer_query(value)?,
+                TitoIndexFieldType::String | TitoIndexFieldType::CustomString(_) => {
+                    safe_encode(value)
+                }
+                TitoIndexFieldType::Number => encode_index_integer_query(value)?,
             };
 
             let field_name = index_field.name.clone();

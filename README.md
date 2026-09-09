@@ -74,7 +74,7 @@ impl TitoModelTrait for User {
             name: "by_email".to_string(),
             fields: vec![TitoIndexField {
                 name: "email".to_string(),
-                r#type: TitoIndexBlockType::String,
+                r#type: TitoIndexFieldType::String,
             }],
         }]
     }
@@ -109,6 +109,20 @@ domain and API boundaries determine when an additional read is required. When a 
 depends on an existing record remaining unchanged, `model.assert_current(id, &tx)` reads and stages
 the exact primary bytes without deserializing, changing timestamps, touching indexes, or creating a
 second lock record.
+
+For a single-valued ordinary index, `model.assert_index_match(id, payload, &tx)` checks the exact
+declared field values against the owner's reverse-index manifest and stages the same manifest bytes
+on a match. It does not fetch the primary row or an index's copied owner payload. A missing manifest
+or mismatched value returns `false`; corrupt, duplicate, ambiguous or oversized metadata errors.
+Assertions accept at most one MiB of metadata and 10,000 keys, record IDs up to 512 bytes and field
+values up to 4,096 bytes. Numeric comparisons use exact signed integer encoding.
+
+This asserts indexed values, not the whole record or permission to access it. Applications using
+it as a projection-revision fence must advance an indexed revision on every content change and
+preserve atomic set/remove maintenance. Raw primary writes/deletes bypass that contract. Adding a
+revision index requires an explicit offline index rebuild before dependent reads; the assertion
+does not repair old manifests or fall back to fetching content. An engine must detect conflicting
+writes to the manifest for the assertion to fence concurrent updates/removals.
 
 ## Storage integrity and pagination
 

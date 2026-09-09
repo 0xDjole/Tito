@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tito::{
     types::{
-        DBUuid, TitoEngine, TitoIndexBlockType, TitoIndexConfig, TitoIndexField, TitoModelTrait,
+        DBUuid, TitoEngine, TitoIndexConfig, TitoIndexField, TitoIndexFieldType, TitoModelTrait,
     },
     TiKV, TitoError, TitoModelOptions,
 };
@@ -31,7 +31,7 @@ impl TitoModelTrait for Tag {
             name: "tag-by-name".to_string(),
             fields: vec![TitoIndexField {
                 name: "name".to_string(),
-                r#type: TitoIndexBlockType::String,
+                r#type: TitoIndexFieldType::String,
             }],
         }]
     }
@@ -53,7 +53,7 @@ impl TitoModelTrait for Post {
                 name: "post-by-author".to_string(),
                 fields: vec![TitoIndexField {
                     name: "author".to_string(),
-                    r#type: TitoIndexBlockType::String,
+                    r#type: TitoIndexFieldType::String,
                 }],
             },
             TitoIndexConfig {
@@ -61,7 +61,7 @@ impl TitoModelTrait for Post {
                 name: "post-by-tag".to_string(),
                 fields: vec![TitoIndexField {
                     name: "tag_ids".to_string(),
-                    r#type: TitoIndexBlockType::String,
+                    r#type: TitoIndexFieldType::String,
                 }],
             },
         ]

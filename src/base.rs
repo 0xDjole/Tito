@@ -374,6 +374,52 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         tx.put(primary_key, bytes).await
     }
 
+    pub(crate) async fn assert_reverse_index_key(
+        &self,
+        primary_key: &str,
+        prefix: &str,
+        expected: &str,
+        tx: &E::Transaction,
+    ) -> Result<bool, TitoError> {
+        let reverse_key = format!("reverse-index:{primary_key}");
+        let Some(bytes) = tx.get(&reverse_key).await? else {
+            return Ok(false);
+        };
+        if bytes.len() > 1_048_576 {
+            return Err(TitoError::IndexError(
+                "Index assertion metadata exceeds one MiB".to_string(),
+            ));
+        }
+        let reverse = self.deserialize_reverse_index(&reverse_key, &bytes)?;
+        if reverse.value.len() > 10_000 {
+            return Err(TitoError::IndexError(
+                "Index assertion metadata exceeds 10000 keys".to_string(),
+            ));
+        }
+        self.validate_reverse_index_keys(primary_key, &reverse)?;
+        let mut unique = std::collections::HashSet::with_capacity(reverse.value.len());
+        let mut selected = None;
+        for key in &reverse.value {
+            if !unique.insert(key) {
+                return Err(TitoError::IndexError(
+                    "Index assertion metadata contains duplicate keys".to_string(),
+                ));
+            }
+            if key.starts_with(prefix) {
+                if selected.replace(key.as_str()).is_some() {
+                    return Err(TitoError::IndexError(
+                        "Index assertion requires a single-valued index".to_string(),
+                    ));
+                }
+            }
+        }
+        if selected != Some(expected) {
+            return Ok(false);
+        }
+        tx.put(reverse_key, bytes).await?;
+        Ok(true)
+    }
+
     async fn load_index_state(
         &self,
         primary_key: &str,

@@ -15,7 +15,7 @@ struct NumericRecord {
 
 fn numeric_index(
     name: &str,
-    fields: &[(&str, TitoIndexBlockType)],
+    fields: &[(&str, TitoIndexFieldType)],
     condition: bool,
 ) -> TitoIndexConfig {
     TitoIndexConfig {
@@ -36,25 +36,25 @@ impl TitoModelTrait for NumericRecord {
         vec![
             numeric_index(
                 "numeric-by-value",
-                &[("value", TitoIndexBlockType::Number)],
+                &[("value", TitoIndexFieldType::Number)],
                 self.indexed,
             ),
             numeric_index(
                 "numeric-by-tenant-value",
                 &[
-                    ("tenant", TitoIndexBlockType::String),
-                    ("value", TitoIndexBlockType::Number),
+                    ("tenant", TitoIndexFieldType::String),
+                    ("value", TitoIndexFieldType::Number),
                 ],
                 self.indexed,
             ),
             numeric_index(
                 "numeric-by-values",
-                &[("values", TitoIndexBlockType::Number)],
+                &[("values", TitoIndexFieldType::Number)],
                 self.indexed,
             ),
             numeric_index(
                 "numeric-by-measurements",
-                &[("measurements", TitoIndexBlockType::Number)],
+                &[("measurements", TitoIndexFieldType::Number)],
                 self.indexed,
             ),
         ]
@@ -64,8 +64,8 @@ impl TitoModelTrait for NumericRecord {
         vec![numeric_index(
             "numeric-unique-value",
             &[
-                ("tenant", TitoIndexBlockType::String),
-                ("value", TitoIndexBlockType::Number),
+                ("tenant", TitoIndexFieldType::String),
+                ("value", TitoIndexFieldType::Number),
             ],
             self.indexed && self.unique,
         )]

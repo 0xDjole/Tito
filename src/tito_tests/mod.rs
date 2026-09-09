@@ -5,7 +5,7 @@ use crate::queue::{
 use crate::test_support::MemoryEngine;
 use crate::types::{
     PartitionConfig, TitoCursor, TitoEngine, TitoFindByIndexPayload, TitoFindOneByIndexPayload,
-    TitoFindPayload, TitoId, TitoIndexBlockType, TitoIndexConfig, TitoIndexField, TitoModelOptions,
+    TitoFindPayload, TitoId, TitoIndexConfig, TitoIndexField, TitoIndexFieldType, TitoModelOptions,
     TitoModelTrait, TitoPaginated, TitoScanPayload,
 };
 use crate::utils::{
@@ -46,7 +46,7 @@ impl TitoModelTrait for Author {
                 name: "author-by-email".to_string(),
                 fields: vec![TitoIndexField {
                     name: "email".to_string(),
-                    r#type: TitoIndexBlockType::String,
+                    r#type: TitoIndexFieldType::String,
                 }],
             },
             TitoIndexConfig {
@@ -54,7 +54,7 @@ impl TitoModelTrait for Author {
                 name: "author-by-age".to_string(),
                 fields: vec![TitoIndexField {
                     name: "age".to_string(),
-                    r#type: TitoIndexBlockType::Number,
+                    r#type: TitoIndexFieldType::Number,
                 }],
             },
             TitoIndexConfig {
@@ -63,11 +63,11 @@ impl TitoModelTrait for Author {
                 fields: vec![
                     TitoIndexField {
                         name: "org_id".to_string(),
-                        r#type: TitoIndexBlockType::String,
+                        r#type: TitoIndexFieldType::String,
                     },
                     TitoIndexField {
                         name: "email".to_string(),
-                        r#type: TitoIndexBlockType::String,
+                        r#type: TitoIndexFieldType::String,
                     },
                 ],
             },
@@ -77,11 +77,11 @@ impl TitoModelTrait for Author {
                 fields: vec![
                     TitoIndexField {
                         name: "kind".to_string(),
-                        r#type: TitoIndexBlockType::Custom("author".to_string()),
+                        r#type: TitoIndexFieldType::CustomString("author".to_string()),
                     },
                     TitoIndexField {
                         name: "org_id".to_string(),
-                        r#type: TitoIndexBlockType::String,
+                        r#type: TitoIndexFieldType::String,
                     },
                 ],
             },
@@ -90,7 +90,7 @@ impl TitoModelTrait for Author {
                 name: "author-by-optional".to_string(),
                 fields: vec![TitoIndexField {
                     name: "optional".to_string(),
-                    r#type: TitoIndexBlockType::String,
+                    r#type: TitoIndexFieldType::String,
                 }],
             },
             TitoIndexConfig {
@@ -99,11 +99,11 @@ impl TitoModelTrait for Author {
                 fields: vec![
                     TitoIndexField {
                         name: "org_id".to_string(),
-                        r#type: TitoIndexBlockType::String,
+                        r#type: TitoIndexFieldType::String,
                     },
                     TitoIndexField {
                         name: "optional".to_string(),
-                        r#type: TitoIndexBlockType::String,
+                        r#type: TitoIndexFieldType::String,
                     },
                 ],
             },
@@ -112,7 +112,7 @@ impl TitoModelTrait for Author {
                 name: "author-disabled".to_string(),
                 fields: vec![TitoIndexField {
                     name: "role".to_string(),
-                    r#type: TitoIndexBlockType::String,
+                    r#type: TitoIndexFieldType::String,
                 }],
             },
         ]
@@ -149,7 +149,7 @@ impl TitoModelTrait for UniqueAccount {
             name: "account-by-email".to_string(),
             fields: vec![TitoIndexField {
                 name: "email".to_string(),
-                r#type: TitoIndexBlockType::String,
+                r#type: TitoIndexFieldType::String,
             }],
         }]
     }
@@ -161,11 +161,11 @@ impl TitoModelTrait for UniqueAccount {
             fields: vec![
                 TitoIndexField {
                     name: "tenant_id".to_string(),
-                    r#type: TitoIndexBlockType::String,
+                    r#type: TitoIndexFieldType::String,
                 },
                 TitoIndexField {
                     name: "email".to_string(),
-                    r#type: TitoIndexBlockType::String,
+                    r#type: TitoIndexFieldType::String,
                 },
             ],
         }]
@@ -211,7 +211,7 @@ impl TitoModelTrait for Tag {
             name: "tag-by-name".to_string(),
             fields: vec![TitoIndexField {
                 name: "name".to_string(),
-                r#type: TitoIndexBlockType::String,
+                r#type: TitoIndexFieldType::String,
             }],
         }]
     }
@@ -262,7 +262,7 @@ impl TitoModelTrait for Post {
                 name: "post-by-author".to_string(),
                 fields: vec![TitoIndexField {
                     name: "author_id".to_string(),
-                    r#type: TitoIndexBlockType::String,
+                    r#type: TitoIndexFieldType::String,
                 }],
             },
             TitoIndexConfig {
@@ -270,7 +270,7 @@ impl TitoModelTrait for Post {
                 name: "post-by-tag".to_string(),
                 fields: vec![TitoIndexField {
                     name: "tag_ids".to_string(),
-                    r#type: TitoIndexBlockType::String,
+                    r#type: TitoIndexFieldType::String,
                 }],
             },
             TitoIndexConfig {
@@ -278,7 +278,7 @@ impl TitoModelTrait for Post {
                 name: "post-by-comment-author".to_string(),
                 fields: vec![TitoIndexField {
                     name: "comments.author_id".to_string(),
-                    r#type: TitoIndexBlockType::String,
+                    r#type: TitoIndexFieldType::String,
                 }],
             },
             TitoIndexConfig {
@@ -286,7 +286,7 @@ impl TitoModelTrait for Post {
                 name: "post-by-metadata".to_string(),
                 fields: vec![TitoIndexField {
                     name: "metadata".to_string(),
-                    r#type: TitoIndexBlockType::String,
+                    r#type: TitoIndexFieldType::String,
                 }],
             },
         ]
@@ -451,7 +451,9 @@ fn cluster_config(node_id: &str) -> ClusterWorkerConfig {
 }
 
 mod cluster;
+mod custom_index;
 mod index;
+mod index_assertion;
 mod model;
 mod numeric_index;
 mod queue;

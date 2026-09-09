@@ -16,6 +16,7 @@ pub(crate) struct MemoryEngine {
     next_commit_unknown_after_apply: Arc<Mutex<Option<bool>>>,
     next_transaction_version: Arc<AtomicU64>,
     pending_queue_scans: Arc<AtomicU64>,
+    recorded_reads: Arc<Mutex<Option<Vec<Vec<u8>>>>>,
 }
 
 #[derive(Clone)]
@@ -26,9 +27,18 @@ pub(crate) struct MemoryTransaction {
     next_commit_unknown_after_apply: Arc<Mutex<Option<bool>>>,
     start_version: u64,
     pending_queue_scans: Arc<AtomicU64>,
+    recorded_reads: Arc<Mutex<Option<Vec<Vec<u8>>>>>,
 }
 
 impl MemoryEngine {
+    pub(crate) async fn start_recording_reads(&self) {
+        *self.recorded_reads.lock().await = Some(Vec::new());
+    }
+
+    pub(crate) async fn take_recorded_reads(&self) -> Vec<Vec<u8>> {
+        self.recorded_reads.lock().await.take().unwrap_or_default()
+    }
+
     pub(crate) async fn put_raw_bytes(&self, key: Vec<u8>, value: Vec<u8>) {
         self.data.lock().await.insert(key, value);
     }
@@ -95,6 +105,7 @@ impl TitoEngine for MemoryEngine {
             next_commit_unknown_after_apply: self.next_commit_unknown_after_apply.clone(),
             start_version,
             pending_queue_scans: self.pending_queue_scans.clone(),
+            recorded_reads: self.recorded_reads.clone(),
         })
     }
 
@@ -143,6 +154,9 @@ impl TitoTransaction for MemoryTransaction {
     }
 
     async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<TitoValue>, TitoError> {
+        if let Some(reads) = self.recorded_reads.lock().await.as_mut() {
+            reads.push(key.as_ref().to_vec());
+        }
         if let Some(message) = self.next_get_error.lock().await.take() {
             return Err(TitoError::QueryFailed(message));
         }
@@ -173,6 +187,9 @@ impl TitoTransaction for MemoryTransaction {
     ) -> Result<Vec<TitoKvPair>, TitoError> {
         let start = range.start.as_ref().to_vec();
         let end = range.end.as_ref().to_vec();
+        if let Some(reads) = self.recorded_reads.lock().await.as_mut() {
+            reads.push([b"scan:", start.as_slice()].concat());
+        }
         if start.starts_with(b"queue:pending:") {
             self.pending_queue_scans.fetch_add(1, Ordering::SeqCst);
         }
@@ -193,6 +210,9 @@ impl TitoTransaction for MemoryTransaction {
     ) -> Result<Vec<TitoKvPair>, TitoError> {
         let start = range.start.as_ref().to_vec();
         let end = range.end.as_ref().to_vec();
+        if let Some(reads) = self.recorded_reads.lock().await.as_mut() {
+            reads.push([b"scan-reverse:", start.as_slice()].concat());
+        }
         Ok(self
             .local
             .lock()
@@ -208,6 +228,9 @@ impl TitoTransaction for MemoryTransaction {
         &self,
         keys: Vec<K>,
     ) -> Result<Vec<TitoKvPair>, TitoError> {
+        if let Some(reads) = self.recorded_reads.lock().await.as_mut() {
+            reads.extend(keys.iter().map(|key| key.as_ref().to_vec()));
+        }
         let data = self.local.lock().await;
         Ok(keys
             .into_iter()
