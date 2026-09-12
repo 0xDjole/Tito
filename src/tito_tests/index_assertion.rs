@@ -144,7 +144,12 @@ async fn index_assertion_fails_closed_on_corrupt_ambiguous_and_oversized_metadat
         .await
         .is_err());
     tx.rollback().await.unwrap();
-    engine.put_json(reverse_key, &json!({"value": []})).await;
+    engine
+        .put_json(
+            reverse_key,
+            &json!({"value": [], "version": valid["version"]}),
+        )
+        .await;
     let tx = engine.begin_transaction().await.unwrap();
     assert!(!model
         .assert_index_match("a1", query("author-by-age", &["36"]), &tx)

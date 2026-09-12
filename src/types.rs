@@ -8,6 +8,9 @@ use std::ops::Range;
 use std::time::Duration;
 use uuid::Uuid;
 
+mod record_version;
+pub use record_version::{TitoRecordVersion, TitoVersioned};
+
 pub trait TitoModelConstraints:
     Default + Clone + Serialize + DeserializeOwned + Unpin + std::marker::Send + Sync + TitoModelTrait
 {
@@ -197,6 +200,7 @@ pub trait TitoModelTrait {
 #[serde(deny_unknown_fields)]
 pub struct ReverseIndex {
     pub value: Vec<String>,
+    pub version: TitoRecordVersion,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

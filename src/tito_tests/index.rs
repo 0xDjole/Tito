@@ -461,10 +461,15 @@ async fn reverse_manifest_cannot_delete_keys_outside_its_own_index_set() {
     let model = engine.clone().model::<Author>(TitoModelOptions::default());
     save_author(&engine, author("a1", "a1@example.com", 36, "org-a")).await;
     save_author(&engine, author("a2", "a2@example.com", 36, "org-a")).await;
+    let version = engine
+        .raw_json("reverse-index:table:authors:a1")
+        .await
+        .unwrap()["version"]
+        .clone();
     engine
         .put_json(
             "reverse-index:table:authors:a1",
-            &json!({"value": ["table:authors:a2"]}),
+            &json!({"value": ["table:authors:a2"], "version": version}),
         )
         .await;
 

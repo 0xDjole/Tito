@@ -107,8 +107,23 @@ let results = query.value(&email).limit(Some(10)).execute().await?;
 Tito reads and writes one model at a time. Applications load related records explicitly so their
 domain and API boundaries determine when an additional read is required. When a transaction
 depends on an existing record remaining unchanged, `model.assert_current(id, &tx)` reads and stages
-the exact primary bytes without deserializing, changing timestamps, touching indexes, or creating a
-second lock record.
+the exact primary bytes after validating its storage metadata, without deserializing the model,
+changing timestamps, touching indexes, or creating a second lock record.
+
+`model.get_versioned(id, transaction)` returns `TitoVersioned<T>` with the model in `value` and
+an opaque `TitoRecordVersion` in `version`. The version is the positive transaction version saved
+by the last model write, not the current reader's transaction version or a business timestamp.
+`model.assert_version(id, expected_version, &tx)` returns `true` only for that stored version and
+stages the primary write fence in the caller's transaction. Check the result before performing
+dependent writes. Concurrent model changes then conflict at commit. A missing or changed record
+returns `false`; invalid storage metadata returns an error.
+
+Reads and fences do not advance the record version. Every model write installs its write-transaction
+version, including same-timestamp writes; delete/recreate obtains a new version. Versions serialize
+as exact opaque strings, so clients do not truncate TiKV's integers to JavaScript numbers. They
+are equality tokens, not domain revisions, provider-operation fences or permission to retry an
+external effect. The transaction engine must supply unique positive transaction versions and
+detect write conflicts.
 
 For a single-valued ordinary index, `model.assert_index_match(id, payload, &tx)` checks the exact
 declared field values against the owner's reverse-index manifest and stages the same manifest bytes
@@ -126,19 +141,21 @@ writes to the manifest for the assertion to fence concurrent updates/removals.
 
 ## Storage integrity and pagination
 
-Each persisted model row has a matching `reverse-index:{primary-key}` manifest, including models
-with no secondary indexes. The manifest may name ordinary `index:` keys ending in that exact
+Each persisted model row has a matching `reverse-index:{primary-key}` manifest containing its
+required record `version` and index-key `value` array, including models with no secondary indexes.
+Primary, metadata and secondary indexes commit atomically. The manifest may name ordinary `index:` keys ending in that exact
 primary key and model-scoped `unique-index:` keys whose stored owner matches that primary record.
 Updates and removals validate the pair and every unique owner before mutating either side. A
 missing, orphaned, malformed, or syntactically cross-record manifest is an integrity error; Tito
 does not reinterpret it as a missing entity or follow it to an unrelated key.
 
-The unchanged manifest format does not contain an index-schema version, so Tito cannot prove that
+The record version is not an index-schema version, so Tito cannot prove that
 a syntactically valid manifest still enumerates every index created by an older application schema.
 Recomputing against the current model would incorrectly reject legitimate index additions,
 removals, and condition changes. Detecting or repairing a valid-shaped but semantically incomplete
-historical manifest therefore requires an application-owned audited rebuild; 0.16.2 deliberately
-does not overstate that guarantee.
+historical manifest therefore requires an application-owned audited rebuild. Missing record versions
+are not backfilled from the current read, clock or model timestamp; older metadata requires the
+application's explicit pre-production reset and backup-format cutover.
 
 Scans fail on malformed JSON, non-UTF-8 keys, and values that do not deserialize into the requested
 model. They never silently shorten a page by dropping corrupt rows. Forward cursors continue from

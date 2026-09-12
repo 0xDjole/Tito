@@ -7,7 +7,8 @@ use crate::{
     query::IndexQueryBuilder,
     types::{
         FieldValue, ReverseIndex, TitoCursor, TitoEngine, TitoFindPayload, TitoKvPair,
-        TitoModelOptions, TitoPaginated, TitoScanPayload, TitoTransaction,
+        TitoModelOptions, TitoPaginated, TitoRecordVersion, TitoScanPayload, TitoTransaction,
+        TitoVersioned,
     },
     utils::{key_after_bytes, prefix_end_bytes},
 };
@@ -368,10 +369,36 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
     pub async fn assert_current(&self, id: &str, tx: &E::Transaction) -> Result<(), TitoError> {
         let primary_key = format!("{}:{id}", self.get_table());
+        self.load_index_state(&primary_key, tx)
+            .await?
+            .ok_or_else(|| {
+                TitoError::NotFound(format!("Record '{primary_key}' not found in database"))
+            })?;
+        self.fence_primary(&primary_key, tx).await
+    }
+
+    async fn fence_primary(&self, primary_key: &str, tx: &E::Transaction) -> Result<(), TitoError> {
         let bytes = tx.get(&primary_key).await?.ok_or_else(|| {
             TitoError::NotFound(format!("Record '{primary_key}' not found in database"))
         })?;
         tx.put(primary_key, bytes).await
+    }
+
+    pub async fn assert_version(
+        &self,
+        id: &str,
+        expected: TitoRecordVersion,
+        tx: &E::Transaction,
+    ) -> Result<bool, TitoError> {
+        let primary_key = format!("{}:{id}", self.get_table());
+        let Some(metadata) = self.load_index_state(&primary_key, tx).await? else {
+            return Ok(false);
+        };
+        if metadata.version != expected {
+            return Ok(false);
+        }
+        self.fence_primary(&primary_key, tx).await?;
+        Ok(true)
     }
 
     pub(crate) async fn assert_reverse_index_key(
@@ -424,7 +451,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         &self,
         primary_key: &str,
         tx: &E::Transaction,
-    ) -> Result<Option<Vec<String>>, TitoError> {
+    ) -> Result<Option<ReverseIndex>, TitoError> {
         let reverse_key = format!("reverse-index:{}", primary_key);
         let primary = tx.get(primary_key).await?;
         let reverse = tx.get(&reverse_key).await?;
@@ -434,7 +461,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             (Some(_), Some(bytes)) => {
                 let reverse_index = self.deserialize_reverse_index(&reverse_key, &bytes)?;
                 self.validate_reverse_index_keys(primary_key, &reverse_index)?;
-                Ok(Some(reverse_index.value))
+                Ok(Some(reverse_index))
             }
             (Some(_), None) => Err(TitoError::IndexError(format!(
                 "Primary record '{}' exists without reverse index '{}'",
@@ -519,6 +546,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         let all_index_data = self.get_index_keys(id.clone(), &payload, &stored_value)?;
         let index_json_key = ReverseIndex {
             value: all_index_data.iter().map(|(key, _)| key.clone()).collect(),
+            version: TitoRecordVersion::from_transaction(tx.start_version())?,
         };
         let reverse_value = self.value_with_options(index_json_key, false, true)?;
 
@@ -533,7 +561,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                     }
                     if old_index_keys
                         .as_ref()
-                        .is_none_or(|keys| !keys.contains(key))
+                        .is_none_or(|metadata| !metadata.value.contains(key))
                     {
                         return Err(TitoError::IndexError(format!(
                             "Unique index '{}' on model '{}' is not declared by its owner",
@@ -546,7 +574,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         }
 
         if let Some(old_index_keys) = old_index_keys {
-            for key in old_index_keys {
+            for key in old_index_keys.value {
                 if Self::unique_index_name(&key).is_some()
                     && !self.validate_unique_owner(&key, &raw_id, tx).await?
                 {
@@ -591,6 +619,44 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             model: self,
             id: id.to_string(),
         }
+    }
+
+    pub async fn get_versioned(
+        &self,
+        id: &str,
+        tx: Option<&E::Transaction>,
+    ) -> Result<TitoVersioned<T>, TitoError> {
+        match tx {
+            Some(tx) => self.get_versioned_with_tx(id, tx).await,
+            None => {
+                self.tx(|tx| async move { self.get_versioned_with_tx(id, &tx).await })
+                    .await
+            }
+        }
+    }
+
+    async fn get_versioned_with_tx(
+        &self,
+        id: &str,
+        tx: &E::Transaction,
+    ) -> Result<TitoVersioned<T>, TitoError> {
+        let primary_key = format!("{}:{id}", self.get_table());
+        let metadata = self
+            .load_index_state(&primary_key, tx)
+            .await?
+            .ok_or_else(|| {
+                TitoError::NotFound(format!("Record '{primary_key}' not found in database"))
+            })?;
+        let value = self.get_one_with_tx(id, tx).await?;
+        if value.id() != id {
+            return Err(TitoError::DeserializationFailed(
+                "Versioned model identity differs from its primary key".into(),
+            ));
+        }
+        Ok(TitoVersioned {
+            value,
+            version: metadata.version,
+        })
     }
 
     async fn get_internal(&self, id: &str, tx: Option<&E::Transaction>) -> Result<T, TitoError>
@@ -841,7 +907,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         let reverse_index_key = format!("reverse-index:{}", id);
 
         let mut keys = match self.load_index_state(&id, tx).await? {
-            Some(keys) => keys,
+            Some(metadata) => metadata.value,
             None => return Err(TitoError::NotFound(format!("Entity not found: {}", id))),
         };
 
