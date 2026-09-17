@@ -252,12 +252,30 @@ impl<
                 T::table()
             ))
         })?;
-        serde_json::from_slice(&primary_bytes).map_err(|error| {
+        let primary: T = serde_json::from_slice(&primary_bytes).map_err(|error| {
             TitoError::DeserializationFailed(format!(
                 "Failed to deserialize owner of unique index '{}': {}",
                 payload.index, error
             ))
-        })
+        })?;
+        if serde_json::to_value(&primary).map_err(|error| {
+            TitoError::SerializationFailed(format!(
+                "Failed to compare owner of unique index '{}': {}",
+                payload.index, error
+            ))
+        })? != serde_json::from_slice::<Value>(&index_bytes).map_err(|error| {
+            TitoError::DeserializationFailed(format!(
+                "Failed to compare unique index '{}': {}",
+                payload.index, error
+            ))
+        })? {
+            return Err(TitoError::IndexError(format!(
+                "Unique index '{}' on model '{}' disagrees with its owner",
+                payload.index,
+                T::table()
+            )));
+        }
+        Ok(primary)
     }
 
     pub async fn find_by_index_raw(
