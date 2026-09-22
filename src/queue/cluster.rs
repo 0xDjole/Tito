@@ -102,30 +102,30 @@ impl ClusterPartitionAssignment {
 }
 
 impl<E: TitoEngine> Queue<E> {
-    fn cluster_prefix() -> &'static str {
-        "tito:queue:cluster:"
+    fn cluster_prefix(&self) -> String {
+        format!("tito:{}:cluster:", self.config.name())
     }
 
-    fn coordinator_key() -> String {
-        format!("{}coordinator", Self::cluster_prefix())
+    fn coordinator_key(&self) -> String {
+        format!("{}coordinator", self.cluster_prefix())
     }
 
-    fn nodes_prefix() -> String {
-        format!("{}nodes:", Self::cluster_prefix())
+    fn nodes_prefix(&self) -> String {
+        format!("{}nodes:", self.cluster_prefix())
     }
 
-    fn node_key(node_id: &str) -> String {
-        format!("{}{}", Self::nodes_prefix(), safe_encode(node_id))
+    fn node_key(&self, node_id: &str) -> String {
+        format!("{}{}", self.nodes_prefix(), safe_encode(node_id))
     }
 
-    fn partitions_prefix() -> String {
-        format!("{}partitions:", Self::cluster_prefix())
+    fn partitions_prefix(&self) -> String {
+        format!("{}partitions:", self.cluster_prefix())
     }
 
-    fn partition_key(partition: u32) -> String {
+    fn partition_key(&self, partition: u32) -> String {
         format!(
             "{}{:0pwidth$}",
-            Self::partitions_prefix(),
+            self.partitions_prefix(),
             partition,
             pwidth = PARTITION_DIGITS,
         )
@@ -173,7 +173,7 @@ impl<E: TitoEngine> Queue<E> {
                         node_id: config.node_id.clone(),
                         heartbeat_at: Utc::now().timestamp_millis(),
                     };
-                    Self::put_json(&tx, &Self::node_key(&config.node_id), &node).await
+                    Self::put_json(&tx, &self.node_key(&config.node_id), &node).await
                 }
             })
             .await
@@ -189,7 +189,7 @@ impl<E: TitoEngine> Queue<E> {
                 let config = config.clone();
                 async move {
                     let now = Utc::now().timestamp_millis();
-                    let key = Self::coordinator_key();
+                    let key = self.coordinator_key();
                     let lease = Self::read_json::<ClusterCoordinatorLease>(&tx, &key).await?;
                     let can_claim = match lease {
                         None => true,
@@ -225,7 +225,7 @@ impl<E: TitoEngine> Queue<E> {
                 async move {
                     let now = Utc::now().timestamp_millis();
                     let stale_before = now.saturating_sub(duration_millis(config.lease_ttl));
-                    let prefix = Self::nodes_prefix();
+                    let prefix = self.nodes_prefix();
                     let entries = tx
                         .scan(
                             prefix.as_bytes()..Self::prefix_end(&prefix).as_slice(),
@@ -266,7 +266,7 @@ impl<E: TitoEngine> Queue<E> {
                         let stale_before = now.saturating_sub(duration_millis(config.lease_ttl));
                         let remove_before =
                             now.saturating_sub(duration_millis(config.stale_node_ttl));
-                        let prefix = Self::nodes_prefix();
+                        let prefix = self.nodes_prefix();
                         let entries = tx
                             .scan(
                                 prefix.as_bytes()..Self::prefix_end(&prefix).as_slice(),
@@ -308,7 +308,7 @@ impl<E: TitoEngine> Queue<E> {
                     let mut assignments = Vec::new();
 
                     for partition in 0..partition_count {
-                        let key = Self::partition_key(partition);
+                        let key = self.partition_key(partition);
                         let mut assignment =
                             Self::read_json::<ClusterPartitionAssignment>(&tx, &key)
                                 .await?
@@ -348,7 +348,7 @@ impl<E: TitoEngine> Queue<E> {
                 let config = config.clone();
                 async move {
                     let now = Utc::now().timestamp_millis();
-                    let prefix = Self::partitions_prefix();
+                    let prefix = self.partitions_prefix();
                     let entries = tx
                         .scan(
                             prefix.as_bytes()..Self::prefix_end(&prefix).as_slice(),
@@ -429,7 +429,7 @@ impl<E: TitoEngine> Queue<E> {
                 let config = config.clone();
                 async move {
                     let now = Utc::now().timestamp_millis();
-                    let prefix = Self::partitions_prefix();
+                    let prefix = self.partitions_prefix();
                     let entries = tx
                         .scan(
                             prefix.as_bytes()..Self::prefix_end(&prefix).as_slice(),
@@ -471,7 +471,7 @@ impl<E: TitoEngine> Queue<E> {
                 let config = config.clone();
                 async move {
                     let now = Utc::now().timestamp_millis();
-                    let key = Self::partition_key(partition);
+                    let key = self.partition_key(partition);
                     let Some(assignment) =
                         Self::read_json::<ClusterPartitionAssignment>(&tx, &key).await?
                     else {

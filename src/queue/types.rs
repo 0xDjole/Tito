@@ -180,6 +180,7 @@ fn queue_event_id() -> String {
 
 #[derive(Debug, Clone)]
 pub struct QueueConfig {
+    name: String,
     pub partition_count: u32,
     pub completed_retention: Duration,
 }
@@ -187,8 +188,30 @@ pub struct QueueConfig {
 impl QueueConfig {
     pub fn new(partition_count: u32, completed_retention: Duration) -> Self {
         Self {
+            name: "queue".to_string(),
             partition_count,
             completed_retention,
         }
+    }
+
+    pub fn with_name(mut self, name: impl Into<String>) -> Result<Self, TitoError> {
+        let name = name.into();
+        if name.is_empty()
+            || name.len() > 128
+            || !name
+                .bytes()
+                .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'-' | b'_'))
+        {
+            return Err(TitoError::InvalidInput(
+                "Queue name must contain 1–128 ASCII letters, digits, hyphens or underscores"
+                    .into(),
+            ));
+        }
+        self.name = name;
+        Ok(self)
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 }
