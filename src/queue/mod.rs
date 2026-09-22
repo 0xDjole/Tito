@@ -856,6 +856,73 @@ impl<E: TitoEngine> Queue<E> {
             .await
     }
 
+    pub async fn scan_by_owner<T: DeserializeOwned + Clone + Send + Sync + 'static>(
+        &self,
+        owner: &QueueOwner,
+        status: QueueEventStatus,
+        cursor: Option<Vec<u8>>,
+        limit: u32,
+    ) -> Result<QueueScanPage<T>, TitoError> {
+        let prefix = Self::owner_status_prefix(owner, status)?;
+        if cursor
+            .as_ref()
+            .is_some_and(|value| !value.starts_with(prefix.as_bytes()))
+        {
+            return Err(TitoError::InvalidInput(
+                "Queue cursor belongs to another owner or status".into(),
+            ));
+        }
+        let limit = limit.max(1);
+        self.engine
+            .transaction(|tx| {
+                let start = cursor.clone().unwrap_or_else(|| prefix.as_bytes().to_vec());
+                let prefix = prefix.clone();
+                async move {
+                    let entries =
+                        Self::scan_queue_entries(&tx, start, Self::prefix_end(&prefix), limit)
+                            .await?;
+                    let next_cursor = if entries.len() == limit as usize {
+                        entries.last().map(|(key, _)| {
+                            let mut cursor = key.clone();
+                            cursor.push(0);
+                            cursor
+                        })
+                    } else {
+                        None
+                    };
+                    let mut events = Vec::with_capacity(entries.len());
+                    for (index_key, _) in entries {
+                        let storage_key = Self::indexed_storage_key(&index_key, &prefix)?;
+                        if !storage_key.starts_with(Self::status_prefix(status).as_bytes()) {
+                            return Err(TitoError::DeserializationFailed(
+                                "Queue owner index points outside its status".into(),
+                            ));
+                        }
+                        let value = tx.get(&storage_key).await?.ok_or_else(|| {
+                            TitoError::DeserializationFailed(
+                                "Queue owner index points to a missing event".into(),
+                            )
+                        })?;
+                        let event = Self::read_event_from_value::<T>(&value)?;
+                        if event.status != status || event.owner.as_ref() != Some(owner) {
+                            return Err(TitoError::DeserializationFailed(
+                                "Queue owner index conflicts with its event".into(),
+                            ));
+                        }
+                        let key = String::from_utf8(storage_key).map_err(|_| {
+                            TitoError::DeserializationFailed("Invalid queue key".into())
+                        })?;
+                        events.push((key, event));
+                    }
+                    Ok::<_, TitoError>(QueueScanPage {
+                        events,
+                        next_cursor,
+                    })
+                }
+            })
+            .await
+    }
+
     pub async fn delete_matching_in_tx<T, F>(
         &self,
         status: QueueEventStatus,
@@ -1346,6 +1413,170 @@ mod tests {
             .events
             .iter()
             .all(|(_, event)| event.owner.as_ref() == Some(&foreign)));
+    }
+
+    #[tokio::test]
+    async fn owner_reader_pages_only_its_index_and_preserves_queue_transitions() {
+        let engine = MemoryEngine::default();
+        let queue = queue(engine.clone());
+        let owner = QueueOwner::new("store", "a:with/slashes").unwrap();
+        let foreign = QueueOwner::new("store", "a:with/slashes/other").unwrap();
+        for i in 0..35 {
+            queue
+                .publish(
+                    QueueEvent::new(format!("entry:{i}"), payload(&i.to_string()), 0)
+                        .with_owner(owner.clone()),
+                )
+                .await
+                .unwrap();
+        }
+        queue
+            .publish(
+                QueueEvent::new("entry:foreign", payload("foreign"), 0).with_owner(foreign.clone()),
+            )
+            .await
+            .unwrap();
+        let foreign_key = queue
+            .scan_by_owner::<Payload>(&foreign, QueueEventStatus::Pending, None, 1)
+            .await
+            .unwrap()
+            .events[0]
+            .0
+            .clone();
+        engine
+            .put_raw(&foreign_key, b"invalid unrelated payload".to_vec())
+            .await;
+        engine.start_recording_reads().await;
+        let mut cursor = None;
+        let mut rows = Vec::new();
+        loop {
+            let page = queue
+                .scan_by_owner::<Payload>(&owner, QueueEventStatus::Pending, cursor.clone(), 17)
+                .await
+                .unwrap();
+            assert!(page.events.len() <= 17);
+            if let Some(next) = &page.next_cursor {
+                assert!(cursor.as_ref().is_none_or(|previous| next > previous));
+            }
+            rows.extend(page.events);
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(rows.len(), 35);
+        assert_eq!(
+            rows.iter()
+                .map(|(_, event)| &event.id)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            35
+        );
+        let prefix =
+            Queue::<MemoryEngine>::owner_status_prefix(&owner, QueueEventStatus::Pending).unwrap();
+        let reads = engine.take_recorded_reads().await;
+        assert!(reads
+            .iter()
+            .filter_map(|read| read.strip_prefix(b"scan:"))
+            .all(|start| start.starts_with(prefix.as_bytes())));
+        assert!(!reads
+            .iter()
+            .any(|read| read.ends_with(foreign_key.as_bytes())));
+        assert_eq!(engine.pending_queue_scan_count(), 0);
+        queue.ack(&rows[0].0).await.unwrap();
+        queue
+            .reschedule(&rows[1].0, rows[1].1.rescheduled(60_000))
+            .await
+            .unwrap();
+        let pending = queue
+            .scan_by_owner::<Payload>(&owner, QueueEventStatus::Pending, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(pending.events.len(), 34);
+        assert!(pending
+            .events
+            .iter()
+            .any(|(_, event)| event.id == rows[1].1.id && event.timestamp == 60_000));
+        let completed = queue
+            .scan_by_owner::<Payload>(&owner, QueueEventStatus::Completed, None, 100)
+            .await
+            .unwrap();
+        assert_eq!(completed.events.len(), 2);
+        assert!(completed
+            .events
+            .iter()
+            .all(|(_, event)| event.owner.as_ref() == Some(&owner)));
+    }
+
+    #[tokio::test]
+    async fn owner_reader_rejects_foreign_cursor_and_corrupt_index_without_writes() {
+        let engine = MemoryEngine::default();
+        let queue = queue(engine.clone());
+        let owner = QueueOwner::new("store", "target").unwrap();
+        let foreign = QueueOwner::new("store", "foreign").unwrap();
+        for wrong_prefix in [
+            Queue::<MemoryEngine>::owner_status_prefix(&foreign, QueueEventStatus::Pending)
+                .unwrap(),
+            Queue::<MemoryEngine>::owner_status_prefix(&owner, QueueEventStatus::Completed)
+                .unwrap(),
+        ] {
+            assert!(matches!(
+                queue
+                    .scan_by_owner::<Payload>(
+                        &owner,
+                        QueueEventStatus::Pending,
+                        Some(wrong_prefix.into_bytes()),
+                        10
+                    )
+                    .await,
+                Err(TitoError::InvalidInput(_))
+            ));
+        }
+        queue
+            .publish(
+                QueueEvent::new("entry:target", payload("target"), 0).with_owner(owner.clone()),
+            )
+            .await
+            .unwrap();
+        let row = queue
+            .scan_by_owner::<Payload>(&owner, QueueEventStatus::Pending, None, 10)
+            .await
+            .unwrap()
+            .events
+            .pop()
+            .unwrap();
+        let mut mismatched = row.1;
+        mismatched.owner = Some(foreign);
+        let bytes = serde_json::to_vec(&mismatched).unwrap();
+        engine.put_raw(&row.0, bytes.clone()).await;
+        assert!(matches!(
+            queue
+                .scan_by_owner::<Payload>(&owner, QueueEventStatus::Pending, None, 10)
+                .await,
+            Err(TitoError::DeserializationFailed(_))
+        ));
+        assert_eq!(engine.raw_bytes(&row.0).await, Some(bytes));
+        for missing_key in ["queue:completed:missing", "queue:pending:missing"] {
+            let isolated_engine = MemoryEngine::default();
+            let isolated_queue = Queue::new(
+                isolated_engine.clone(),
+                QueueConfig::new(1, Duration::from_secs(3 * 24 * 60 * 60)),
+            );
+            let dangling_index = Queue::<MemoryEngine>::owner_index_key(
+                &owner,
+                QueueEventStatus::Completed,
+                missing_key.as_bytes(),
+            )
+            .unwrap();
+            isolated_engine.put_raw(&dangling_index, vec![]).await;
+            assert!(matches!(
+                isolated_queue
+                    .scan_by_owner::<Payload>(&owner, QueueEventStatus::Completed, None, 10)
+                    .await,
+                Err(TitoError::DeserializationFailed(_))
+            ));
+            assert!(isolated_engine.contains_key(&dangling_index).await);
+        }
     }
 
     #[tokio::test]
