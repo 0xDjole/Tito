@@ -15,6 +15,8 @@ use tikv_client::{Timestamp, TimestampExt, Transaction, TransactionClient};
 use tokio::time::sleep;
 
 const MAX_TRANSACTION_RETRIES: u32 = 10;
+const MAX_READ_LOCK_RESOLUTION_ATTEMPTS: u32 = 8;
+const READ_LOCK_RESOLUTION_BACKOFF: Duration = Duration::from_millis(25);
 const TIKV_GRPC_MAX_DECODING_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 
 fn contains_undetermined_error(error: &tikv_client::Error) -> bool {
@@ -45,6 +47,7 @@ fn classify_tikv_error(
         | tikv_client::Error::RegionNotFoundInResponse { .. }
         | tikv_client::Error::LeaderNotFound { .. }
         | tikv_client::Error::ResolveLockError(_)
+        | tikv_client::Error::TxnNotFound(_)
         | tikv_client::Error::NoCurrentRegions
         | tikv_client::Error::EntryNotFoundInRegionCache
         | tikv_client::Error::PessimisticLockError { .. } => true,
@@ -57,6 +60,7 @@ fn classify_tikv_error(
                     inner,
                     tikv_client::Error::RegionError(_)
                         | tikv_client::Error::ResolveLockError(_)
+                        | tikv_client::Error::TxnNotFound(_)
                         | tikv_client::Error::LeaderNotFound { .. }
                         | tikv_client::Error::RegionForKeyNotFound { .. }
                         | tikv_client::Error::KeyError(_)
@@ -340,12 +344,30 @@ impl TitoTransaction for TiKVTransaction {
 
     async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<TitoValue>, TitoError> {
         let tikv_key: tikv_client::Key = key.as_ref().to_vec().into();
-        self.inner
-            .lock()
-            .await
-            .get(tikv_key)
-            .await
-            .map_err(|e| classify_tikv_error(e, "Get operation failed", &self.had_retryable_error))
+        let mut attempt = 0;
+        loop {
+            let pending = AtomicBool::new(false);
+            let outcome = self
+                .inner
+                .lock()
+                .await
+                .get(tikv_key.clone())
+                .await
+                .map_err(|e| classify_tikv_error(e, "Get operation failed", &pending));
+            match outcome {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    attempt += 1;
+                    if !error.is_retryable() || attempt >= MAX_READ_LOCK_RESOLUTION_ATTEMPTS {
+                        if pending.load(Ordering::Relaxed) {
+                            self.had_retryable_error.store(true, Ordering::Relaxed);
+                        }
+                        return Err(error);
+                    }
+                    sleep(READ_LOCK_RESOLUTION_BACKOFF * attempt).await;
+                }
+            }
+        }
     }
 
     async fn put<K: AsRef<[u8]> + Send, V: AsRef<[u8]> + Send>(
