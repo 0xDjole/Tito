@@ -281,6 +281,13 @@ range destruction for reset, restore, or drop-style maintenance with application
 
 ## Queue Processing
 
+`QueueConfig::new(partitions, retention)` selects the default queue named `queue`.
+Use `.with_name("test-example")?` for another queue on the same database. Names contain 1–128
+ASCII letters, digits, hyphens or underscores. Pending/completed rows, owner indexes, worker
+coordination and retention are scoped to that name. Publishers and workers for one application
+must use the same configuration. Cursors and mutation keys from another queue are rejected;
+clearing one queue leaves the others untouched. Named queues do not isolate application models.
+
 Queue events are partitioned by their business key, carry their own signed Unix epoch-millisecond timestamp, and remain pending until the handler explicitly acknowledges them. The full `i64` range is stored and ordered exactly; negative timestamps are reachable due times, not invalid values. Tito has no automatic retry policy, retry counter, backoff, failed state, or DLQ:
 
 Handlers return `QueueHandlerResult<T>`, an alias for `Result<QueueHandlerOutcome<T>, TitoError>`.
