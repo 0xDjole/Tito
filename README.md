@@ -157,6 +157,16 @@ historical manifest therefore requires an application-owned audited rebuild. Mis
 are not backfilled from the current read, clock or model timestamp; older metadata requires the
 application's explicit pre-production reset and backup-format cutover.
 
+For offline repair of lost or stale secondary indexes under an unchanged model,
+`model.rebuild_indexes_for_restore(id, &tx)` validates the retained primary and reverse manifest,
+then rewrites only their declared index values. The primary bytes, manifest bytes and original
+record version are preserved and fenced in the same transaction. Missing secondary keys are
+allowed; a unique key owned by another record is not. Ordinary writes still reject missing unique
+keys. Missing versions, duplicate or foreign manifest keys, a primary/key mismatch, or a manifest
+that differs from the current model reject. This is not schema migration, a new record write or
+permission to invent missing authoritative metadata. The caller owns offline operation, bounded
+primary enumeration and domain relationship validation; Tito does not scan related records.
+
 Scans fail on malformed JSON, non-UTF-8 keys, and values that do not deserialize into the requested
 model. They never silently shorten a page by dropping corrupt rows. Forward cursors continue from
 the exact key plus a NUL byte; reverse cursors use the exact key as the exclusive upper bound. Both

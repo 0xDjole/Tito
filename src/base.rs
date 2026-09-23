@@ -377,6 +377,76 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         self.fence_primary(&primary_key, tx).await
     }
 
+    pub async fn rebuild_indexes_for_restore(
+        &self,
+        id: &str,
+        tx: &E::Transaction,
+    ) -> Result<T, TitoError> {
+        if id.is_empty() || id.len() > 512 {
+            return Err(TitoError::InvalidInput("Invalid restore record ID".into()));
+        }
+        let primary_key = format!("{}:{id}", self.get_table());
+        let reverse_key = format!("reverse-index:{primary_key}");
+        let primary = tx.get(&primary_key).await?.ok_or_else(|| {
+            TitoError::NotFound(format!("Record '{primary_key}' not found in database"))
+        })?;
+        let reverse = tx.get(&reverse_key).await?.ok_or_else(|| {
+            TitoError::IndexError(format!("Record '{primary_key}' has no restore metadata"))
+        })?;
+        if reverse.len() > 1_048_576 {
+            return Err(TitoError::IndexError(
+                "Restore metadata exceeds one MiB".into(),
+            ));
+        }
+        let metadata = self.deserialize_reverse_index(&reverse_key, &reverse)?;
+        if metadata.value.len() > 10_000 {
+            return Err(TitoError::IndexError(
+                "Restore metadata exceeds 10000 keys".into(),
+            ));
+        }
+        self.validate_reverse_index_keys(&primary_key, &metadata)?;
+        let value: Value = serde_json::from_slice(&primary)
+            .map_err(|error| TitoError::DeserializationFailed(error.to_string()))?;
+        let stored: T = serde_json::from_value(value.clone())
+            .map_err(|error| TitoError::DeserializationFailed(error.to_string()))?;
+        if stored.id() != id {
+            return Err(TitoError::IndexError(
+                "Restore primary identity differs from its key".into(),
+            ));
+        }
+        let indexes = self.get_index_keys(primary_key.clone(), &stored, &value)?;
+        let declared: std::collections::HashSet<_> = metadata.value.iter().collect();
+        let computed: std::collections::HashSet<_> = indexes.iter().map(|(key, _)| key).collect();
+        if declared.len() != metadata.value.len()
+            || computed.len() != indexes.len()
+            || declared != computed
+        {
+            return Err(TitoError::IndexError(
+                "Restore metadata differs from current model indexes".into(),
+            ));
+        }
+        for (key, _) in &indexes {
+            if let Some(index) = Self::unique_index_name(key) {
+                if let Some(bytes) = tx.get(key).await? {
+                    let owner: T = serde_json::from_slice(&bytes)
+                        .map_err(|error| TitoError::DeserializationFailed(error.to_string()))?;
+                    if owner.id() != id {
+                        return Err(TitoError::UniqueViolation {
+                            model: T::table(),
+                            index: index.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        tx.put(primary_key, primary).await?;
+        tx.put(reverse_key, reverse).await?;
+        for (key, value) in indexes {
+            self.put_value(key, &value, tx).await?;
+        }
+        Ok(stored)
+    }
+
     async fn fence_primary(&self, primary_key: &str, tx: &E::Transaction) -> Result<(), TitoError> {
         let bytes = tx.get(&primary_key).await?.ok_or_else(|| {
             TitoError::NotFound(format!("Record '{primary_key}' not found in database"))

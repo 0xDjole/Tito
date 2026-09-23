@@ -454,6 +454,7 @@ mod cluster;
 mod custom_index;
 mod index;
 mod index_assertion;
+mod index_restore;
 mod model;
 mod numeric_index;
 mod queue;
