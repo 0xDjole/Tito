@@ -391,6 +391,11 @@ newer cleanup work.
 
 Tito may replay a transaction closure after an explicitly retryable, determined datastore failure. TiKV's `UndeterminedError` is different: the commit may already be durable. Tito returns `TitoError::CommitOutcomeUnknown` and never replays that closure. The caller reconciles against authoritative domain state; an acknowledgement either committed or the unchanged Pending invocation is delivered again.
 
+Cancellation removes a transaction from the active registry. Before native commit starts, cleanup
+rolls back pending work. Once native commit has started, cancellation only releases the retained
+handle so its heartbeat can stop; cleanup never replays the closure or rolls back an uncertain
+commit. Callers still reconcile any interrupted command against its authoritative identity.
+
 ### Upgrade contract
 
 This queue protocol removes the former retry/DLQ metadata, changes Pending storage keys to include

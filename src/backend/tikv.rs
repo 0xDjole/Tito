@@ -104,6 +104,43 @@ pub struct TiKVBackend {
     pub active_transactions: Arc<Mutex<HashMap<String, TiKVTransaction>>>,
 }
 
+struct TransactionRegistration {
+    backend: TiKVBackend,
+    transaction: Option<TiKVTransaction>,
+}
+
+impl TransactionRegistration {
+    async fn finish(&mut self) {
+        if let Some(transaction) = &self.transaction {
+            self.backend
+                .active_transactions
+                .lock()
+                .await
+                .remove(&transaction.id);
+        }
+        self.transaction = None;
+    }
+}
+
+impl Drop for TransactionRegistration {
+    fn drop(&mut self) {
+        let Some(transaction) = self.transaction.take() else {
+            return;
+        };
+        let backend = self.backend.clone();
+        tokio::spawn(async move {
+            backend
+                .active_transactions
+                .lock()
+                .await
+                .remove(&transaction.id);
+            if !transaction.commit_started.load(Ordering::Acquire) {
+                let _ = transaction.rollback().await;
+            }
+        });
+    }
+}
+
 #[async_trait]
 impl TitoEngine for TiKVBackend {
     type Transaction = TiKVTransaction;
@@ -120,6 +157,7 @@ impl TitoEngine for TiKVBackend {
             id: DBUuid::new_v4().to_string(),
             inner: Arc::new(tokio::sync::Mutex::new(tx)),
             had_retryable_error: Arc::new(AtomicBool::new(false)),
+            commit_started: Arc::new(AtomicBool::new(false)),
             start_version,
         })
     }
@@ -144,11 +182,14 @@ impl TitoEngine for TiKVBackend {
                 })
                 .map_err(E::from)?;
 
-            let tx_id = tx.id.clone();
+            let mut registration = TransactionRegistration {
+                backend: self.clone(),
+                transaction: Some(tx.clone()),
+            };
 
             {
                 let mut active_transactions = self.active_transactions.lock().await;
-                active_transactions.insert(tx_id.clone(), tx.clone());
+                active_transactions.insert(tx.id.clone(), tx.clone());
             }
 
             let result = f_clone(tx.clone()).await;
@@ -156,18 +197,14 @@ impl TitoEngine for TiKVBackend {
             match result {
                 Ok(value) => match tx.clone().commit().await {
                     Ok(_) => {
-                        let mut active_transactions = self.active_transactions.lock().await;
-                        active_transactions.remove(&tx_id);
+                        registration.finish().await;
                         return Ok(value);
                     }
                     Err(e) => {
                         if !e.is_commit_outcome_unknown() {
                             let _ = tx.rollback().await;
                         }
-                        {
-                            let mut active_transactions = self.active_transactions.lock().await;
-                            active_transactions.remove(&tx_id);
-                        }
+                        registration.finish().await;
 
                         if commit_failure_action(&e, retries) == CommitFailureAction::Retry {
                             retries += 1;
@@ -183,10 +220,7 @@ impl TitoEngine for TiKVBackend {
                 Err(e) => {
                     let is_retryable = tx.had_retryable_error.load(Ordering::Relaxed);
                     let _ = tx.rollback().await;
-                    {
-                        let mut active_transactions = self.active_transactions.lock().await;
-                        active_transactions.remove(&tx_id);
-                    }
+                    registration.finish().await;
 
                     if is_retryable && retries < MAX_TRANSACTION_RETRIES {
                         retries += 1;
@@ -208,7 +242,9 @@ impl TitoEngine for TiKVBackend {
         drop(active_transactions);
 
         for (_tx_id, tx) in transactions {
-            let _ = tx.inner.lock().await.rollback().await;
+            if !tx.commit_started.load(Ordering::Acquire) {
+                let _ = tx.rollback().await;
+            }
         }
         Ok(())
     }
@@ -333,6 +369,7 @@ pub struct TiKVTransaction {
     pub id: String,
     pub inner: Arc<tokio::sync::Mutex<Transaction>>,
     pub had_retryable_error: Arc<AtomicBool>,
+    commit_started: Arc<AtomicBool>,
     start_version: u64,
 }
 
@@ -455,15 +492,11 @@ impl TitoTransaction for TiKVTransaction {
     }
 
     async fn commit(self) -> Result<(), TitoError> {
-        self.inner
-            .lock()
-            .await
-            .commit()
-            .await
-            .map(|_| ())
-            .map_err(|e| {
-                classify_tikv_error(e, "Transaction commit failed", &self.had_retryable_error)
-            })
+        let mut transaction = self.inner.lock().await;
+        self.commit_started.store(true, Ordering::Release);
+        transaction.commit().await.map(|_| ()).map_err(|e| {
+            classify_tikv_error(e, "Transaction commit failed", &self.had_retryable_error)
+        })
     }
 
     async fn rollback(self) -> Result<(), TitoError> {
