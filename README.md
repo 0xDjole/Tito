@@ -39,6 +39,26 @@ instance sets `condition` to false.
 - **Partitioned Queue**: Horizontal scaling via stable business-key partitions
 - **Event Timestamps**: Each event says when it becomes runnable
 
+## TiKV client dependency
+
+Tito's normal dependency selects [getwyrd/client-rust
+55cd29b2ec9ad9f04d312e18a5ed8f6393fe219e](https://github.com/getwyrd/client-rust/commit/55cd29b2ec9ad9f04d312e18a5ed8f6393fe219e)
+with default features disabled. This immutable merge retains both [upstream primary-commit
+ambiguity handling](https://github.com/tikv/client-rust/commit/337c710451e4078b8014dd6661fb84f2335c5eec)
+and [expired missing-primary lock recovery](https://github.com/getwyrd/client-rust/commit/a7fba928e5712922fa95a497c52552e141afbd41),
+including both native per-key error wrappers. The client uses Tonic 0.12 and the HTTP/2 0.4
+dependency chain. Consumers need no client patch or locally copied client source.
+
+Primary-commit transport/status loss and native undetermined region responses remain ambiguous.
+Tito returns `CommitOutcomeUnknown` without replaying or rolling back that transaction. An expired
+secondary whose transaction primary was never written is resolved by a normal native read; it
+does not require an application repair command.
+
+This dependency is distributed through an immutable Tito Git release. [Cargo registry
+publication](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html#multiple-locations)
+would replace a Git dependency with its declared registry version, so no registry fallback is
+declared for an older client that lacks these fixes.
+
 ## Connection
 
 ```rust
@@ -433,18 +453,26 @@ queue:owner:{base64url(type)}:{base64url(id)}:{status_type}:{base64url(queue_sto
 
 ## Verification
 
-Run the complete crate checks from this repository:
+Run the complete crate checks from this repository while an explicitly owned disposable native
+PD/TiKV runtime is available. Set `TITO_NATIVE_PD_URI` to that runtime's loopback `host:port` and
+`TITO_NATIVE_RUN_ID` to its `run-` identity; the native case refuses undeclared infrastructure.
 
 ```sh
-cargo test --all-targets
+cargo test --locked --all-targets
 ```
 
-The tests use the in-memory engine and cover model/index writes, queue transitions, exact
+The library cases use the in-memory engine and cover model/index writes, queue transitions, exact
 signed millisecond scheduling and completion, exact inclusive cutoff buckets and signed extrema,
-configured retention, cluster ownership and leases, worker
-shutdown, and ambiguous transaction outcomes. Examples are compiled but not run against a live
-database. Application-level TiKV, provider-effect, backup, and restore evidence belongs to the
-application's complete suite against this exact dependency candidate.
+configured retention, cluster ownership and leases, worker shutdown, and ambiguous transaction
+outcomes. `tikv_native_orphan_lock_test` creates a real secondary lock after a definite primary
+prewrite conflict, waits for its observed native TTL, proves the missing-primary branch through a
+normal Tito read, and verifies recovery preserves the winning primary. It removes only its own
+two UUID-scoped keys. Examples are compiled but not run against a live database.
+
+Application-level primary-commit response loss, provider effects, backup and restore remain the
+application's complete-suite responsibility against the exact released Tito revision. The native
+client proof must cover both connection loss and gRPC status loss after an actual primary
+acknowledgement, with an unknown outcome, no rollback, and all accepted domain writes intact.
 
 ## License
 
