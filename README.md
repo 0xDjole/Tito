@@ -6,6 +6,8 @@ A database layer on TiKV with indexing, transactions, and a built-in partitioned
 
 - **Data Storage**: Models with CRUD operations
 - **Indexing**: Conditional ordinary and unique composite indexes for efficient queries
+- **References**: Records declare what they point at; Tito checks every pointer on save, keeps one
+  key per pointer, refuses to remove a record while anything points at it, and lists who does
 - **Transactions**: Full ACID transactions
 - **Query Builder**: Fluent API for querying by index
 
@@ -77,6 +79,8 @@ struct User {
     id: String,
     name: String,
     email: String,
+    avatar_id: Option<String>,
+    deleting: bool,
 }
 
 impl TitoModelTrait for User {
@@ -84,7 +88,7 @@ impl TitoModelTrait for User {
         self.id.clone()
     }
 
-    fn table(&self) -> String {
+    fn table() -> String {
         "user".to_string()
     }
 
@@ -99,15 +103,21 @@ impl TitoModelTrait for User {
         }]
     }
 
-    fn events(&self) -> Vec<TitoEventConfig> {
-        let now = chrono::Utc::now().timestamp_millis();
-        vec![
-            TitoEventConfig { name: "user".to_string(), timestamp: now },
-            TitoEventConfig { name: "analytics".to_string(), timestamp: now },
-        ]
+    fn references(&self) -> Vec<TitoReference> {
+        self.avatar_id
+            .iter()
+            .map(|avatar_id| TitoReference::new("media", avatar_id, "avatar_id"))
+            .collect()
+    }
+
+    fn is_deleting(&self) -> bool {
+        self.deleting
     }
 }
 ```
+
+`references` and `is_deleting` have no default, so a model can't forget them. A model that points
+at nothing returns an empty list, and a model with no deleting state returns `false`.
 
 ## CRUD Operations
 
@@ -159,12 +169,100 @@ revision index requires an explicit offline index rebuild before dependent reads
 does not repair old manifests or fall back to fetching content. An engine must detect conflicting
 writes to the manifest for the assertion to fence concurrent updates/removals.
 
+## References
+
+Tito has no foreign keys, so a record says what it points at, the way it lists its indexes.
+`references()` returns one `TitoReference { table, id, path }` per pointer:
+- `table` is the target model's `table()`;
+- `id` is the target's record id;
+- `path` says where the pointer sits in the source, such as `gallery.0`.
+
+Table and id are 1 to 512 bytes and the path is 1 to 2,048 bytes. Identical triples count once. A
+pointer to the record itself is ignored, because it goes away with the record.
+
+Tito finds each target at `table:{table}:{id}`, the default `key_prefix`. A model that overrides
+`key_prefix` can't be a reference target.
+
+**On save**, in the caller's transaction:
+1. Tito reads every target. A missing target fails the save with
+   `TitoError::ReferenceMissing { table, id, path }`.
+2. A target the record didn't point at before, under any path, is new. If a new target is marked
+   deleting, the save fails with `TitoError::ReferenceDeleting { table, id, path }`.
+3. A target the record already pointed at may stay while it is deleting, so a cleanup can still edit
+   it away. Moving it to another path keeps it.
+4. Tito writes one key per new pointer and deletes the keys of pointers that went away, in the same
+   transaction. Kept keys are not rewritten.
+
+Each key looks like this:
+
+```
+ref:{target table}:{target id}:{source table}:{source id}:{path}
+```
+
+Its value is the source's `TitoIncomingReference { table, id, path }`. Each segment escapes `\` and
+`:` with a backslash, so ids that contain separators never collide.
+
+**Deleting.** While `is_deleting()` is true, the record also owns the marker key
+`deleting:{table}:{id}`, with the value `true`. That is how Tito knows a target is deleting without
+knowing its Rust type.
+
+**The manifest.** Reference keys and the marker are listed in the record's manifest beside its
+index keys. A save fails with `InvalidInput` when the manifest would hold more than 10,000 keys or
+more than one MiB. Index repair and index assertions enforce the same two limits.
+
+**Remove.** `model.remove(id, &tx)` fails with `TitoError::Referenced { table, id, by }` while any
+other record points at the record. `by` names up to 20 sources in key order. When it succeeds, the
+remove deletes the record's own reference keys and marker with its indexes.
+
+There is no cascade and no unset. A cleanup over many records runs as the application's own batched
+job, which marks the target deleting first.
+
+**Who points.** `model.referenced_by(id, &tx)` returns every other record pointing at a record, in
+key order, paging through the keys internally.
+
+**Who else points.** `model.referenced_by_except(id, &source_tables, limit, &tx)` returns up to
+`limit` sources whose table is not in `source_tables`, in key order. A record that is about to clean
+up its own dependants asks it before it is marked deleting: a category with a hundred thousand
+products, or a collection with its entries, learns whether anything else points at it without
+reading the pointers it will clear itself.
+
+```rust
+let others = categories
+    .referenced_by_except(&category_id, &["product", "customer"], 20, &tx)
+    .await?;
+```
+
+- Every key of one source table sits in one contiguous range under the target, so Tito seeks past
+  each skipped range instead of reading it.
+- `limit` must be at least 1. An empty or over-512-byte `id` or source table is `InvalidInput`.
+- Listing a table nothing points from, or the same table twice, is allowed.
+- Keys are checked as in `referenced_by`: a key that disagrees with its value is an `IndexError`.
+
+**Erase.** `model.erase(id, &tx)` removes a record, its indexes, its own reference keys and its
+marker without checking who points at it. It exists for erasing a whole tenant, where every source
+goes too. Keys that other records hold pointing at the erased record stay until those records go.
+
+**Index repair.** `rebuild_indexes_for_restore` rebuilds reference keys and the marker from the
+record, like index keys. It doesn't read the targets, so records can be restored in any order.
+
+**Concurrency.** Tito's TiKV transactions are optimistic, and reads aren't checked at commit, so the
+guard writes a key that conflicting transactions share. Three operations write the target's marker
+key:
+- a save that adds a pointer deletes it, which changes nothing because the key is absent;
+- a remove of the target deletes it;
+- marking the target deleting puts it.
+
+So a pointer added while its target is removed or marked deleting conflicts at commit, and the
+retried transaction sees the new state. Two saves that each add a pointer to the same target at the
+same moment also conflict, and one retries. A save that only keeps its pointers writes no fence.
+
 ## Storage integrity and pagination
 
 Each persisted model row has a matching `reverse-index:{primary-key}` manifest containing its
 required record `version` and index-key `value` array, including models with no secondary indexes.
 Primary, metadata and secondary indexes commit atomically. The manifest may name ordinary `index:` keys ending in that exact
-primary key and model-scoped `unique-index:` keys whose stored owner matches that primary record.
+primary key, model-scoped `unique-index:` keys whose stored owner matches that primary record, the
+record's own `ref:` keys and its own `deleting:` marker.
 Updates and removals validate the pair and every unique owner before mutating either side. A
 missing, orphaned, malformed, or syntactically cross-record manifest is an integrity error; Tito
 does not reinterpret it as a missing entity or follow it to an unrelated key.
@@ -179,13 +277,14 @@ application's explicit pre-production reset and backup-format cutover.
 
 For offline repair of lost or stale secondary indexes under an unchanged model,
 `model.rebuild_indexes_for_restore(id, &tx)` validates the retained primary and reverse manifest,
-then rewrites only their declared index values. The primary bytes, manifest bytes and original
-record version are preserved and fenced in the same transaction. Missing secondary keys are
-allowed; a unique key owned by another record is not. Ordinary writes still reject missing unique
-keys. Missing versions, duplicate or foreign manifest keys, a primary/key mismatch, or a manifest
-that differs from the current model reject. This is not schema migration, a new record write or
-permission to invent missing authoritative metadata. The caller owns offline operation, bounded
-primary enumeration and domain relationship validation; Tito does not scan related records.
+then rewrites only their declared index values, reference keys and deleting marker. The primary
+bytes, manifest bytes and original record version are preserved and fenced in the same transaction.
+Missing secondary keys are allowed; a unique key owned by another record is not. Ordinary writes
+still reject missing unique keys. Missing versions, duplicate or foreign manifest keys, a
+primary/key mismatch, or a manifest that differs from the current model's indexes, references or
+deleting state reject. This is not schema migration, a new record write or permission to invent
+missing authoritative metadata. The caller owns offline operation, bounded primary enumeration and
+domain relationship validation; Tito does not scan related records or read reference targets.
 
 Scans fail on malformed JSON, non-UTF-8 keys, and values that do not deserialize into the requested
 model. They never silently shorten a page by dropping corrupt rows. Forward cursors continue from
@@ -208,6 +307,25 @@ Secondary index values intentionally remain complete clones of the primary JSON 
 0.16.2. This preserves the existing storage wire format and query behavior. Removing that
 redundancy requires a separately designed release that rehydrates primary rows and migrates every
 existing index; it is not part of this correctness patch.
+
+### 0.18.2 references
+
+`TitoModelTrait` gains two required methods, `references` and `is_deleting`. Every model must
+implement both before it compiles. There are three new errors: `TitoError::Referenced`,
+`ReferenceMissing` and `ReferenceDeleting`. `TitoModel` gains `referenced_by`,
+`referenced_by_except` and `erase`.
+
+A map field's index entry is now encoded whole, as `{field}:{key}.{value}` passed through the same
+encoding a lookup applies to its value. Before, the map key was written as it was, so a lookup for a
+key with capitals, such as `en-US.spring-menu`, never matched. Index keys of maps whose keys have
+capitals change; reset and reseed, or save those records again. Identical index keys of one record,
+such as a list that holds the same value twice, are written and listed in the manifest once, so
+index repair accepts the record.
+
+Manifests now list the record's `ref:` keys and `deleting:` marker. Records written by 0.18.1 have
+neither: `remove` doesn't see their pointers, and index repair rejects the manifest of any record
+that holds a pointer or is deleting. Reset and reseed, or save every such record again, before
+relying on the guard. Key formats for primaries, indexes and the queue are unchanged.
 
 ### 0.18.0 development cutover
 
@@ -461,7 +579,8 @@ PD/TiKV runtime is available. Set `TITO_NATIVE_PD_URI` to that runtime's loopbac
 cargo test --locked --all-targets
 ```
 
-The library cases use the in-memory engine and cover model/index writes, queue transitions, exact
+The library cases use the in-memory engine and cover model/index writes, reference keys, refusals
+and fences, queue transitions, exact
 signed millisecond scheduling and completion, exact inclusive cutoff buckets and signed extrema,
 configured retention, cluster ownership and leases, worker shutdown, and ambiguous transaction
 outcomes. `tikv_native_orphan_lock_test` creates a real secondary lock after a definite primary

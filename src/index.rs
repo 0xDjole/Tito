@@ -65,7 +65,11 @@ impl<
                                     .as_str()
                                     .filter(|value| !value.is_empty())
                                     .map(|value| {
-                                        format!("{}:{}.{}", field.name, key, safe_encode(value))
+                                        format!(
+                                            "{}:{}",
+                                            field.name,
+                                            safe_encode(&format!("{key}.{value}"))
+                                        )
                                     }),
                                 TitoIndexFieldType::Number => encode_index_number(&value)?
                                     .map(|value| format!("{}:{}:{value}", field.name, key)),
@@ -124,6 +128,8 @@ impl<
     ) -> Result<Vec<(String, Value)>, TitoError> {
         let mut all_index_keys = self.build_index_keys(&id, &value.indexes(), json, false)?;
         all_index_keys.extend(self.build_index_keys(&id, &value.unique_indexes(), json, true)?);
+        let mut seen = std::collections::HashSet::with_capacity(all_index_keys.len());
+        all_index_keys.retain(|(key, _)| seen.insert(key.clone()));
         Ok(all_index_keys)
     }
 

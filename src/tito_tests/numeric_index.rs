@@ -71,6 +71,14 @@ impl TitoModelTrait for NumericRecord {
         )]
     }
 
+    fn references(&self) -> Vec<TitoReference> {
+        Vec::new()
+    }
+
+    fn is_deleting(&self) -> bool {
+        false
+    }
+
     fn table() -> String {
         "numeric-records".to_string()
     }

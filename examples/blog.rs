@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use tito::{
     types::{
         DBUuid, TitoEngine, TitoIndexConfig, TitoIndexField, TitoIndexFieldType, TitoModelTrait,
+        TitoReference,
     },
     TiKV, TitoError, TitoModelOptions,
 };
@@ -36,6 +37,14 @@ impl TitoModelTrait for Tag {
         }]
     }
 
+    fn references(&self) -> Vec<TitoReference> {
+        Vec::new()
+    }
+
+    fn is_deleting(&self) -> bool {
+        false
+    }
+
     fn table() -> String {
         "tag".to_string()
     }
@@ -65,6 +74,20 @@ impl TitoModelTrait for Post {
                 }],
             },
         ]
+    }
+
+    fn references(&self) -> Vec<TitoReference> {
+        self.tag_ids
+            .iter()
+            .enumerate()
+            .map(|(position, tag_id)| {
+                TitoReference::new("tag", tag_id, format!("tag_ids.{position}"))
+            })
+            .collect()
+    }
+
+    fn is_deleting(&self) -> bool {
+        false
     }
 
     fn table() -> String {
@@ -137,6 +160,35 @@ async fn main() -> Result<(), TitoError> {
         .await?;
 
     println!("Created post: {}", post.title);
+
+    let refusal = tito_db
+        .transaction(|tx| {
+            let tag_model = tag_model.clone();
+            let rust_tag_id = rust_tag.id.clone();
+            async move { tag_model.remove(&rust_tag_id, &tx).await }
+        })
+        .await;
+    if let Err(TitoError::Referenced { by, .. }) = refusal {
+        println!(
+            "Tag {} stays: {} post reference(s) use it",
+            rust_tag.name,
+            by.len()
+        );
+    }
+
+    let used_by = tito_db
+        .transaction(|tx| {
+            let tag_model = tag_model.clone();
+            let tech_tag_id = tech_tag.id.clone();
+            async move { tag_model.referenced_by(&tech_tag_id, &tx).await }
+        })
+        .await?;
+    for reference in &used_by {
+        println!(
+            "Tag {} is used by {} {} at {}",
+            tech_tag.name, reference.table, reference.id, reference.path
+        );
+    }
 
     let mut post_with_tags = post_model.get(&post.id).execute(None).await?;
     post_with_tags.tags = tag_model

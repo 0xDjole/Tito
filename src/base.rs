@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 
 use std::marker::PhantomData;
@@ -5,10 +6,16 @@ use std::marker::PhantomData;
 use crate::{
     error::TitoError,
     query::IndexQueryBuilder,
+    reference::{
+        deleting_marker_key, parse_reference_key, primary_key, reference_key,
+        reference_source_prefix, reference_target_prefix, validate_reference,
+        validate_reference_id, validate_reference_table, DELETING_MARKER_KEY_PREFIX,
+        REFERENCE_KEY_PREFIX,
+    },
     types::{
-        FieldValue, ReverseIndex, TitoCursor, TitoEngine, TitoFindPayload, TitoKvPair,
-        TitoModelOptions, TitoPaginated, TitoRecordVersion, TitoScanPayload, TitoTransaction,
-        TitoVersioned,
+        FieldValue, ReverseIndex, TitoCursor, TitoEngine, TitoFindPayload, TitoIncomingReference,
+        TitoKvPair, TitoModelOptions, TitoPaginated, TitoRecordVersion, TitoReference,
+        TitoScanPayload, TitoTransaction, TitoVersioned,
     },
     utils::{key_after_bytes, prefix_end_bytes},
 };
@@ -17,6 +24,11 @@ use base64::{engine::general_purpose, Engine};
 use chrono::Utc;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
+
+const MAX_MANIFEST_KEYS: usize = 10_000;
+const MAX_MANIFEST_BYTES: usize = 1_048_576;
+const MAX_REFUSAL_REFERENCES: usize = 20;
+const REFERENCE_SCAN_BATCH: u32 = 256;
 
 #[derive(Clone)]
 pub struct TitoModel<E: TitoEngine, T> {
@@ -325,12 +337,26 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         primary_key: &str,
         reverse_index: &ReverseIndex,
     ) -> Result<(), TitoError> {
+        let table = T::table();
+        let raw_id = primary_key
+            .strip_prefix(&format!("{}:", self.get_table()))
+            .ok_or_else(|| {
+                TitoError::IndexError(format!(
+                    "Primary key '{}' does not belong to model '{}'",
+                    primary_key, table
+                ))
+            })?;
         let expected_suffix = format!(":{}", primary_key);
-        let unique_prefix = format!("unique-index:{}:", T::table());
+        let unique_prefix = format!("unique-index:{}:", table);
+        let marker = deleting_marker_key(&table, raw_id);
         for key in &reverse_index.value {
             let ordinary = key.starts_with("index:") && key.ends_with(&expected_suffix);
             let unique = key.starts_with(&unique_prefix);
-            if !ordinary && !unique {
+            let reference = parse_reference_key(key).is_some_and(|reference| {
+                reference.source_table == table && reference.source_id == raw_id
+            });
+            let deleting = *key == marker;
+            if !ordinary && !unique && !reference && !deleting {
                 return Err(TitoError::IndexError(format!(
                     "Reverse index for '{}' contains an invalid index key '{}'",
                     primary_key, key
@@ -338,6 +364,263 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             }
         }
         Ok(())
+    }
+
+    fn is_reference_state_key(key: &str) -> bool {
+        key.starts_with(REFERENCE_KEY_PREFIX) || key.starts_with(DELETING_MARKER_KEY_PREFIX)
+    }
+
+    fn declared_references(
+        &self,
+        raw_id: &str,
+        value: &T,
+    ) -> Result<BTreeMap<String, TitoReference>, TitoError> {
+        let table = T::table();
+        let mut references = BTreeMap::new();
+        for reference in value.references() {
+            validate_reference(&reference)?;
+            if reference.table == table && reference.id == raw_id {
+                continue;
+            }
+            let key = reference_key(
+                &reference.table,
+                &reference.id,
+                &table,
+                raw_id,
+                &reference.path,
+            );
+            references.insert(key, reference);
+        }
+        Ok(references)
+    }
+
+    fn declared_marker(&self, raw_id: &str, value: &T) -> Option<String> {
+        value
+            .is_deleting()
+            .then(|| deleting_marker_key(&T::table(), raw_id))
+    }
+
+    fn incoming_value(&self, raw_id: &str, reference: &TitoReference) -> Result<Value, TitoError> {
+        serde_json::to_value(TitoIncomingReference::new(
+            T::table(),
+            raw_id,
+            reference.path.clone(),
+        ))
+        .map_err(|error| TitoError::SerializationFailed(error.to_string()))
+    }
+
+    fn manifest_bytes(
+        &self,
+        primary_key: &str,
+        manifest: &ReverseIndex,
+    ) -> Result<Vec<u8>, TitoError> {
+        if manifest.value.len() > MAX_MANIFEST_KEYS {
+            return Err(TitoError::InvalidInput(format!(
+                "Record '{}' needs more than {} index and reference keys",
+                primary_key, MAX_MANIFEST_KEYS
+            )));
+        }
+        let bytes = serde_json::to_vec(manifest)
+            .map_err(|error| TitoError::SerializationFailed(error.to_string()))?;
+        if bytes.len() > MAX_MANIFEST_BYTES {
+            return Err(TitoError::InvalidInput(format!(
+                "Record '{}' has an index and reference manifest over one MiB",
+                primary_key
+            )));
+        }
+        Ok(bytes)
+    }
+
+    async fn check_reference_targets(
+        &self,
+        references: &BTreeMap<String, TitoReference>,
+        old_reference_keys: &HashSet<String>,
+        tx: &E::Transaction,
+    ) -> Result<Vec<String>, TitoError> {
+        let kept: HashSet<(String, String)> = old_reference_keys
+            .iter()
+            .filter_map(|key| parse_reference_key(key))
+            .map(|key| (key.target_table, key.target_id))
+            .collect();
+        let mut targets: BTreeMap<(String, String), String> = BTreeMap::new();
+        for reference in references.values() {
+            targets
+                .entry((reference.table.clone(), reference.id.clone()))
+                .or_insert_with(|| reference.path.clone());
+        }
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut reads = Vec::with_capacity(targets.len() * 2);
+        for (table, id) in targets.keys() {
+            reads.push(primary_key(table, id));
+            if !kept.contains(&(table.clone(), id.clone())) {
+                reads.push(deleting_marker_key(table, id));
+            }
+        }
+        let found: HashSet<Vec<u8>> = tx
+            .batch_get(reads)
+            .await?
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        let mut fences = Vec::new();
+        for ((table, id), path) in targets {
+            if !found.contains(primary_key(&table, &id).as_bytes()) {
+                return Err(TitoError::ReferenceMissing { table, id, path });
+            }
+            if kept.contains(&(table.clone(), id.clone())) {
+                continue;
+            }
+            let marker = deleting_marker_key(&table, &id);
+            if found.contains(marker.as_bytes()) {
+                return Err(TitoError::ReferenceDeleting { table, id, path });
+            }
+            fences.push(marker);
+        }
+        Ok(fences)
+    }
+
+    fn reference_range_end(prefix: &[u8]) -> Result<Vec<u8>, TitoError> {
+        prefix_end_bytes(prefix).ok_or_else(|| {
+            TitoError::InvalidInput("Reference prefix has no finite range endpoint".to_string())
+        })
+    }
+
+    async fn scan_incoming_references(
+        &self,
+        raw_id: &str,
+        mut start: Vec<u8>,
+        end: &[u8],
+        limit: Option<usize>,
+        incoming: &mut Vec<TitoIncomingReference>,
+        tx: &E::Transaction,
+    ) -> Result<(), TitoError> {
+        let table = T::table();
+        while start.as_slice() < end {
+            let batch = match limit {
+                Some(limit) => {
+                    let remaining = limit.saturating_sub(incoming.len());
+                    if remaining == 0 {
+                        return Ok(());
+                    }
+                    u32::try_from(remaining)
+                        .unwrap_or(u32::MAX)
+                        .min(REFERENCE_SCAN_BATCH)
+                }
+                None => REFERENCE_SCAN_BATCH,
+            };
+            let page = tx.scan(start.clone()..end.to_vec(), batch).await?;
+            let scanned = page.len();
+            for (key_bytes, value_bytes) in page {
+                let key = String::from_utf8(key_bytes).map_err(|error| {
+                    TitoError::DeserializationFailed(format!(
+                        "Reference scan returned a non-UTF-8 key (valid through byte {})",
+                        error.utf8_error().valid_up_to()
+                    ))
+                })?;
+                let reference: TitoIncomingReference = serde_json::from_slice(&value_bytes)
+                    .map_err(|error| {
+                        TitoError::DeserializationFailed(format!(
+                            "Failed to deserialize reference '{}': {}",
+                            key, error
+                        ))
+                    })?;
+                if reference_key(
+                    &table,
+                    raw_id,
+                    &reference.table,
+                    &reference.id,
+                    &reference.path,
+                ) != key
+                {
+                    return Err(TitoError::IndexError(format!(
+                        "Reference key '{}' disagrees with its value",
+                        key
+                    )));
+                }
+                start = key_after_bytes(key.as_bytes());
+                incoming.push(reference);
+            }
+            if scanned < batch as usize {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    async fn incoming_references(
+        &self,
+        raw_id: &str,
+        limit: Option<usize>,
+        tx: &E::Transaction,
+    ) -> Result<Vec<TitoIncomingReference>, TitoError> {
+        let prefix = reference_target_prefix(&T::table(), raw_id);
+        let end = Self::reference_range_end(prefix.as_bytes())?;
+        let mut incoming = Vec::new();
+        self.scan_incoming_references(raw_id, prefix.into_bytes(), &end, limit, &mut incoming, tx)
+            .await?;
+        Ok(incoming)
+    }
+
+    pub async fn referenced_by(
+        &self,
+        id: &str,
+        tx: &E::Transaction,
+    ) -> Result<Vec<TitoIncomingReference>, TitoError> {
+        validate_reference_id(id)?;
+        self.incoming_references(id, None, tx).await
+    }
+
+    pub async fn referenced_by_except(
+        &self,
+        id: &str,
+        source_tables: &[&str],
+        limit: usize,
+        tx: &E::Transaction,
+    ) -> Result<Vec<TitoIncomingReference>, TitoError> {
+        validate_reference_id(id)?;
+        if limit == 0 {
+            return Err(TitoError::InvalidInput(
+                "A reference limit must be greater than zero".to_string(),
+            ));
+        }
+        let table = T::table();
+        let prefix = reference_target_prefix(&table, id);
+        let end = Self::reference_range_end(prefix.as_bytes())?;
+        let mut skipped = Vec::with_capacity(source_tables.len());
+        for source_table in source_tables {
+            validate_reference_table(source_table)?;
+            let skip_start = reference_source_prefix(&table, id, source_table).into_bytes();
+            let skip_end = Self::reference_range_end(&skip_start)?;
+            skipped.push((skip_start, skip_end));
+        }
+        skipped.sort();
+        skipped.dedup();
+        let mut incoming = Vec::new();
+        let mut start = prefix.into_bytes();
+        for (skip_start, skip_end) in skipped {
+            if start < skip_start {
+                self.scan_incoming_references(
+                    id,
+                    start.clone(),
+                    &skip_start,
+                    Some(limit),
+                    &mut incoming,
+                    tx,
+                )
+                .await?;
+                if incoming.len() >= limit {
+                    return Ok(incoming);
+                }
+            }
+            if skip_end > start {
+                start = skip_end;
+            }
+        }
+        self.scan_incoming_references(id, start, &end, Some(limit), &mut incoming, tx)
+            .await?;
+        Ok(incoming)
     }
 
     fn unique_index_name(key: &str) -> Option<&str> {
@@ -393,13 +676,13 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         let reverse = tx.get(&reverse_key).await?.ok_or_else(|| {
             TitoError::IndexError(format!("Record '{primary_key}' has no restore metadata"))
         })?;
-        if reverse.len() > 1_048_576 {
+        if reverse.len() > MAX_MANIFEST_BYTES {
             return Err(TitoError::IndexError(
                 "Restore metadata exceeds one MiB".into(),
             ));
         }
         let metadata = self.deserialize_reverse_index(&reverse_key, &reverse)?;
-        if metadata.value.len() > 10_000 {
+        if metadata.value.len() > MAX_MANIFEST_KEYS {
             return Err(TitoError::IndexError(
                 "Restore metadata exceeds 10000 keys".into(),
             ));
@@ -414,18 +697,25 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                 "Restore primary identity differs from its key".into(),
             ));
         }
-        let indexes = self.get_index_keys(primary_key.clone(), &stored, &value)?;
-        let declared: std::collections::HashSet<_> = metadata.value.iter().collect();
-        let computed: std::collections::HashSet<_> = indexes.iter().map(|(key, _)| key).collect();
+        let mut owned = self.get_index_keys(primary_key.clone(), &stored, &value)?;
+        for (key, reference) in self.declared_references(id, &stored)? {
+            let incoming = self.incoming_value(id, &reference)?;
+            owned.push((key, incoming));
+        }
+        if let Some(marker) = self.declared_marker(id, &stored) {
+            owned.push((marker, Value::Bool(true)));
+        }
+        let declared: HashSet<_> = metadata.value.iter().collect();
+        let computed: HashSet<_> = owned.iter().map(|(key, _)| key).collect();
         if declared.len() != metadata.value.len()
-            || computed.len() != indexes.len()
+            || computed.len() != owned.len()
             || declared != computed
         {
             return Err(TitoError::IndexError(
-                "Restore metadata differs from current model indexes".into(),
+                "Restore metadata differs from current model indexes and references".into(),
             ));
         }
-        for (key, _) in &indexes {
+        for (key, _) in &owned {
             if let Some(index) = Self::unique_index_name(key) {
                 if let Some(bytes) = tx.get(key).await? {
                     let owner: T = serde_json::from_slice(&bytes)
@@ -441,7 +731,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         }
         tx.put(primary_key, primary).await?;
         tx.put(reverse_key, reverse).await?;
-        for (key, value) in indexes {
+        for (key, value) in owned {
             self.put_value(key, &value, tx).await?;
         }
         Ok(stored)
@@ -482,13 +772,13 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         let Some(bytes) = tx.get(&reverse_key).await? else {
             return Ok(false);
         };
-        if bytes.len() > 1_048_576 {
+        if bytes.len() > MAX_MANIFEST_BYTES {
             return Err(TitoError::IndexError(
                 "Index assertion metadata exceeds one MiB".to_string(),
             ));
         }
         let reverse = self.deserialize_reverse_index(&reverse_key, &bytes)?;
-        if reverse.value.len() > 10_000 {
+        if reverse.value.len() > MAX_MANIFEST_KEYS {
             return Err(TitoError::IndexError(
                 "Index assertion metadata exceeds 10000 keys".to_string(),
             ));
@@ -614,11 +904,28 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             self.value_with_options(&payload, timestamps, old_index_keys.is_none())?;
 
         let all_index_data = self.get_index_keys(id.clone(), &payload, &stored_value)?;
-        let index_json_key = ReverseIndex {
-            value: all_index_data.iter().map(|(key, _)| key.clone()).collect(),
+        let references = self.declared_references(&raw_id, &payload)?;
+        let marker = self.declared_marker(&raw_id, &payload);
+        let mut manifest_keys: Vec<String> =
+            all_index_data.iter().map(|(key, _)| key.clone()).collect();
+        manifest_keys.extend(references.keys().cloned());
+        manifest_keys.extend(marker.iter().cloned());
+        let manifest = ReverseIndex {
+            value: manifest_keys,
             version: TitoRecordVersion::from_transaction(tx.start_version())?,
         };
-        let reverse_value = self.value_with_options(index_json_key, false, true)?;
+        let reverse_bytes = self.manifest_bytes(&id, &manifest)?;
+        let old_reference_keys: HashSet<String> = old_index_keys
+            .as_ref()
+            .map(|metadata| {
+                metadata
+                    .value
+                    .iter()
+                    .filter(|key| Self::is_reference_state_key(key))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
 
         for (key, _) in &all_index_data {
             if let Some(index) = Self::unique_index_name(key) {
@@ -643,8 +950,18 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             }
         }
 
+        let fences = self
+            .check_reference_targets(&references, &old_reference_keys, tx)
+            .await?;
+
         if let Some(old_index_keys) = old_index_keys {
             for key in old_index_keys.value {
+                if Self::is_reference_state_key(&key) {
+                    if !references.contains_key(&key) && marker.as_ref() != Some(&key) {
+                        self.delete(key, tx).await?;
+                    }
+                    continue;
+                }
                 if Self::unique_index_name(&key).is_some()
                     && !self.validate_unique_owner(&key, &raw_id, tx).await?
                 {
@@ -658,11 +975,25 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             self.delete(reverse_key.clone(), tx).await?;
         }
 
+        for fence in fences {
+            self.delete(fence, tx).await?;
+        }
         self.put_value(id, &stored_value, tx).await?;
         for (key, value) in all_index_data {
             self.put_value(key, &value, tx).await?;
         }
-        self.put_value(reverse_key, &reverse_value, tx).await?;
+        for (key, reference) in &references {
+            if !old_reference_keys.contains(key) {
+                let incoming = self.incoming_value(&raw_id, reference)?;
+                self.put_value(key.clone(), &incoming, tx).await?;
+            }
+        }
+        if let Some(marker) = marker {
+            if !old_reference_keys.contains(&marker) {
+                self.put_value(marker, &Value::Bool(true), tx).await?;
+            }
+        }
+        tx.put(reverse_key, reverse_bytes).await?;
 
         serde_json::from_value(stored_value).map_err(|e| {
             TitoError::DeserializationFailed(format!("Failed to deserialize stored value: {}", e))
@@ -974,15 +1305,47 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
     pub async fn remove(&self, raw_id: &str, tx: &E::Transaction) -> Result<bool, TitoError> {
         let id = format!("{}:{}", self.get_table(), raw_id);
-        let reverse_index_key = format!("reverse-index:{}", id);
 
         let mut keys = match self.load_index_state(&id, tx).await? {
             Some(metadata) => metadata.value,
             None => return Err(TitoError::NotFound(format!("Entity not found: {}", id))),
         };
 
-        keys.push(id.clone());
-        keys.push(reverse_index_key);
+        let by = self
+            .incoming_references(raw_id, Some(MAX_REFUSAL_REFERENCES), tx)
+            .await?;
+        if !by.is_empty() {
+            return Err(TitoError::Referenced {
+                table: T::table(),
+                id: raw_id.to_string(),
+                by,
+            });
+        }
+
+        keys.push(deleting_marker_key(&T::table(), raw_id));
+        self.remove_keys(&id, raw_id, keys, tx).await
+    }
+
+    pub async fn erase(&self, key: String, tx: &E::Transaction) -> Result<bool, TitoError> {
+        let id = format!("{}:{}", self.get_table(), key);
+
+        let keys = match self.load_index_state(&id, tx).await? {
+            Some(metadata) => metadata.value,
+            None => return Err(TitoError::NotFound(format!("Entity not found: {}", id))),
+        };
+
+        self.remove_keys(&id, &key, keys, tx).await
+    }
+
+    async fn remove_keys(
+        &self,
+        id: &str,
+        raw_id: &str,
+        mut keys: Vec<String>,
+        tx: &E::Transaction,
+    ) -> Result<bool, TitoError> {
+        keys.push(id.to_string());
+        keys.push(format!("reverse-index:{}", id));
 
         for key in &keys {
             if Self::unique_index_name(key).is_some()

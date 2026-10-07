@@ -17,6 +17,8 @@ pub mod query;
 mod key_encoder;
 pub use key_encoder::encode_index_integer;
 
+mod reference;
+
 mod error;
 
 mod event;
@@ -31,7 +33,10 @@ mod test_support;
 mod tito_tests;
 
 pub use error::TitoError;
-pub use types::{PartitionConfig, TitoEngine, TitoModelOptions, TitoModelTrait, PARTITION_DIGITS};
+pub use types::{
+    PartitionConfig, TitoEngine, TitoIncomingReference, TitoModelOptions, TitoModelTrait,
+    TitoReference, PARTITION_DIGITS,
+};
 
 pub use queue::{
     run_cluster_worker, ClusterCoordinatorLease, ClusterPartitionAssignment, ClusterWorkerConfig,

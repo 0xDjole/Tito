@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use tito::{
     types::{
         DBUuid, TitoEngine, TitoIndexConfig, TitoIndexField, TitoIndexFieldType, TitoModelTrait,
+        TitoReference,
     },
     TiKV, TitoError, TitoModelOptions,
 };
@@ -23,6 +24,14 @@ impl TitoModelTrait for User {
                 r#type: TitoIndexFieldType::String,
             }],
         }]
+    }
+
+    fn references(&self) -> Vec<TitoReference> {
+        Vec::new()
+    }
+
+    fn is_deleting(&self) -> bool {
+        false
     }
 
     fn table() -> String {

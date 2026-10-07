@@ -51,6 +51,14 @@ impl TitoModelTrait for ComputedRecord {
         self.id.clone()
     }
 
+    fn references(&self) -> Vec<TitoReference> {
+        Vec::new()
+    }
+
+    fn is_deleting(&self) -> bool {
+        false
+    }
+
     fn table() -> String {
         "computed-records".to_string()
     }

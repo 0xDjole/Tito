@@ -815,3 +815,78 @@ async fn map_indexes_include_map_entry_keys_in_index_key() {
         .iter()
         .any(|key| key.contains("metadata:channel.web:table:posts:p1")));
 }
+
+#[tokio::test]
+async fn a_map_entry_is_found_by_its_key_and_value_whatever_the_key_case() {
+    let engine = engine();
+    save_post(
+        &engine,
+        Post {
+            metadata: HashMap::from([("en-US".to_string(), "spring-menu".to_string())]),
+            ..post("p1", "a1", vec![])
+        },
+    )
+    .await;
+    let model = engine.clone().model::<Post>(TitoModelOptions::default());
+
+    let mut query = model.query_by_index("post-by-metadata");
+    let found = query
+        .value("en-US.spring-menu")
+        .execute(None)
+        .await
+        .unwrap();
+
+    assert_eq!(found.items.len(), 1);
+    assert_eq!(found.items[0].id, "p1");
+    assert_eq!(
+        engine
+            .keys_with_prefix("index:post-by-metadata:metadata:en-us.spring-menu:")
+            .await
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn identical_index_keys_of_one_record_are_written_once() {
+    let engine = engine();
+    let mut item = post("p1", "a1", vec!["t1".to_string(), "t1".to_string()]);
+    item.metadata = HashMap::from([
+        ("en-US".to_string(), "spring-menu".to_string()),
+        ("en-us".to_string(), "spring-menu".to_string()),
+    ]);
+    save_post(&engine, item).await;
+    let model = engine.clone().model::<Post>(TitoModelOptions::default());
+
+    let manifest = engine
+        .raw_json("reverse-index:table:posts:p1")
+        .await
+        .unwrap()["value"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|key| key.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    let mut unique = manifest.clone();
+    unique.sort();
+    unique.dedup();
+
+    assert_eq!(unique.len(), manifest.len());
+    assert_eq!(
+        manifest
+            .iter()
+            .filter(|key| key.starts_with("index:post-by-metadata:metadata:en-us.spring-menu:"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        manifest
+            .iter()
+            .filter(|key| key.starts_with("index:post-by-tag:tag_ids:t1:"))
+            .count(),
+        1
+    );
+    let tx = engine.begin_transaction().await.unwrap();
+    model.rebuild_indexes_for_restore("p1", &tx).await.unwrap();
+    crate::types::TitoTransaction::commit(tx).await.unwrap();
+}

@@ -5,8 +5,9 @@ use crate::queue::{
 use crate::test_support::MemoryEngine;
 use crate::types::{
     PartitionConfig, TitoCursor, TitoEngine, TitoFindByIndexPayload, TitoFindOneByIndexPayload,
-    TitoFindPayload, TitoId, TitoIndexConfig, TitoIndexField, TitoIndexFieldType, TitoModelOptions,
-    TitoModelTrait, TitoPaginated, TitoScanPayload,
+    TitoFindPayload, TitoId, TitoIncomingReference, TitoIndexConfig, TitoIndexField,
+    TitoIndexFieldType, TitoModelOptions, TitoModelTrait, TitoPaginated, TitoReference,
+    TitoScanPayload,
 };
 use crate::utils::{
     key_after, key_after_bytes, next_string_lexicographically, prefix_end, prefix_end_bytes,
@@ -118,6 +119,14 @@ impl TitoModelTrait for Author {
         ]
     }
 
+    fn references(&self) -> Vec<TitoReference> {
+        Vec::new()
+    }
+
+    fn is_deleting(&self) -> bool {
+        false
+    }
+
     fn table() -> String {
         "authors".to_string()
     }
@@ -171,6 +180,14 @@ impl TitoModelTrait for UniqueAccount {
         }]
     }
 
+    fn references(&self) -> Vec<TitoReference> {
+        Vec::new()
+    }
+
+    fn is_deleting(&self) -> bool {
+        false
+    }
+
     fn table() -> String {
         "unique-accounts".to_string()
     }
@@ -214,6 +231,14 @@ impl TitoModelTrait for Tag {
                 r#type: TitoIndexFieldType::String,
             }],
         }]
+    }
+
+    fn references(&self) -> Vec<TitoReference> {
+        Vec::new()
+    }
+
+    fn is_deleting(&self) -> bool {
+        false
     }
 
     fn table() -> String {
@@ -290,6 +315,14 @@ impl TitoModelTrait for Post {
                 }],
             },
         ]
+    }
+
+    fn references(&self) -> Vec<TitoReference> {
+        Vec::new()
+    }
+
+    fn is_deleting(&self) -> bool {
+        false
     }
 
     fn table() -> String {
@@ -458,3 +491,4 @@ mod index_restore;
 mod model;
 mod numeric_index;
 mod queue;
+mod reference;

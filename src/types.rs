@@ -183,11 +183,49 @@ pub struct TitoRelIndexConfig {
     pub field: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TitoReference {
+    pub table: String,
+    pub id: String,
+    pub path: String,
+}
+
+impl TitoReference {
+    pub fn new(table: impl Into<String>, id: impl Into<String>, path: impl Into<String>) -> Self {
+        Self {
+            table: table.into(),
+            id: id.into(),
+            path: path.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TitoIncomingReference {
+    pub table: String,
+    pub id: String,
+    pub path: String,
+}
+
+impl TitoIncomingReference {
+    pub fn new(table: impl Into<String>, id: impl Into<String>, path: impl Into<String>) -> Self {
+        Self {
+            table: table.into(),
+            id: id.into(),
+            path: path.into(),
+        }
+    }
+}
+
 pub trait TitoModelTrait {
     fn indexes(&self) -> Vec<TitoIndexConfig>;
     fn unique_indexes(&self) -> Vec<TitoIndexConfig> {
         Vec::new()
     }
+    fn references(&self) -> Vec<TitoReference>;
+    fn is_deleting(&self) -> bool;
     fn table() -> String;
     fn id(&self) -> String;
 

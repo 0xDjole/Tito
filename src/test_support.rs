@@ -17,6 +17,13 @@ pub(crate) struct MemoryEngine {
     next_transaction_version: Arc<AtomicU64>,
     pending_queue_scans: Arc<AtomicU64>,
     recorded_reads: Arc<Mutex<Option<Vec<Vec<u8>>>>>,
+    recorded_writes: Arc<Mutex<Option<Vec<RecordedWrite>>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RecordedWrite {
+    Put(String),
+    Delete(String),
 }
 
 #[derive(Clone)]
@@ -28,6 +35,7 @@ pub(crate) struct MemoryTransaction {
     start_version: u64,
     pending_queue_scans: Arc<AtomicU64>,
     recorded_reads: Arc<Mutex<Option<Vec<Vec<u8>>>>>,
+    recorded_writes: Arc<Mutex<Option<Vec<RecordedWrite>>>>,
 }
 
 impl MemoryEngine {
@@ -37,6 +45,14 @@ impl MemoryEngine {
 
     pub(crate) async fn take_recorded_reads(&self) -> Vec<Vec<u8>> {
         self.recorded_reads.lock().await.take().unwrap_or_default()
+    }
+
+    pub(crate) async fn start_recording_writes(&self) {
+        *self.recorded_writes.lock().await = Some(Vec::new());
+    }
+
+    pub(crate) async fn take_recorded_writes(&self) -> Vec<RecordedWrite> {
+        self.recorded_writes.lock().await.take().unwrap_or_default()
     }
 
     pub(crate) async fn put_raw_bytes(&self, key: Vec<u8>, value: Vec<u8>) {
@@ -106,6 +122,7 @@ impl TitoEngine for MemoryEngine {
             start_version,
             pending_queue_scans: self.pending_queue_scans.clone(),
             recorded_reads: self.recorded_reads.clone(),
+            recorded_writes: self.recorded_writes.clone(),
         })
     }
 
@@ -168,6 +185,11 @@ impl TitoTransaction for MemoryTransaction {
         key: K,
         value: V,
     ) -> Result<(), TitoError> {
+        if let Some(writes) = self.recorded_writes.lock().await.as_mut() {
+            writes.push(RecordedWrite::Put(
+                String::from_utf8_lossy(key.as_ref()).into_owned(),
+            ));
+        }
         self.local
             .lock()
             .await
@@ -176,6 +198,11 @@ impl TitoTransaction for MemoryTransaction {
     }
 
     async fn delete<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<(), TitoError> {
+        if let Some(writes) = self.recorded_writes.lock().await.as_mut() {
+            writes.push(RecordedWrite::Delete(
+                String::from_utf8_lossy(key.as_ref()).into_owned(),
+            ));
+        }
         self.local.lock().await.remove(key.as_ref());
         Ok(())
     }

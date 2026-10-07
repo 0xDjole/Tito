@@ -1,3 +1,4 @@
+use crate::types::TitoIncomingReference;
 use thiserror::Error;
 
 #[derive(Error, Debug, PartialEq, Eq)]
@@ -44,6 +45,27 @@ pub enum TitoError {
     #[error("Unique index '{index}' on model '{model}' is already owned")]
     UniqueViolation { model: String, index: String },
 
+    #[error("Record '{table}:{id}' is still referenced by {}", describe_incoming_references(.by))]
+    Referenced {
+        table: String,
+        id: String,
+        by: Vec<TitoIncomingReference>,
+    },
+
+    #[error("Reference at '{path}' points at missing record '{table}:{id}'")]
+    ReferenceMissing {
+        table: String,
+        id: String,
+        path: String,
+    },
+
+    #[error("Reference at '{path}' points at record '{table}:{id}', which is being deleted")]
+    ReferenceDeleting {
+        table: String,
+        id: String,
+        path: String,
+    },
+
     #[error("Relationship error: {0}")]
     RelationshipError(String),
 
@@ -64,6 +86,19 @@ pub enum TitoError {
 
     #[error("Configuration error: {0}")]
     Configuration(String),
+}
+
+fn describe_incoming_references(references: &[TitoIncomingReference]) -> String {
+    references
+        .iter()
+        .map(|reference| {
+            format!(
+                "{} {} ({})",
+                reference.table, reference.id, reference.path
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl TitoError {
