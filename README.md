@@ -258,6 +258,24 @@ same moment also conflict, and one retries. A save that only keeps its pointers 
 
 ## Storage integrity and pagination
 
+`model.replace_many(Vec<(expected, next)>).timestamps(false).execute(&tx)` replaces existing
+records of one model in the caller's transaction. Every source must still equal its complete
+expected serialized record, and each replacement keeps its source ID. The method validates and
+serializes the complete batch before staging any write. Unique keys may move between included
+sources, including swap cycles; a final duplicate key or an owner outside the batch is refused.
+References use the batch's final target states: existing links may remain while a target becomes
+Deleting, but a new link cannot point at a final Deleting target. External target checks retain
+the normal deleting-marker conflict fences. Each source primary is replaced, fencing concurrent
+source changes, and all manifests receive the transaction's record version. Timestamp handling
+matches `set`; pass `timestamps(false)` to retain application-authored times.
+
+A batch contains 1–100 distinct existing records. Its combined old and prepared storage keys
+must fit 10,000 keys, and its prepared writes and deletion keys must fit 8 MiB. Invalid input,
+stale expected records, ownership conflicts, missing or deleting targets, and serialization errors
+are returned before the batch writes anything. A later transaction failure rolls back the whole
+batch with its caller's other changes. This operation does not create records or assign temporary
+unique values.
+
 Each persisted model row has a matching `reverse-index:{primary-key}` manifest containing its
 required record `version` and index-key `value` array, including models with no secondary indexes.
 Primary, metadata and secondary indexes commit atomically. The manifest may name ordinary `index:` keys ending in that exact

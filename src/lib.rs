@@ -6,7 +6,10 @@ pub mod types;
 
 mod base;
 
-pub use base::{GetBuilder, GetManyBuilder, SetBuilder, TitoModel};
+pub use base::{
+    GetBuilder, GetManyBuilder, ReplaceManyBuilder, SetBuilder, TitoModel, MAX_REPLACE_MANY_BYTES,
+    MAX_REPLACE_MANY_KEYS, MAX_REPLACE_MANY_RECORDS,
+};
 
 mod utils;
 

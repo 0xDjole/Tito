@@ -30,6 +30,11 @@ const MAX_MANIFEST_BYTES: usize = 1_048_576;
 const MAX_REFUSAL_REFERENCES: usize = 20;
 const REFERENCE_SCAN_BATCH: u32 = 256;
 
+mod batch;
+pub use batch::{
+    ReplaceManyBuilder, MAX_REPLACE_MANY_BYTES, MAX_REPLACE_MANY_KEYS, MAX_REPLACE_MANY_RECORDS,
+};
+
 #[derive(Clone)]
 pub struct TitoModel<E: TitoEngine, T> {
     pub engine: E,
