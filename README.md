@@ -589,13 +589,18 @@ queue:owner:{base64url(type)}:{base64url(id)}:{status_type}:{base64url(queue_sto
 
 ## Verification
 
-Run the complete crate checks from this repository while an explicitly owned disposable native
-PD/TiKV runtime is available. Set `TITO_NATIVE_PD_URI` to that runtime's loopback `host:port` and
-`TITO_NATIVE_RUN_ID` to its `run-` identity; the native case refuses undeclared infrastructure.
+Run the complete verification command from this repository. It prepares an explicitly owned
+disposable native PD/TiKV runtime and supplies `TITO_NATIVE_PD_URI` as its loopback `host:port` and
+`TITO_NATIVE_RUN_ID` as its `run-` identity; the native cases still refuse undeclared infrastructure.
 
 ```sh
-cargo test --locked --all-targets
+python3 scripts/verify.py
 ```
+
+The wrapper runs the complete `cargo test --locked --all-targets` phase, the vendored PD owner's
+eight reconnect regressions and two retained controls, and the actual three-member PD leadership
+transfer witness. Every phase is required. See [complete verification](docs/verification.md) for
+prerequisites, source holds, native ownership, cleanup and retained evidence.
 
 The library cases use the in-memory engine and cover model/index writes, reference keys, refusals
 and fences, queue transitions, exact
