@@ -23,6 +23,7 @@ pub(crate) const DEFAULT_HANDLER_TIMEOUT: Duration = Duration::from_secs(10 * 60
 pub struct WorkerConfig {
     pub partition_range: std::ops::Range<u32>,
     pub handler_timeout: Duration,
+    pub poll_interval: Duration,
 }
 
 impl WorkerConfig {
@@ -30,6 +31,7 @@ impl WorkerConfig {
         Self {
             partition_range,
             handler_timeout: DEFAULT_HANDLER_TIMEOUT,
+            poll_interval: WORKER_POLL_INTERVAL,
         }
     }
 }
@@ -176,6 +178,7 @@ where
             let h = handler.clone();
             let mut rx = shutdown.resubscribe();
             let handler_timeout = config.handler_timeout;
+            let poll_interval = config.poll_interval;
 
             handles.push(tokio::spawn(async move {
                 let mut cursor: Option<QueuePullCursor> = None;
@@ -184,7 +187,7 @@ where
                         _ = rx.recv() => break,
                         result = q.pull::<T>(partition, cursor.clone(), 50) => result,
                     };
-                    match page {
+                    let pull_now = match page {
                         Ok(page) => {
                             cursor = page.next_cursor;
                             let mut shutting_down = false;
@@ -207,14 +210,19 @@ where
                             if shutting_down {
                                 break;
                             }
+                            cursor.is_some()
                         }
                         Err(error) => {
                             log::error!("Failed to pull queue partition {}: {}", partition, error);
+                            false
                         }
+                    };
+                    if pull_now {
+                        continue;
                     }
                     tokio::select! {
                         _ = rx.recv() => break,
-                        _ = sleep(WORKER_POLL_INTERVAL) => {}
+                        _ = sleep(poll_interval) => {}
                     }
                 }
             }));

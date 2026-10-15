@@ -1,8 +1,3 @@
-/// Returns the exclusive byte-range endpoint for every key beginning with `prefix`.
-///
-/// This is deliberately different from [`key_after`]. A prefix endpoint advances
-/// the last possible byte and truncates the suffix, while an after-key bound appends
-/// a zero byte so that no keys between two adjacent-looking strings are skipped.
 pub fn prefix_end(prefix: String) -> String {
     let mut chars = prefix.chars().collect::<Vec<_>>();
 
@@ -20,21 +15,9 @@ pub fn prefix_end(prefix: String) -> String {
     String::new()
 }
 
-/// Returns an inclusive lower bound that sorts immediately after `key` itself.
-///
-/// Appending NUL is the correct continuation for a half-open scan: it excludes the
-/// exact key while retaining keys such as `a20` after a cursor at `a2`.
 pub fn key_after(mut key: String) -> String {
     key.push('\0');
     key
-}
-
-/// Historical name retained for source compatibility.
-///
-/// This function has prefix-range semantics. New code should call [`prefix_end`]
-/// when closing a prefix range and [`key_after`] when continuing after an exact key.
-pub fn next_string_lexicographically(payload: String) -> String {
-    prefix_end(payload)
 }
 
 pub(crate) fn prefix_end_bytes(prefix: &[u8]) -> Option<Vec<u8>> {

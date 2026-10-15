@@ -10,6 +10,9 @@ A database layer on TiKV with indexing, transactions, and a built-in partitioned
   key per pointer, refuses to remove a record while anything points at it, and lists who does
 - **Transactions**: Full ACID transactions
 - **Query Builder**: Fluent API for querying by index
+- **Transactional Publication**: Queue events can be written atomically with application data
+- **Partitioned Queue**: Horizontal scaling via fixed business-key partitions
+- **Event Timestamps**: Each event says when it becomes runnable
 
 Indexes are sparse. Tito writes an index key only when every configured field contains a value of
 the configured type. Missing fields, JSON `null`, empty strings, empty collections, and values of a
@@ -27,8 +30,14 @@ zero, fractional or exponent notation, whitespace, or out-of-range values.
 result as exactly 20 decimal digits. Byte ordering therefore matches signed integer ordering,
 including negative values, zero, and decimal-width boundaries. Use this exported encoder for
 manual numeric range endpoints; never pad the original integer directly. Half-open scans and exact
-cursor continuation retain their existing semantics. String index encoding and opaque record IDs
-are unchanged.
+cursor continuation retain their existing semantics.
+
+String index values are stored exactly. `encode_index_string(&str)` escapes `\` as `\\` and `:` as
+`\:` and keeps every other character as it is: no case folding, trimming or word splitting. Values
+that differ only by case or spacing, such as `ABC`, `abc` and ` abc `, are different values in
+ordinary and unique indexes, and a lookup finds only the exact value. A map field's entry is
+encoded as `{key}.{value}` and a numeric map entry's key goes through the same encoder. Use this
+exported encoder for manual string range endpoints. Opaque record IDs are unchanged.
 
 Ordinary indexes are declared by `indexes`; their keys include the primary record identity and may
 have many owners. Exclusive value ownership is declared separately by `unique_indexes`; its key
@@ -37,19 +46,21 @@ claim therefore conflicts on one real ownership key and returns `TitoError::Uniq
 without exposing the indexed value. `find_one_by_unique_index` performs an exact key read and then
 loads the authoritative primary record. Conditional unique indexes are omitted when their model
 instance sets `condition` to false.
-- **Transactional Publication**: Queue events can be written atomically with application data
-- **Partitioned Queue**: Horizontal scaling via stable business-key partitions
-- **Event Timestamps**: Each event says when it becomes runnable
 
 ## TiKV client dependency
 
-Tito's normal dependency selects [getwyrd/client-rust
+Tito vendors its TiKV client in `vendor/tikv-client` and depends on it by path with default features
+disabled. The vendored tree is [getwyrd/client-rust
 55cd29b2ec9ad9f04d312e18a5ed8f6393fe219e](https://github.com/getwyrd/client-rust/commit/55cd29b2ec9ad9f04d312e18a5ed8f6393fe219e)
-with default features disabled. This immutable merge retains both [upstream primary-commit
+with one changed file, `src/pd/retry.rs` (a failed PD request waits for a replaced connection after
+the reconnect throttle while keeping the existing request and connection budgets), and one added
+test file; `vendor/tikv-client/UPSTREAM-PROVENANCE.json` records every file hash. The base merge
+retains both [upstream primary-commit
 ambiguity handling](https://github.com/tikv/client-rust/commit/337c710451e4078b8014dd6661fb84f2335c5eec)
 and [expired missing-primary lock recovery](https://github.com/getwyrd/client-rust/commit/a7fba928e5712922fa95a497c52552e141afbd41),
 including both native per-key error wrappers. The client uses Tonic 0.12 and the HTTP/2 0.4
-dependency chain. Consumers need no client patch or locally copied client source.
+dependency chain. A consumer receives the vendored client through Tito's own path dependency,
+including when it patches Tito to a local checkout; it needs no separate client patch.
 
 Primary-commit transport/status loss and native undetermined region responses remain ambiguous.
 Tito returns `CommitOutcomeUnknown` without replaying or rolling back that transaction. An expired
@@ -67,9 +78,10 @@ declared for an older client that lacks these fixes.
 use tito::backend::tikv::TiKV;
 
 let db = TiKV::connect(vec!["127.0.0.1:2379"]).await?;
-
-let db = TiKV::connect_with_partitions(vec!["127.0.0.1:2379"], 1024).await?;
 ```
+
+Queue partitions are configured on the queue (`QueueConfig::new(partitions, retention)`), not on
+the connection.
 
 ## Model Definition
 
@@ -122,16 +134,21 @@ at nothing returns an empty list, and a model with no deleting state returns `fa
 ## CRUD Operations
 
 ```rust
-let users = db.clone().model::<User>();
+use tito::{TitoEngine, TitoModelOptions};
 
-db.transaction(|tx| async move {
-    users.build_with_options(user, TitoOptions::with_events(TitoOperation::Insert), &tx).await
-}).await?;
+let users = db.clone().model::<User>(TitoModelOptions::default());
 
-let user = users.find_by_id(&id, vec![]).await?;
+db.transaction(|tx| {
+    let users = users.clone();
+    let user = user.clone();
+    async move { users.set(user).timestamps(false).execute(&tx).await }
+})
+.await?;
+
+let user = users.get(&id).execute(None).await?;
 
 let mut query = users.query_by_index("by_email");
-let results = query.value(&email).limit(Some(10)).execute().await?;
+let results = query.value(email.as_str()).limit(Some(10)).execute(None).await?;
 ```
 
 Tito reads and writes one model at a time. Applications load related records explicitly so their
@@ -317,14 +334,28 @@ let end = tito::prefix_end("index:by_store:store_id:abc:".to_string());
 let after = tito::key_after("index:by_store:store_id:abc:table:item:42".to_string());
 ```
 
-`next_string_lexicographically` remains an alias for `prefix_end` for source compatibility. It must
-not be used to continue after an exact key because advancing the final character can skip keys such
-as `a20` after `a2`.
+`prefix_end` closes a prefix range; it must not be used to continue after an exact key because
+advancing the final character can skip keys such as `a20` after `a2`. Use `key_after` for that.
 
-Secondary index values intentionally remain complete clones of the primary JSON document in
-0.16.2. This preserves the existing storage wire format and query behavior. Removing that
-redundancy requires a separately designed release that rehydrates primary rows and migrates every
-existing index; it is not part of this correctness patch.
+Secondary index values intentionally remain complete clones of the primary JSON document. This
+preserves the existing storage wire format and query behavior. Removing that redundancy requires a
+separately designed release that rehydrates primary rows and migrates every existing index.
+
+### 0.18.3 exact index values, fixed partitions and bounded reads
+
+- String index values are encoded exactly by `encode_index_string`: only `\` and `:` are escaped.
+  Before, values were lowercased, trimmed and split at camel-case humps, so `ABC` and `abc` shared
+  one unique value and a lookup of one returned the other. Index keys of values with capitals,
+  surrounding whitespace or camel-case humps change, and so do keys of queue cluster nodes; reset
+  and reseed, or save those records again. Numeric map-entry keys are now escaped too.
+- Queue partitions come from `queue_partition_for_key`, a fixed FNV-1a hash, instead of the Rust
+  standard library's hasher, which may change between Rust releases. Pending rows published by
+  0.18.2 can sit in another partition than their key's new events; drain or reset the queue before
+  upgrading.
+- `next_string_lexicographically` is removed; call `prefix_end`.
+- TiKV scans and batch gets are bounded by bytes as well as rows (see Queue Processing).
+- Workers pull the next page at once while a pass has more rows. `WorkerConfig` gains
+  `poll_interval`.
 
 ### 0.18.2 references
 
@@ -466,11 +497,24 @@ Handlers return `QueueHandlerResult<T>`, an alias for `Result<QueueHandlerOutcom
 Each event's own timestamp determines when it becomes runnable. Tito indexes that timestamp but never chooses or changes it. A domain that needs another invocation supplies a replacement event carrying the desired timestamp; Tito only commits the complete-and-insert transaction. `Reschedule` requires the logical event ID, partition key, owner, and payload to remain identical, so only the timestamp may change. `QueueEvent::rescheduled` constructs that replacement. `Advance` also preserves the ID, key, and owner, but requires the typed payload to change; its replacement timestamp remains application-owned. In both cases the completed row retains the exact prior payload while the new Pending row carries the replacement. Provider leases and processing deadlines belong only to domain records.
 
 Every new invocation must serialize to at most `MAX_QUEUE_EVENT_BYTES` (1 MiB). Publication rejects
-larger events before writing anything. Queue range reads preserve their public logical page size while fetching at most 16
-invocations per datastore scan. Tito configures both TiKV clients with a 32 MiB decoding budget, so
-the maximum 16 MiB of valid invocation bytes has at least 2x transport headroom for completed-status
-metadata, keys, and protobuf framing. This keeps one logical page from becoming one unbounded RPC
-without turning a 50-event worker pull into dozens of sequential datastore calls.
+larger events before writing anything. Queue range reads preserve their public logical page size while
+asking the engine for at most 16 invocations per scan.
+
+The TiKV engine bounds every read by bytes as well as rows, for models, indexes, references and the
+queue alike. A scan is fetched as a sequence of datastore requests:
+
+- the first request asks for at most `SCAN_RPC_FIRST_ROWS` (16) rows;
+- each later request asks for as many rows as fit `SCAN_RPC_BYTES` (4 MiB) at the size of the
+  largest row of the previous request, between 1 and `SCAN_RPC_MAX_ROWS` (4,096);
+- a request that TiKV or the client refuses for its message size (gRPC `RESOURCE_EXHAUSTED` or
+  `OUT_OF_RANGE`) is repeated with half the rows; a single row larger than the transport limit
+  fails the read with the transport error.
+
+A batch get that is refused for its size is split in halves the same way. Callers still receive
+exactly the rows they asked for, in order. Tito's client decodes responses up to 32 MiB. A TiKV that
+limits its responses below that (`server.max-grpc-send-msg-len`) only costs refused round trips
+before a request is halved; setting the limit to 32 MiB keeps a first request of 16 rows of 1 MiB
+in one round trip.
 
 ```rust
 use std::sync::Arc;
@@ -518,11 +562,21 @@ or Completed keys and the predicate can preserve a currently executing lifecycle
 type and ID are opaque, non-empty strings bounded to 512 bytes each. They are routing/erasure
 metadata, not provider identity or domain state.
 
+A worker keeps pulling while its pass has more rows: after a full page it pulls the next page at once.
+It waits its poll interval only after a pass ends or a pull fails. `WorkerConfig::new` polls every
+second and `ClusterWorkerConfig::new` every 500 ms; both expose `poll_interval`.
+
 Workers supervise each handler with a ten-minute timeout by default. Configure `handler_timeout` when a workload has a different bounded execution contract; the timeout is executor protection and never changes queue state or provider policy.
 Worker shutdown stops new pulls and handler starts, then drains every handler that already started
 and applies its outcome before joining. The configured handler timeout bounds that drain. A handler
 error, panic, timeout, lost worker, lost cluster partition lease, or queue-outcome storage failure
 leaves the exact invocation Pending.
+
+Each event's partition is `queue_partition_for_key(&event.key, partition_count)`: the 64-bit FNV-1a
+hash of the key's UTF-8 bytes (offset basis `0xcbf29ce484222325`, prime `0x100000001b3`) modulo
+the partition count. The hash is part of the storage contract and does not depend on the Rust
+release, so a key's events stay in one partition across upgrades while the partition count is
+unchanged. Publishers and workers must use the same partition count.
 
 Partition polling is fair across due rows. Pending storage keys are ordered as
 `queue:pending:{partition:04}:{encode_index_integer(timestamp)}:{enqueue_version:020}:{event_id}`. The enqueue version is
@@ -567,18 +621,6 @@ from 0.16.3 therefore requires no queue storage migration.
 
 For the prelaunch cutover, stop publishers and workers, use the source release to drain Pending and clear its Failed/DLQ keyspaces, verify Pending is empty, deploy the replacement environment, and then restart publication and processing. A future nonempty production environment requires an explicit, separately named bridge release before this queue contract is enabled.
 
-## Future Events
-
-```rust
-fn events(&self) -> Vec<TitoEventConfig> {
-    let in_one_hour = chrono::Utc::now().timestamp_millis() + 3_600_000;
-    vec![TitoEventConfig {
-        name: "reminder".to_string(),
-        timestamp: in_one_hour,
-    }]
-}
-```
-
 ## Event Key Format
 
 ```
@@ -602,14 +644,19 @@ eight reconnect regressions and two retained controls, and the actual three-memb
 transfer witness. Every phase is required. See [complete verification](docs/verification.md) for
 prerequisites, source holds, native ownership, cleanup and retained evidence.
 
-The library cases use the in-memory engine and cover model/index writes, reference keys, refusals
-and fences, queue transitions, exact
+The library cases use the in-memory engine and cover model/index writes, exact index values,
+reference keys, refusals and staged fence writes, queue transitions, fixed partitions, exact
 signed millisecond scheduling and completion, exact inclusive cutoff buckets and signed extrema,
-configured retention, cluster ownership and leases, worker shutdown, and ambiguous transaction
-outcomes. `tikv_native_orphan_lock_test` creates a real secondary lock after a definite primary
+configured retention, cluster ownership and leases, worker paging and shutdown, and ambiguous
+transaction outcomes. `tikv_native_orphan_lock_test` creates a real secondary lock after a definite primary
 prewrite conflict, waits for its observed native TTL, proves the missing-primary branch through a
 normal Tito read, and verifies recovery preserves the winning primary. It removes only its own
-two UUID-scoped keys. Examples are compiled but not run against a live database.
+two UUID-scoped keys. `tikv_native_large_rows_test` reads 40 records of 1 MiB, more than the
+client's 32 MiB decoding budget, through scans, index pages and a batch get, and pulls 16 queue
+events of almost 1 MiB. `tikv_native_fence_test` proves on real TiKV that reference fences, `assert_current`,
+`assert_version` and unique claims conflict at commit, and that unique values differing only by
+case or spacing coexist. The in-memory engine never detects conflicts, so conflict behaviour is
+proven only by these native cases. Examples are compiled but not run against a live database.
 
 Application-level primary-commit response loss, provider effects, backup and restore remain the
 application's complete-suite responsibility against the exact released Tito revision. The native

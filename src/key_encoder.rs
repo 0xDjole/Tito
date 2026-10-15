@@ -34,40 +34,15 @@ pub(crate) fn encode_index_integer_query(value: &str) -> Result<String, TitoErro
     Ok(encode_index_integer(integer))
 }
 
-pub fn to_snake_case(s: &str) -> String {
-    let mut snake_case = String::new();
-    let chars: Vec<char> = s.chars().collect();
+pub fn encode_index_string(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
 
-    for (i, &ch) in chars.iter().enumerate() {
-        if ch.is_uppercase() && i != 0 && chars[i - 1].is_lowercase() {
-            snake_case.push('_');
+    for character in value.chars() {
+        if character == ':' || character == '\\' {
+            encoded.push('\\');
         }
-
-        if ch.is_alphabetic() {
-            snake_case.push(ch.to_lowercase().next().unwrap());
-        } else {
-            snake_case.push(ch);
-        }
+        encoded.push(character);
     }
 
-    snake_case = snake_case
-        .trim_matches(|c: char| c.is_whitespace() && c != '_')
-        .to_string();
-
-    snake_case
-}
-
-pub fn safe_encode(key: &str) -> String {
-    let key = to_snake_case(key);
-
-    let mut result = String::with_capacity(key.len() * 2);
-
-    for ch in key.chars() {
-        if ch == ':' || ch == '\\' {
-            result.push('\\');
-        }
-        result.push(ch);
-    }
-
-    result
+    encoded
 }

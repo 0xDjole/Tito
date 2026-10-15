@@ -112,7 +112,7 @@ async fn custom_string_uses_existing_encoding_without_a_stored_field_and_default
     let stored = save(&engine, source).await.unwrap();
     let json = serde_json::to_value(&stored).unwrap();
     assert!(json.get("target_key").is_none());
-    let encoded = safe_encode(&stored.target_key());
+    let encoded = encode_index_string(&stored.target_key());
     assert_eq!(
         engine.raw_json(&format!(
             "index:computed-by-target:tenant:store-1:target_key:{encoded}:table:computed-records:first"

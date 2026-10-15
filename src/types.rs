@@ -78,9 +78,6 @@ pub trait TitoEngine: Send + Sync + Clone {
 
     async fn clear_active_transactions(&self) -> Result<(), TitoError>;
 
-    /// Irreversibly removes every key in `[start, end)`.
-    ///
-    /// Both bounds must be non-empty and `start` must be less than `end`.
     async fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<(), TitoError>;
 
     async fn garbage_collect(&self, retention: Duration) -> Result<(), TitoError> {

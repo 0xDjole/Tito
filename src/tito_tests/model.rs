@@ -794,13 +794,22 @@ fn model_key_helpers_extract_last_key_segment() {
 }
 
 #[test]
-fn safe_encode_snake_cases_and_escapes_key_separators() {
-    assert_eq!(safe_encode("Ada:Admin\\User"), "ada\\:admin\\\\user");
+fn encode_index_string_escapes_only_key_separators() {
+    assert_eq!(
+        encode_index_string("Ada:Admin\\User"),
+        "Ada\\:Admin\\\\User"
+    );
+    assert_eq!(
+        encode_index_string(" camelCase  Value "),
+        " camelCase  Value "
+    );
+    assert_eq!(encode_index_string("ž:\\:"), "ž\\:\\\\\\:");
+    assert_eq!(encode_index_string(""), "");
+    assert_ne!(encode_index_string("ABC"), encode_index_string("abc"));
 }
 
 #[test]
 fn lexicographic_helpers_move_string_bounds() {
-    assert_eq!(next_string_lexicographically("abc".to_string()), "abd");
     assert_eq!(prefix_end("abc".to_string()), "abd");
     assert_eq!(prefix_end("ab\u{10ffff}".to_string()), "ac");
     assert_eq!(key_after("abc".to_string()).as_bytes(), b"abc\0");

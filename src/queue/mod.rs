@@ -1,4 +1,5 @@
 mod cluster;
+mod partition;
 mod types;
 mod worker;
 
@@ -9,6 +10,7 @@ pub use cluster::{
     run_cluster_worker, ClusterCoordinatorLease, ClusterPartitionAssignment, ClusterWorkerConfig,
     ClusterWorkerNode,
 };
+pub use partition::queue_partition_for_key;
 pub use types::{
     QueueConfig, QueueDeletePage, QueueEvent, QueueEventStatus, QueueHandlerOutcome,
     QueueHandlerResult, QueueOwner, QueuePullCursor, QueuePullPage, QueueScanPage,
@@ -16,8 +18,6 @@ pub use types::{
 };
 pub use worker::{run_worker, WorkerConfig};
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -100,10 +100,7 @@ impl<E: TitoEngine> Queue<E> {
     }
 
     fn partition_for_key(&self, key: &str) -> u32 {
-        let partition_count = self.config.partition_count.max(1);
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        (hasher.finish() % partition_count as u64) as u32
+        queue_partition_for_key(key, self.config.partition_count)
     }
 
     fn pending_key(
@@ -624,10 +621,6 @@ impl<E: TitoEngine> Queue<E> {
             .await
     }
 
-    /// Completes a pending invocation and atomically inserts its next typed payload.
-    ///
-    /// The replacement must preserve the logical event ID, partition key, and owner while
-    /// changing the payload. Its timestamp remains application-owned.
     pub async fn advance<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static>(
         &self,
         storage_key: &str,
@@ -1011,11 +1004,6 @@ impl<E: TitoEngine> Queue<E> {
         })
     }
 
-    /// Deletes a bounded batch by the optional owner index inside the caller's transaction.
-    ///
-    /// The predicate can preserve a currently executing owner lifecycle event. Only rows published
-    /// with owner indexes by this queue protocol are visible; an upgrade must drain/reset old rows
-    /// or explicitly backfill them before relying on owner-bounded erasure.
     pub async fn delete_by_owner_matching_in_tx<T, F>(
         &self,
         owner: &QueueOwner,

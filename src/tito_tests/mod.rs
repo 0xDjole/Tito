@@ -1,4 +1,4 @@
-use crate::key_encoder::safe_encode;
+use crate::encode_index_string;
 use crate::queue::{
     run_worker, Queue, QueueConfig, QueueEvent, QueueEventStatus, QueueHandlerOutcome, WorkerConfig,
 };
@@ -9,9 +9,7 @@ use crate::types::{
     TitoIndexFieldType, TitoModelOptions, TitoModelTrait, TitoPaginated, TitoReference,
     TitoScanPayload,
 };
-use crate::utils::{
-    key_after, key_after_bytes, next_string_lexicographically, prefix_end, prefix_end_bytes,
-};
+use crate::utils::{key_after, key_after_bytes, prefix_end, prefix_end_bytes};
 use crate::{ClusterCoordinatorLease, ClusterWorkerConfig, TitoError};
 use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;

@@ -2,6 +2,7 @@ use crate::error::TitoError;
 use crate::types::{
     validate_delete_range, DBUuid, TitoEngine, TitoKvPair, TitoTransaction, TitoValue,
 };
+use crate::utils::key_after_bytes;
 use async_trait::async_trait;
 use futures::lock::Mutex;
 use rand::Rng;
@@ -18,6 +19,27 @@ const MAX_TRANSACTION_RETRIES: u32 = 10;
 const MAX_READ_LOCK_RESOLUTION_ATTEMPTS: u32 = 8;
 const READ_LOCK_RESOLUTION_BACKOFF: Duration = Duration::from_millis(25);
 const TIKV_GRPC_MAX_DECODING_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
+pub const SCAN_RPC_BYTES: usize = 4 * 1024 * 1024;
+pub const SCAN_RPC_FIRST_ROWS: u32 = 16;
+pub const SCAN_RPC_MAX_ROWS: u32 = 4_096;
+const GRPC_RESOURCE_EXHAUSTED: i32 = 8;
+const GRPC_OUT_OF_RANGE: i32 = 11;
+
+fn exceeds_message_limit(error: &tikv_client::Error) -> bool {
+    match error {
+        tikv_client::Error::GrpcAPI(status) => matches!(
+            i32::from(status.code()),
+            GRPC_RESOURCE_EXHAUSTED | GRPC_OUT_OF_RANGE
+        ),
+        tikv_client::Error::MultipleKeyErrors(errors)
+        | tikv_client::Error::ExtractedErrors(errors) => errors.iter().any(exceeds_message_limit),
+        _ => false,
+    }
+}
+
+fn scan_rows_for(largest_row_bytes: usize) -> u32 {
+    (SCAN_RPC_BYTES / largest_row_bytes.max(1)).clamp(1, SCAN_RPC_MAX_ROWS as usize) as u32
+}
 
 fn contains_undetermined_error(error: &tikv_client::Error) -> bool {
     match error {
@@ -301,6 +323,22 @@ mod tests {
     }
 
     #[test]
+    fn scan_rpcs_are_sized_by_the_largest_row_of_the_previous_page() {
+        assert_eq!(scan_rows_for(MAX_QUEUE_EVENT_BYTES), 4);
+        assert_eq!(scan_rows_for(MAX_QUEUE_EVENT_BYTES + 1), 3);
+        assert_eq!(scan_rows_for(SCAN_RPC_BYTES), 1);
+        assert_eq!(scan_rows_for(8 * SCAN_RPC_BYTES), 1);
+        assert_eq!(scan_rows_for(0), SCAN_RPC_MAX_ROWS);
+        assert_eq!(scan_rows_for(200), SCAN_RPC_MAX_ROWS);
+        assert_eq!(scan_rows_for(2_048), 2_048);
+        assert!(
+            SCAN_RPC_FIRST_ROWS as usize * MAX_QUEUE_EVENT_BYTES * 2
+                <= TIKV_GRPC_MAX_DECODING_MESSAGE_BYTES
+        );
+        assert!(SCAN_RPC_BYTES * 2 <= TIKV_GRPC_MAX_DECODING_MESSAGE_BYTES);
+    }
+
+    #[test]
     fn undetermined_commit_is_classified_as_unknown_and_never_retried() {
         let retryable_flag = AtomicBool::new(false);
         let error = classify_tikv_error(
@@ -373,6 +411,96 @@ pub struct TiKVTransaction {
     start_version: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScanDirection {
+    Forward,
+    Reverse,
+}
+
+impl ScanDirection {
+    fn failure(self) -> &'static str {
+        match self {
+            Self::Forward => "Scan operation failed",
+            Self::Reverse => "Reverse scan operation failed",
+        }
+    }
+}
+
+impl TiKVTransaction {
+    async fn scan_rpc(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: u32,
+        direction: ScanDirection,
+    ) -> Result<Vec<TitoKvPair>, tikv_client::Error> {
+        let range: tikv_client::BoundRange = (start.to_vec()..end.to_vec()).into();
+        let mut transaction = self.inner.lock().await;
+        match direction {
+            ScanDirection::Forward => Ok(transaction
+                .scan(range, limit)
+                .await?
+                .map(|kv| (kv.0.into(), kv.1))
+                .collect()),
+            ScanDirection::Reverse => Ok(transaction
+                .scan_reverse(range, limit)
+                .await?
+                .map(|kv| (kv.0.into(), kv.1))
+                .collect()),
+        }
+    }
+
+    async fn scan_pages(
+        &self,
+        mut start: Vec<u8>,
+        mut end: Vec<u8>,
+        limit: u32,
+        direction: ScanDirection,
+    ) -> Result<Vec<TitoKvPair>, TitoError> {
+        let mut rows: Vec<TitoKvPair> = Vec::new();
+        let mut rpc_rows = SCAN_RPC_FIRST_ROWS;
+        while start < end {
+            let remaining = limit.saturating_sub(rows.len() as u32);
+            if remaining == 0 {
+                break;
+            }
+            let requested = remaining.min(rpc_rows);
+            let page = match self.scan_rpc(&start, &end, requested, direction).await {
+                Ok(page) => page,
+                Err(error) if requested > 1 && exceeds_message_limit(&error) => {
+                    rpc_rows = requested / 2;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(classify_tikv_error(
+                        error,
+                        direction.failure(),
+                        &self.had_retryable_error,
+                    ))
+                }
+            };
+            let full = page.len() >= requested as usize;
+            let Some((last, _)) = page.last() else {
+                break;
+            };
+            match direction {
+                ScanDirection::Forward => start = key_after_bytes(last),
+                ScanDirection::Reverse => end = last.clone(),
+            }
+            rpc_rows = scan_rows_for(
+                page.iter()
+                    .map(|(key, value)| key.len() + value.len())
+                    .fold(0, usize::max),
+            );
+            rows.extend(page);
+            if !full {
+                break;
+            }
+        }
+        Ok(rows)
+    }
+}
+
 #[async_trait]
 impl TitoTransaction for TiKVTransaction {
     fn start_version(&self) -> u64 {
@@ -434,19 +562,13 @@ impl TitoTransaction for TiKVTransaction {
         range: Range<K>,
         limit: u32,
     ) -> Result<Vec<TitoKvPair>, TitoError> {
-        let start = range.start.as_ref().to_vec();
-        let end = range.end.as_ref().to_vec();
-        let bound_range: tikv_client::BoundRange = (start..end).into();
-        let result = self
-            .inner
-            .lock()
-            .await
-            .scan(bound_range, limit)
-            .await
-            .map_err(|e| {
-                classify_tikv_error(e, "Scan operation failed", &self.had_retryable_error)
-            })?;
-        Ok(result.map(|kv| (kv.0.into(), kv.1)).collect())
+        self.scan_pages(
+            range.start.as_ref().to_vec(),
+            range.end.as_ref().to_vec(),
+            limit,
+            ScanDirection::Forward,
+        )
+        .await
     }
 
     async fn scan_reverse<K: AsRef<[u8]> + Send>(
@@ -454,41 +576,54 @@ impl TitoTransaction for TiKVTransaction {
         range: Range<K>,
         limit: u32,
     ) -> Result<Vec<TitoKvPair>, TitoError> {
-        let start = range.start.as_ref().to_vec();
-        let end = range.end.as_ref().to_vec();
-        let bound_range: tikv_client::BoundRange = (start..end).into();
-        let result = self
-            .inner
-            .lock()
-            .await
-            .scan_reverse(bound_range, limit)
-            .await
-            .map_err(|e| {
-                classify_tikv_error(
-                    e,
-                    "Reverse scan operation failed",
-                    &self.had_retryable_error,
-                )
-            })?;
-        Ok(result.map(|kv| (kv.0.into(), kv.1)).collect())
+        self.scan_pages(
+            range.start.as_ref().to_vec(),
+            range.end.as_ref().to_vec(),
+            limit,
+            ScanDirection::Reverse,
+        )
+        .await
     }
 
     async fn batch_get<K: AsRef<[u8]> + Send>(
         &self,
         keys: Vec<K>,
     ) -> Result<Vec<TitoKvPair>, TitoError> {
-        let tikv_keys: Vec<tikv_client::Key> =
-            keys.iter().map(|k| k.as_ref().to_vec().into()).collect();
-        let result = self
-            .inner
-            .lock()
-            .await
-            .batch_get(tikv_keys)
-            .await
-            .map_err(|e| {
-                classify_tikv_error(e, "Batch get operation failed", &self.had_retryable_error)
-            })?;
-        Ok(result.map(|kv| (kv.0.into(), kv.1)).collect())
+        let mut chunks = vec![keys
+            .iter()
+            .map(|key| key.as_ref().to_vec())
+            .collect::<Vec<_>>()];
+        let mut found = Vec::new();
+        while let Some(mut chunk) = chunks.pop() {
+            let request: Vec<tikv_client::Key> = chunk.iter().cloned().map(Into::into).collect();
+            let result = self
+                .inner
+                .lock()
+                .await
+                .batch_get(request)
+                .await
+                .map(|pairs| {
+                    pairs
+                        .map(|kv| (kv.0.into(), kv.1))
+                        .collect::<Vec<TitoKvPair>>()
+                });
+            match result {
+                Ok(pairs) => found.extend(pairs),
+                Err(error) if chunk.len() > 1 && exceeds_message_limit(&error) => {
+                    let second = chunk.split_off(chunk.len() / 2);
+                    chunks.push(second);
+                    chunks.push(chunk);
+                }
+                Err(error) => {
+                    return Err(classify_tikv_error(
+                        error,
+                        "Batch get operation failed",
+                        &self.had_retryable_error,
+                    ))
+                }
+            }
+        }
+        Ok(found)
     }
 
     async fn commit(self) -> Result<(), TitoError> {

@@ -1,6 +1,6 @@
 use crate::{
     error::TitoError,
-    key_encoder::{encode_index_integer_query, encode_index_number, safe_encode},
+    key_encoder::{encode_index_integer_query, encode_index_number, encode_index_string},
     types::{
         FieldValue, TitoEngine, TitoFindByIndexPayload, TitoFindOneByIndexPayload, TitoIndexConfig,
         TitoIndexFieldType, TitoModelTrait, TitoPaginated, TitoScanPayload, TitoTransaction,
@@ -68,18 +68,27 @@ impl<
                                         format!(
                                             "{}:{}",
                                             field.name,
-                                            safe_encode(&format!("{key}.{value}"))
+                                            encode_index_string(&format!("{key}.{value}"))
                                         )
                                     }),
-                                TitoIndexFieldType::Number => encode_index_number(&value)?
-                                    .map(|value| format!("{}:{}:{value}", field.name, key)),
+                                TitoIndexFieldType::Number => {
+                                    encode_index_number(&value)?.map(|value| {
+                                        format!(
+                                            "{}:{}:{value}",
+                                            field.name,
+                                            encode_index_string(&key)
+                                        )
+                                    })
+                                }
                             },
                             FieldValue::Simple(value) => match &field.r#type {
                                 TitoIndexFieldType::String
                                 | TitoIndexFieldType::CustomString(_) => value
                                     .as_str()
                                     .filter(|value| !value.is_empty())
-                                    .map(|value| format!("{}:{}", field.name, safe_encode(value))),
+                                    .map(|value| {
+                                        format!("{}:{}", field.name, encode_index_string(value))
+                                    }),
                                 TitoIndexFieldType::Number => encode_index_number(&value)?
                                     .map(|value| format!("{}:{value}", field.name)),
                             },
@@ -170,7 +179,7 @@ impl<
         for (field, value) in index.fields.iter().zip(values) {
             let encoded = match field.r#type {
                 TitoIndexFieldType::String | TitoIndexFieldType::CustomString(_) => {
-                    safe_encode(value)
+                    encode_index_string(value)
                 }
                 TitoIndexFieldType::Number => encode_index_integer_query(value)?,
             };
@@ -322,7 +331,7 @@ impl<
 
             let value = match index_field_type {
                 TitoIndexFieldType::String | TitoIndexFieldType::CustomString(_) => {
-                    safe_encode(value)
+                    encode_index_string(value)
                 }
                 TitoIndexFieldType::Number => encode_index_integer_query(value)?,
             };
@@ -388,7 +397,7 @@ impl<
 
             let value = match index_field_type {
                 TitoIndexFieldType::String | TitoIndexFieldType::CustomString(_) => {
-                    safe_encode(value)
+                    encode_index_string(value)
                 }
                 TitoIndexFieldType::Number => encode_index_integer_query(value)?,
             };

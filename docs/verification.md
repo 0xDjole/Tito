@@ -28,9 +28,21 @@ creates a separate vendor target cache or silently changes the Cargo test profil
 
 The wrapper builds before starting a database. Its first disposable runtime has one real PD and
 one real TiKV, and supplies the existing `TITO_NATIVE_PD_URI` and `TITO_NATIVE_RUN_ID` declarations
-to the complete `cargo test --locked --all-targets` phase. The existing actual secondary-lock and
-atomic batch replacement cases remain mandatory. After verifying that runtime's complete
-cleanup, the wrapper starts three PD members with distinct native loopback client and peer ports.
+to the complete `cargo test --locked --all-targets` phase. Every native case is mandatory:
+
+- the actual secondary-lock recovery and atomic batch replacement cases;
+- 40 records of 1 MiB, more than the client's 32 MiB decoding budget, read in one forward scan,
+  one reverse scan, ordinary index pages and one batch get, and 16 queue events of almost 1 MiB
+  pulled, completed and cleared;
+- reference fences: a new pointer conflicts at commit with a concurrent removal or deleting mark
+  of its target, and two new pointers to one target conflict;
+- `assert_current` against a concurrent update in both commit orders, and `assert_version` against
+  a concurrent update;
+- two concurrent claims of one unique value conflict and the retry is refused, while values that
+  differ only by case or spacing coexist and are found exactly.
+
+After verifying that runtime's complete cleanup, the wrapper starts three PD members with distinct
+native loopback client and peer ports.
 The members share their owned container's network namespace, matching the existing Server test
 runtime pattern. Their advertised addresses are the actual published loopback addresses; no
 response rewriting or transport fault simulator is involved. Separate phases keep the maximum

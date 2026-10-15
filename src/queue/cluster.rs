@@ -16,7 +16,7 @@ use super::{
     duration_millis, Queue, QueueEvent, QueueHandlerResult, QueuePullCursor,
     COMPLETED_EVENT_MAINTENANCE_INTERVAL,
 };
-use crate::key_encoder::safe_encode;
+use crate::key_encoder::encode_index_string;
 use crate::types::{TitoEngine, TitoTransaction, PARTITION_DIGITS};
 use crate::TitoError;
 
@@ -115,7 +115,7 @@ impl<E: TitoEngine> Queue<E> {
     }
 
     fn node_key(&self, node_id: &str) -> String {
-        format!("{}{}", self.nodes_prefix(), safe_encode(node_id))
+        format!("{}{}", self.nodes_prefix(), encode_index_string(node_id))
     }
 
     fn partitions_prefix(&self) -> String {
@@ -718,7 +718,7 @@ async fn run_partition_worker<E, T, H>(
             break;
         }
 
-        if process_partition_once(
+        match process_partition_once(
             queue.clone(),
             config.clone(),
             partition,
@@ -728,9 +728,10 @@ async fn run_partition_worker<E, T, H>(
             &mut stop,
         )
         .await
-            == PartitionWorkerDirective::Stop
         {
-            break;
+            PartitionWorkerDirective::Stop => break,
+            PartitionWorkerDirective::Pull => continue,
+            PartitionWorkerDirective::Wait => {}
         }
 
         tokio::select! {
@@ -744,7 +745,8 @@ async fn run_partition_worker<E, T, H>(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PartitionWorkerDirective {
-    Continue,
+    Pull,
+    Wait,
     Stop,
 }
 
@@ -862,8 +864,13 @@ where
     match pull {
         Ok(page) => {
             *cursor = page.next_cursor;
+            let directive = if cursor.is_some() {
+                PartitionWorkerDirective::Pull
+            } else {
+                PartitionWorkerDirective::Wait
+            };
             if page.events.is_empty() {
-                return PartitionWorkerDirective::Continue;
+                return directive;
             }
 
             for (storage_key, event) in page.events {
@@ -906,14 +913,14 @@ where
                     return PartitionWorkerDirective::Stop;
                 }
             }
-            PartitionWorkerDirective::Continue
+            directive
         }
         Err(_) => {
             tokio::select! {
                 biased;
                 _ = stop.retirement.changed() => PartitionWorkerDirective::Stop,
                 _ = stop.shutdown.changed() => PartitionWorkerDirective::Stop,
-                _ = sleep(Duration::from_millis(500)) => PartitionWorkerDirective::Continue,
+                _ = sleep(Duration::from_millis(500)) => PartitionWorkerDirective::Wait,
             }
         }
     }

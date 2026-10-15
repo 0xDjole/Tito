@@ -18,7 +18,7 @@ pub mod queue;
 pub mod query;
 
 mod key_encoder;
-pub use key_encoder::encode_index_integer;
+pub use key_encoder::{encode_index_integer, encode_index_string};
 
 mod reference;
 
@@ -42,10 +42,11 @@ pub use types::{
 };
 
 pub use queue::{
-    run_cluster_worker, ClusterCoordinatorLease, ClusterPartitionAssignment, ClusterWorkerConfig,
-    ClusterWorkerNode, Queue, QueueConfig, QueueDeletePage, QueueEvent, QueueEventStatus,
-    QueueHandlerOutcome, QueueHandlerResult, QueueOwner, QueueScanPage, WorkerConfig,
-    MAX_QUEUE_EVENT_BYTES, MAX_QUEUE_OWNER_COMPONENT_BYTES,
+    queue_partition_for_key, run_cluster_worker, ClusterCoordinatorLease,
+    ClusterPartitionAssignment, ClusterWorkerConfig, ClusterWorkerNode, Queue, QueueConfig,
+    QueueDeletePage, QueueEvent, QueueEventStatus, QueueHandlerOutcome, QueueHandlerResult,
+    QueueOwner, QueueScanPage, WorkerConfig, MAX_QUEUE_EVENT_BYTES,
+    MAX_QUEUE_OWNER_COMPONENT_BYTES,
 };
 
-pub use utils::{key_after, next_string_lexicographically, prefix_end};
+pub use utils::{key_after, prefix_end};

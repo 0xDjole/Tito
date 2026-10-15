@@ -379,6 +379,36 @@ async fn numeric_array_and_map_entries_use_the_same_signed_encoding() {
 }
 
 #[tokio::test]
+async fn numeric_map_entry_keys_are_encoded_exactly() {
+    let engine = engine();
+    let mut record = numeric_record("map-keys", json!(1));
+    record.measurements = HashMap::from([
+        ("a:b".to_string(), json!(1)),
+        ("a\\b".to_string(), json!(2)),
+        ("A:B".to_string(), json!(3)),
+    ]);
+    save_numeric(&engine, record.clone()).await.unwrap();
+
+    for (encoded_name, value) in [("a\\:b", 1), ("a\\\\b", 2), ("A\\:B", 3)] {
+        let key = format!(
+            "index:numeric-by-measurements:measurements:{encoded_name}:{}:table:numeric-records:map-keys",
+            encode_index_integer(value)
+        );
+        assert_eq!(
+            engine.raw_json(&key).await.unwrap(),
+            serde_json::to_value(&record).unwrap()
+        );
+    }
+    assert_eq!(
+        engine
+            .keys_with_prefix("index:numeric-by-measurements:measurements:")
+            .await
+            .len(),
+        3
+    );
+}
+
+#[tokio::test]
 async fn unsupported_numeric_values_reject_insert_and_update_without_any_mutation() {
     let engine = engine();
     save_numeric(&engine, numeric_record("existing", json!(-1)))

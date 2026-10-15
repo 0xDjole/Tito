@@ -77,9 +77,6 @@ impl QueueOwner {
     }
 }
 
-/// The result of handling one queue event.
-///
-/// An error leaves the current pending event unchanged for later redelivery.
 pub type QueueHandlerResult<T> = Result<QueueHandlerOutcome<T>, TitoError>;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

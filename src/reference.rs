@@ -1,3 +1,4 @@
+use crate::key_encoder::encode_index_string;
 use crate::types::TitoReference;
 use crate::TitoError;
 
@@ -13,17 +14,6 @@ pub(crate) struct ReferenceKey {
     pub(crate) target_id: String,
     pub(crate) source_table: String,
     pub(crate) source_id: String,
-}
-
-pub(crate) fn encode_reference_segment(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for character in value.chars() {
-        if character == ':' || character == '\\' {
-            encoded.push('\\');
-        }
-        encoded.push(character);
-    }
-    encoded
 }
 
 fn decode_reference_segments(encoded: &str) -> Option<Vec<String>> {
@@ -51,19 +41,19 @@ pub(crate) fn reference_key(
 ) -> String {
     format!(
         "{REFERENCE_KEY_PREFIX}{}:{}:{}:{}:{}",
-        encode_reference_segment(target_table),
-        encode_reference_segment(target_id),
-        encode_reference_segment(source_table),
-        encode_reference_segment(source_id),
-        encode_reference_segment(path)
+        encode_index_string(target_table),
+        encode_index_string(target_id),
+        encode_index_string(source_table),
+        encode_index_string(source_id),
+        encode_index_string(path)
     )
 }
 
 pub(crate) fn reference_target_prefix(table: &str, id: &str) -> String {
     format!(
         "{REFERENCE_KEY_PREFIX}{}:{}:",
-        encode_reference_segment(table),
-        encode_reference_segment(id)
+        encode_index_string(table),
+        encode_index_string(id)
     )
 }
 
@@ -75,15 +65,15 @@ pub(crate) fn reference_source_prefix(
     format!(
         "{}{}:",
         reference_target_prefix(target_table, target_id),
-        encode_reference_segment(source_table)
+        encode_index_string(source_table)
     )
 }
 
 pub(crate) fn deleting_marker_key(table: &str, id: &str) -> String {
     format!(
         "{DELETING_MARKER_KEY_PREFIX}{}:{}",
-        encode_reference_segment(table),
-        encode_reference_segment(id)
+        encode_index_string(table),
+        encode_index_string(id)
     )
 }
 

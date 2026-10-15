@@ -35,6 +35,15 @@ PROTOCOL_CASES = {
 TITO_NATIVE_CASES = {
     "native_batch_swap_fences_every_source_and_commits_only_final_owners",
     "expired_secondary_without_a_primary_heals_through_normal_tito_reads",
+    "native_reads_forty_one_mib_records_through_byte_bounded_requests",
+    "native_queue_pulls_and_completes_sixteen_one_mib_events",
+    "native_a_new_pointer_conflicts_with_a_concurrent_removal_of_its_target",
+    "native_a_new_pointer_conflicts_with_a_concurrent_deleting_mark_on_its_target",
+    "native_two_new_pointers_to_one_target_conflict_and_the_retry_keeps_both",
+    "native_assert_current_conflicts_with_a_concurrent_update_in_either_order",
+    "native_assert_version_conflicts_with_a_concurrent_update_and_then_reports_the_change",
+    "native_concurrent_claims_of_one_unique_value_conflict_and_the_retry_is_refused",
+    "native_unique_values_differing_only_by_case_or_spacing_coexist_and_are_found_exactly",
 }
 
 

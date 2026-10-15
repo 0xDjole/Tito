@@ -16,7 +16,7 @@ async fn conditional_unique_index_owns_one_value_and_supports_exact_lookup() {
         .find_one_by_unique_index(
             TitoFindOneByIndexPayload {
                 index: "verified-account-by-tenant-email".to_string(),
-                values: vec!["store-1".to_string(), "ada@example.com".to_string()],
+                values: vec!["store-1".to_string(), "Ada@Example.com".to_string()],
             },
             None,
         )
@@ -27,9 +27,74 @@ async fn conditional_unique_index_owns_one_value_and_supports_exact_lookup() {
     assert!(
         engine
             .contains_key(
-                "unique-index:unique-accounts:verified-account-by-tenant-email:tenant_id:store-1:email:ada@example.com",
+                "unique-index:unique-accounts:verified-account-by-tenant-email:tenant_id:store-1:email:Ada@Example.com",
             )
             .await
+    );
+    assert!(matches!(
+        model
+            .find_one_by_unique_index(
+                TitoFindOneByIndexPayload {
+                    index: "verified-account-by-tenant-email".to_string(),
+                    values: vec!["store-1".to_string(), "ada@example.com".to_string()],
+                },
+                None,
+            )
+            .await,
+        Err(TitoError::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn unique_values_differing_only_by_case_coexist_and_are_found_exactly() {
+    let engine = engine();
+    let model = engine
+        .clone()
+        .model::<UniqueAccount>(TitoModelOptions::default());
+    let emails = [
+        ("a1", "Ada@Example.com"),
+        ("a2", "ada@example.com"),
+        ("a3", "ADA@EXAMPLE.COM"),
+        ("a4", " ada@example.com "),
+        ("a5", "adaExample"),
+        ("a6", "ada_example"),
+    ];
+    for (id, email) in emails {
+        save_unique_account(&engine, unique_account(id, "store-1", email, true)).await;
+    }
+
+    for (id, email) in emails {
+        let found = model
+            .find_one_by_unique_index(
+                TitoFindOneByIndexPayload {
+                    index: "verified-account-by-tenant-email".to_string(),
+                    values: vec!["store-1".to_string(), email.to_string()],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(found.id, id);
+        assert_eq!(found.email, email);
+    }
+    assert!(matches!(
+        model
+            .find_one_by_unique_index(
+                TitoFindOneByIndexPayload {
+                    index: "verified-account-by-tenant-email".to_string(),
+                    values: vec!["store-1".to_string(), "Ada@example.com".to_string()],
+                },
+                None,
+            )
+            .await,
+        Err(TitoError::NotFound(_))
+    ));
+    assert_eq!(
+        engine
+            .keys_with_prefix("unique-index:unique-accounts:verified-account-by-tenant-email:")
+            .await
+            .len(),
+        emails.len()
     );
 }
 
@@ -156,25 +221,77 @@ async fn disabled_unique_index_does_not_claim_the_value() {
 }
 
 #[tokio::test]
-async fn string_index_queries_are_case_normalized_and_escape_colons() {
+async fn string_index_queries_are_exact_and_escape_colons() {
     let engine = engine();
     let model = engine.clone().model::<Author>(TitoModelOptions::default());
     save_author(&engine, author("a1", "Ada:Admin@Example.com", 36, "org-a")).await;
+    save_author(&engine, author("a2", "ada:admin@example.com", 37, "org-a")).await;
 
     let mut query = model.query_by_index("author-by-email");
     let found = query
-        .value("ada:admin@example.com")
+        .value("Ada:Admin@Example.com")
         .execute(None)
         .await
         .unwrap();
 
     assert_eq!(found.items.len(), 1);
     assert_eq!(found.items[0].id, "a1");
+    let mut query = model.query_by_index("author-by-email");
+    let found = query
+        .value("ada:admin@example.com")
+        .execute(None)
+        .await
+        .unwrap();
+    assert_eq!(found.items.len(), 1);
+    assert_eq!(found.items[0].id, "a2");
+    let mut query = model.query_by_index("author-by-email");
+    assert!(query
+        .value("ADA:ADMIN@EXAMPLE.COM")
+        .execute(None)
+        .await
+        .unwrap()
+        .items
+        .is_empty());
     assert!(
         engine
-            .contains_key("index:author-by-email:email:ada\\:admin@example.com:table:authors:a1")
+            .contains_key("index:author-by-email:email:Ada\\:Admin@Example.com:table:authors:a1")
             .await
     );
+    assert!(
+        engine
+            .contains_key("index:author-by-email:email:ada\\:admin@example.com:table:authors:a2")
+            .await
+    );
+}
+
+#[tokio::test]
+async fn string_index_values_keep_whitespace_and_word_boundaries() {
+    let engine = engine();
+    let model = engine.clone().model::<Author>(TitoModelOptions::default());
+    let authors = [
+        ("a1", " padded@example.com "),
+        ("a2", "padded@example.com"),
+        ("a3", "camelCase"),
+        ("a4", "camel_case"),
+        ("a5", "back\\slash"),
+        ("a6", "back:slash"),
+    ];
+    for (id, email) in authors {
+        save_author(&engine, author(id, email, 30, "org-a")).await;
+    }
+
+    for (id, email) in authors {
+        let mut query = model.query_by_index("author-by-email");
+        let found = query.value(email).execute(None).await.unwrap();
+        assert_eq!(
+            found
+                .items
+                .into_iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![id.to_string()]
+        );
+    }
 }
 
 #[tokio::test]
@@ -817,7 +934,7 @@ async fn map_indexes_include_map_entry_keys_in_index_key() {
 }
 
 #[tokio::test]
-async fn a_map_entry_is_found_by_its_key_and_value_whatever_the_key_case() {
+async fn a_map_entry_is_found_by_its_exact_key_and_value() {
     let engine = engine();
     save_post(
         &engine,
@@ -838,9 +955,17 @@ async fn a_map_entry_is_found_by_its_key_and_value_whatever_the_key_case() {
 
     assert_eq!(found.items.len(), 1);
     assert_eq!(found.items[0].id, "p1");
+    let mut query = model.query_by_index("post-by-metadata");
+    assert!(query
+        .value("en-us.spring-menu")
+        .execute(None)
+        .await
+        .unwrap()
+        .items
+        .is_empty());
     assert_eq!(
         engine
-            .keys_with_prefix("index:post-by-metadata:metadata:en-us.spring-menu:")
+            .keys_with_prefix("index:post-by-metadata:metadata:en-US.spring-menu:")
             .await
             .len(),
         1
@@ -848,7 +973,7 @@ async fn a_map_entry_is_found_by_its_key_and_value_whatever_the_key_case() {
 }
 
 #[tokio::test]
-async fn identical_index_keys_of_one_record_are_written_once() {
+async fn identical_index_keys_of_one_record_are_written_once_and_case_variants_are_kept() {
     let engine = engine();
     let mut item = post("p1", "a1", vec!["t1".to_string(), "t1".to_string()]);
     item.metadata = HashMap::from([
@@ -872,13 +997,17 @@ async fn identical_index_keys_of_one_record_are_written_once() {
     unique.dedup();
 
     assert_eq!(unique.len(), manifest.len());
-    assert_eq!(
-        manifest
-            .iter()
-            .filter(|key| key.starts_with("index:post-by-metadata:metadata:en-us.spring-menu:"))
-            .count(),
-        1
-    );
+    for exact in ["en-US", "en-us"] {
+        assert_eq!(
+            manifest
+                .iter()
+                .filter(|key| key.starts_with(&format!(
+                    "index:post-by-metadata:metadata:{exact}.spring-menu:"
+                )))
+                .count(),
+            1
+        );
+    }
     assert_eq!(
         manifest
             .iter()

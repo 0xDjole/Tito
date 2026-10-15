@@ -1468,6 +1468,128 @@ async fn queue_worker_times_out_handler_and_redelivers_pending_invocation() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn published_and_rescheduled_rows_sit_in_the_partition_of_their_key_hash() {
+    let engine = engine();
+    let queue = queue(engine, 10);
+    let keys = [
+        "store:4f6c1a52-7e0b-4f43-9d0c-2b4c1a9e8f10",
+        "entry:due",
+        "order:ž",
+        "a",
+        "foobar",
+    ];
+    for key in keys {
+        queue
+            .publish(QueueEvent::new(key, queue_payload(key), 0))
+            .await
+            .unwrap();
+    }
+
+    let pending = queue
+        .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 100)
+        .await
+        .unwrap();
+    assert_eq!(pending.events.len(), keys.len());
+    for (storage_key, event) in &pending.events {
+        let partition = crate::queue_partition_for_key(&event.key, 10);
+        assert!(storage_key.starts_with(&format!("queue:pending:{partition:04}:")));
+    }
+    for (key, partition) in [
+        ("store:4f6c1a52-7e0b-4f43-9d0c-2b4c1a9e8f10", 3),
+        ("entry:due", 9),
+        ("order:ž", 8),
+    ] {
+        assert!(pending.events.iter().any(|(storage_key, event)| {
+            event.key == key && storage_key.starts_with(&format!("queue:pending:{partition:04}:"))
+        }));
+    }
+
+    let (storage_key, event) = pending
+        .events
+        .iter()
+        .find(|(_, event)| event.key == "order:ž")
+        .cloned()
+        .unwrap();
+    queue
+        .reschedule(&storage_key, event.rescheduled(1))
+        .await
+        .unwrap();
+    let pending = queue
+        .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 100)
+        .await
+        .unwrap();
+    assert!(pending.events.iter().any(|(storage_key, event)| {
+        event.key == "order:ž"
+            && event.timestamp == 1
+            && storage_key.starts_with("queue:pending:0008:")
+    }));
+}
+
+#[tokio::test]
+async fn standalone_worker_pulls_the_next_page_without_waiting_for_its_poll_interval() {
+    let engine = engine();
+    let queue = Arc::new(queue(engine, 1));
+    let due = Utc::now().timestamp_millis() - 10_000;
+    for index in 0..120 {
+        let id = format!("paged-{index:03}");
+        queue
+            .publish(queue_event(&id, &format!("entry:{id}"), due))
+            .await
+            .unwrap();
+    }
+
+    let handled = Arc::new(AtomicUsize::new(0));
+    let all_handled = Arc::new(Notify::new());
+    let handler_handled = handled.clone();
+    let handler_all_handled = all_handled.clone();
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let mut config = WorkerConfig::new(0..1);
+    config.poll_interval = Duration::from_secs(60 * 60);
+    let handle = run_worker::<_, QueuePayload, _>(
+        queue.clone(),
+        config,
+        move |_event| {
+            let handled = handler_handled.clone();
+            let all_handled = handler_all_handled.clone();
+            Box::pin(async move {
+                if handled.fetch_add(1, Ordering::SeqCst) + 1 == 120 {
+                    all_handled.notify_one();
+                }
+                Ok(QueueHandlerOutcome::Acknowledge)
+            })
+        },
+        shutdown_rx,
+    )
+    .await;
+
+    timeout(Duration::from_secs(10), all_handled.notified())
+        .await
+        .unwrap();
+    let _ = shutdown_tx.send(());
+    timeout(Duration::from_secs(2), handle)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(handled.load(Ordering::SeqCst), 120);
+    assert!(queue
+        .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 10)
+        .await
+        .unwrap()
+        .events
+        .is_empty());
+    assert_eq!(
+        queue
+            .scan_by_status::<QueuePayload>(QueueEventStatus::Completed, None, 200)
+            .await
+            .unwrap()
+            .events
+            .len(),
+        120
+    );
+}
+
 async fn wait_for_completed(queue: &Arc<Queue<MemoryEngine>>, event_id: &str) {
     timeout(Duration::from_secs(2), async {
         loop {

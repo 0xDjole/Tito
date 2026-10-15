@@ -503,6 +503,71 @@ async fn cluster_worker_observes_shutdown_sent_immediately_after_start() {
 }
 
 #[tokio::test]
+async fn cluster_partition_worker_pulls_the_next_page_without_waiting_for_its_poll_interval() {
+    let engine = engine();
+    let queue = Arc::new(queue(engine, 1));
+    let due = Utc::now().timestamp_millis() - 10_000;
+    for index in 0..120 {
+        let id = format!("cluster-paged-{index:03}");
+        queue
+            .publish(queue_event(&id, &format!("entry:{id}"), due))
+            .await
+            .unwrap();
+    }
+    let mut config = cluster_config("paging-node");
+    config.poll_interval = Duration::from_secs(60 * 60);
+    queue.heartbeat_cluster_worker(&config).await.unwrap();
+    assert!(queue
+        .try_acquire_cluster_coordinator(&config)
+        .await
+        .unwrap());
+    queue.rebalance_cluster_partitions(&config).await.unwrap();
+    assert_eq!(
+        queue.sync_cluster_partition_leases(&config).await.unwrap().len(),
+        1
+    );
+
+    let handled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let all_handled = Arc::new(Notify::new());
+    let handler_handled = handled.clone();
+    let handler_all_handled = all_handled.clone();
+    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+    let handle = crate::run_cluster_worker(
+        queue.clone(),
+        config,
+        move |_event: QueueEvent<QueuePayload>| {
+            let handled = handler_handled.clone();
+            let all_handled = handler_all_handled.clone();
+            Box::pin(async move {
+                if handled.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == 120 {
+                    all_handled.notify_one();
+                }
+                Ok(QueueHandlerOutcome::Acknowledge)
+            })
+        },
+        shutdown_rx,
+    )
+    .await;
+
+    timeout(Duration::from_secs(10), all_handled.notified())
+        .await
+        .unwrap();
+    let _ = shutdown_tx.send(());
+    timeout(Duration::from_secs(2), handle)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(handled.load(std::sync::atomic::Ordering::SeqCst), 120);
+    assert!(queue
+        .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 10)
+        .await
+        .unwrap()
+        .events
+        .is_empty());
+}
+
+#[tokio::test]
 async fn cluster_coordinator_enforces_configured_completed_history_retention() {
     const RETENTION_SECONDS: i64 = 60 * 60;
     let engine = engine();
