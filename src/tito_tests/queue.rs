@@ -1144,7 +1144,8 @@ async fn queue_worker_handler_error_leaves_exact_pending_invocation_unchanged() 
     let release = Arc::new(Notify::new());
     let handler_started = started.clone();
     let handler_release = release.clone();
-    let handler_event = event.clone();
+    let mut handler_event = event.clone();
+    handler_event.pending_key = Some(storage_key.clone());
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
     let handle = run_worker::<_, QueuePayload, _>(
         queue.clone(),

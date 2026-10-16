@@ -44,13 +44,15 @@ pub(crate) enum HandlerExecution<T> {
 
 pub(crate) async fn execute_handler<T, H>(
     handler: &H,
-    event: QueueEvent<T>,
+    storage_key: &str,
+    mut event: QueueEvent<T>,
     handler_timeout: Duration,
 ) -> HandlerExecution<T>
 where
     T: Send + 'static,
     H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerResult<T>>,
 {
+    event.pending_key = Some(storage_key.to_string());
     let handler_future = match catch_unwind(AssertUnwindSafe(|| handler(event))) {
         Ok(handler_future) => handler_future,
         Err(_) => return HandlerExecution::Panicked,
@@ -199,8 +201,13 @@ where
                                     }
                                     Err(TryRecvError::Empty) => {}
                                 }
-                                let execution =
-                                    execute_handler(&h, event.clone(), handler_timeout).await;
+                                let execution = execute_handler(
+                                    &h,
+                                    &storage_key,
+                                    event.clone(),
+                                    handler_timeout,
+                                )
+                                .await;
                                 if let Some(outcome) =
                                     handler_outcome_or_log(execution, &event, handler_timeout)
                                 {

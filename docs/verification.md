@@ -34,6 +34,11 @@ to the complete `cargo test --locked --all-targets` phase. Every native case is 
 - 40 records of 1 MiB, more than the client's 32 MiB decoding budget, read in one forward scan,
   one reverse scan, ordinary index pages and one batch get, and 16 queue events of almost 1 MiB
   pulled, completed and cleared;
+- a cluster-worker and a standalone-worker handler each complete their own pending queue row inside
+  the transaction that applies their change, and the later acknowledgement changes nothing; two
+  deliveries of one row conflict at commit and the retry skips, so the change applies once; a
+  rolled-back handler transaction leaves the row and its owner index pending for redelivery; an
+  undelivered event, a completed-row key and another event's pending row are refused without writes;
 - reference fences: a new pointer conflicts at commit with a concurrent removal or deleting mark
   of its target, and two new pointers to one target conflict;
 - `assert_current` against a concurrent update in both commit orders, and `assert_version` against

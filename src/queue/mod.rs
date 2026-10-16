@@ -612,6 +612,49 @@ impl<E: TitoEngine> Queue<E> {
             .await
     }
 
+    pub async fn ack_in_tx<T>(
+        &self,
+        event: &QueueEvent<T>,
+        tx: &E::Transaction,
+    ) -> Result<bool, TitoError> {
+        let storage_key = event.pending_key.as_deref().ok_or_else(|| {
+            TitoError::InvalidInput(
+                "Only an event delivered from its pending row can be acknowledged in a transaction"
+                    .to_string(),
+            )
+        })?;
+        if !storage_key.starts_with(&self.status_prefix(QueueEventStatus::Pending)) {
+            return Err(TitoError::InvalidInput(
+                "Only pending queue events can be acknowledged".to_string(),
+            ));
+        }
+
+        let Some(bytes) = tx
+            .get(storage_key.as_bytes())
+            .await
+            .map_err(|e| TitoError::QueryFailed(format!("Get queue event: {}", e)))?
+        else {
+            return Ok(false);
+        };
+        let Some(current) = Self::read_pending_entry(&bytes)? else {
+            return Ok(false);
+        };
+        if current.id != event.id {
+            return Err(TitoError::InvalidInput(
+                "A pending queue row can only be acknowledged by its own event".to_string(),
+            ));
+        }
+
+        self.complete_pending_entry(
+            tx,
+            storage_key.as_bytes(),
+            current,
+            "Create completed event",
+        )
+        .await?;
+        Ok(true)
+    }
+
     pub async fn reschedule<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static>(
         &self,
         storage_key: &str,
@@ -1107,6 +1150,7 @@ mod tests {
             timestamp,
             status,
             processed_at,
+            pending_key: None,
         }
     }
 

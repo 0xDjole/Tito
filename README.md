@@ -494,6 +494,20 @@ Handlers return `QueueHandlerResult<T>`, an alias for `Result<QueueHandlerOutcom
 - `Ok(QueueHandlerOutcome::Advance(next_event))` atomically preserves the current row as completed history and inserts the supplied next typed payload.
 - `Err(_)`, a handler panic, executor timeout, lost worker, or queue-commit failure produces no persisted outcome, so the exact current invocation remains pending.
 
+A handler whose work is one Tito transaction can complete its own invocation inside that
+transaction, so the work applies exactly once. Workers hand every delivered event the storage key
+of the pending row it came from in `QueueEvent::pending_key`. The field is never serialized and is
+`None` on published, pulled, scanned and constructed events; code that hands such an event to a
+handler itself sets it from the row's storage key. `queue.ack_in_tx(&event, &tx)` completes that
+row in the caller's transaction and returns `true`, or returns `false` when the row is already
+gone, and the handler then skips its work. Two deliveries of one row both write its pending key:
+the later commit conflicts, and its retry finds the row gone and skips. A rolled-back transaction
+leaves the row pending for redelivery. Such a handler returns `Acknowledge`; the worker's separate
+acknowledgement then finds no pending row and changes nothing, while a `Reschedule` or `Advance`
+returned after an in-transaction acknowledgement writes no successor. `ack_in_tx` refuses an event
+without a pending key, a key outside the pending rows of its queue, and a pending row of another
+event.
+
 Each event's own timestamp determines when it becomes runnable. Tito indexes that timestamp but never chooses or changes it. A domain that needs another invocation supplies a replacement event carrying the desired timestamp; Tito only commits the complete-and-insert transaction. `Reschedule` requires the logical event ID, partition key, owner, and payload to remain identical, so only the timestamp may change. `QueueEvent::rescheduled` constructs that replacement. `Advance` also preserves the ID, key, and owner, but requires the typed payload to change; its replacement timestamp remains application-owned. In both cases the completed row retains the exact prior payload while the new Pending row carries the replacement. Provider leases and processing deadlines belong only to domain records.
 
 Every new invocation must serialize to at most `MAX_QUEUE_EVENT_BYTES` (1 MiB). Publication rejects
@@ -653,7 +667,10 @@ prewrite conflict, waits for its observed native TTL, proves the missing-primary
 normal Tito read, and verifies recovery preserves the winning primary. It removes only its own
 two UUID-scoped keys. `tikv_native_large_rows_test` reads 40 records of 1 MiB, more than the
 client's 32 MiB decoding budget, through scans, index pages and a batch get, and pulls 16 queue
-events of almost 1 MiB. `tikv_native_fence_test` proves on real TiKV that reference fences, `assert_current`,
+events of almost 1 MiB. `tikv_native_queue_test` proves that cluster-worker and standalone-worker
+handlers complete their own pending row inside their transaction, that a duplicate delivery
+conflicts on that row and its retry skips, that a rolled-back handler leaves the row pending, and
+that `ack_in_tx` refuses events and keys it does not own without writing. `tikv_native_fence_test` proves on real TiKV that reference fences, `assert_current`,
 `assert_version` and unique claims conflict at commit, and that unique values differing only by
 case or spacing coexist. The in-memory engine never detects conflicts, so conflict behaviour is
 proven only by these native cases. Examples are compiled but not run against a live database.

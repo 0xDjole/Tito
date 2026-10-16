@@ -92,6 +92,8 @@ pub struct QueueEvent<T> {
     pub status: QueueEventStatus,
     #[serde(default)]
     pub processed_at: Option<i64>,
+    #[serde(skip)]
+    pub pending_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +131,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent
             timestamp,
             status: QueueEventStatus::Pending,
             processed_at: None,
+            pending_key: None,
         }
     }
 
@@ -166,6 +169,7 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent
             timestamp,
             status: QueueEventStatus::Pending,
             processed_at: None,
+            pending_key: None,
         }
     }
 }

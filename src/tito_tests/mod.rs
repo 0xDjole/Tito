@@ -444,6 +444,7 @@ fn queue_event(id: &str, key: &str, timestamp: i64) -> QueueEvent<QueuePayload> 
         timestamp,
         status: QueueEventStatus::Pending,
         processed_at: None,
+        pending_key: None,
     }
 }
 

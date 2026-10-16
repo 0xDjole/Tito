@@ -894,8 +894,13 @@ where
                     return PartitionWorkerDirective::Stop;
                 }
 
-                let execution =
-                    execute_handler(&handler, event.clone(), config.handler_timeout).await;
+                let execution = execute_handler(
+                    &handler,
+                    &storage_key,
+                    event.clone(),
+                    config.handler_timeout,
+                )
+                .await;
                 if let Some(outcome) =
                     handler_outcome_or_log(execution, &event, config.handler_timeout)
                 {
