@@ -2,12 +2,12 @@ use crate::encode_index_string;
 use crate::queue::{
     run_worker, Queue, QueueConfig, QueueEvent, QueueEventStatus, QueueHandlerOutcome, WorkerConfig,
 };
-use crate::test_support::MemoryEngine;
+use crate::test_support::{MemoryEngine, MemoryTransaction, RecordedWrite};
 use crate::types::{
     PartitionConfig, TitoCursor, TitoEngine, TitoFindByIndexPayload, TitoFindOneByIndexPayload,
     TitoFindPayload, TitoId, TitoIncomingReference, TitoIndexConfig, TitoIndexField,
     TitoIndexFieldType, TitoModelOptions, TitoModelTrait, TitoPaginated, TitoReference,
-    TitoScanPayload,
+    TitoScanPayload, TitoTransaction,
 };
 use crate::utils::{key_after, key_after_bytes, prefix_end, prefix_end_bytes};
 use crate::{ClusterCoordinatorLease, ClusterWorkerConfig, TitoError};
@@ -249,6 +249,132 @@ impl TitoModelTrait for Tag {
 }
 
 #[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct Shop {
+    id: String,
+    name: String,
+    deleting: bool,
+}
+
+impl TitoModelTrait for Shop {
+    fn indexes(&self) -> Vec<TitoIndexConfig> {
+        vec![TitoIndexConfig {
+            condition: true,
+            name: "shop-by-name".to_string(),
+            fields: vec![TitoIndexField {
+                name: "name".to_string(),
+                r#type: TitoIndexFieldType::String,
+            }],
+        }]
+    }
+
+    fn references(&self) -> Vec<TitoReference> {
+        Vec::new()
+    }
+
+    fn is_deleting(&self) -> bool {
+        self.deleting
+    }
+
+    fn table() -> String {
+        "shops".to_string()
+    }
+
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn fence_stripes() -> u16 {
+        16
+    }
+}
+
+fn shop(id: &str) -> Shop {
+    Shop {
+        id: id.to_string(),
+        name: format!("Shop {id}"),
+        deleting: false,
+    }
+}
+
+fn shops(engine: &MemoryEngine) -> crate::TitoModel<MemoryEngine, Shop> {
+    engine.clone().model::<Shop>(TitoModelOptions::default())
+}
+
+async fn save_shop(engine: &MemoryEngine, value: Shop) -> Result<Shop, TitoError> {
+    let model = shops(engine);
+    engine
+        .transaction(|tx| {
+            let model = model.clone();
+            let value = value.clone();
+            async move { model.set(value).timestamps(false).execute(&tx).await }
+        })
+        .await
+}
+
+#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct Stand<const STRIPES: u16> {
+    id: String,
+    name: String,
+    deleting: bool,
+}
+
+impl<const STRIPES: u16> TitoModelTrait for Stand<STRIPES> {
+    fn indexes(&self) -> Vec<TitoIndexConfig> {
+        Vec::new()
+    }
+
+    fn references(&self) -> Vec<TitoReference> {
+        Vec::new()
+    }
+
+    fn is_deleting(&self) -> bool {
+        self.deleting
+    }
+
+    fn table() -> String {
+        format!("stands-{STRIPES}")
+    }
+
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn fence_stripes() -> u16 {
+        STRIPES
+    }
+}
+
+fn stand<const STRIPES: u16>(id: &str) -> Stand<STRIPES> {
+    Stand {
+        id: id.to_string(),
+        name: format!("Stand {id}"),
+        deleting: false,
+    }
+}
+
+fn stands<const STRIPES: u16>(
+    engine: &MemoryEngine,
+) -> crate::TitoModel<MemoryEngine, Stand<STRIPES>> {
+    engine
+        .clone()
+        .model::<Stand<STRIPES>>(TitoModelOptions::default())
+}
+
+async fn save_stand<const STRIPES: u16>(
+    engine: &MemoryEngine,
+    value: Stand<STRIPES>,
+) -> Result<Stand<STRIPES>, TitoError> {
+    let model = stands::<STRIPES>(engine);
+    engine
+        .transaction(|tx| {
+            let model = model.clone();
+            let value = value.clone();
+            async move { model.set(value).timestamps(false).execute(&tx).await }
+        })
+        .await
+}
+
+#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct Block {
     id: String,
     author_id: String,
@@ -334,6 +460,178 @@ impl TitoModelTrait for Post {
 
 fn engine() -> MemoryEngine {
     MemoryEngine::default()
+}
+
+fn fence_writes(writes: &[RecordedWrite]) -> Vec<String> {
+    assert!(!writes
+        .iter()
+        .any(|write| matches!(write, RecordedWrite::Put(key) if key.starts_with("fence:"))));
+    writes
+        .iter()
+        .filter_map(|write| match write {
+            RecordedWrite::Delete(key) if key.starts_with("fence:") => Some(key.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn deleting_writes(writes: &[RecordedWrite]) -> Vec<RecordedWrite> {
+    writes
+        .iter()
+        .filter(|write| match write {
+            RecordedWrite::Put(key) | RecordedWrite::Delete(key) => key.starts_with("deleting:"),
+        })
+        .cloned()
+        .collect()
+}
+
+fn stripe_keys(table: &str, id: &str, stripes: u16) -> Vec<String> {
+    (0..stripes)
+        .map(|stripe| crate::fence::fence_stripe_key(table, id, stripe))
+        .collect()
+}
+
+async fn save_writes<T: crate::types::TitoModelConstraints>(
+    engine: &MemoryEngine,
+    model: &crate::TitoModel<MemoryEngine, T>,
+    value: T,
+) -> Vec<RecordedWrite> {
+    engine.start_recording_writes().await;
+    engine
+        .transaction(|tx| {
+            let model = model.clone();
+            let value = value.clone();
+            async move { model.set(value).timestamps(false).execute(&tx).await }
+        })
+        .await
+        .unwrap();
+    engine.take_recorded_writes().await
+}
+
+async fn remove_writes<T: crate::types::TitoModelConstraints>(
+    engine: &MemoryEngine,
+    model: &crate::TitoModel<MemoryEngine, T>,
+    id: &str,
+) -> Vec<RecordedWrite> {
+    engine.start_recording_writes().await;
+    assert!(engine
+        .transaction(|tx| {
+            let model = model.clone();
+            let id = id.to_string();
+            async move { model.remove(&id, &tx).await }
+        })
+        .await
+        .unwrap());
+    engine.take_recorded_writes().await
+}
+
+async fn erase_writes<T: crate::types::TitoModelConstraints>(
+    engine: &MemoryEngine,
+    model: &crate::TitoModel<MemoryEngine, T>,
+    id: &str,
+) -> Vec<RecordedWrite> {
+    engine.start_recording_writes().await;
+    assert!(engine
+        .transaction(|tx| {
+            let model = model.clone();
+            let id = id.to_string();
+            async move { model.erase(id, &tx).await }
+        })
+        .await
+        .unwrap());
+    engine.take_recorded_writes().await
+}
+
+async fn repair_writes<T: crate::types::TitoModelConstraints>(
+    engine: &MemoryEngine,
+    model: &crate::TitoModel<MemoryEngine, T>,
+    id: &str,
+) -> Vec<RecordedWrite> {
+    engine.start_recording_writes().await;
+    let tx = engine.begin_transaction().await.unwrap();
+    model.rebuild_indexes_for_restore(id, &tx).await.unwrap();
+    tx.commit().await.unwrap();
+    engine.take_recorded_writes().await
+}
+
+fn picked_stripe(writes: &[RecordedWrite], table: &str, id: &str, stripes: u16) -> u16 {
+    let [RecordedWrite::Delete(key)] = writes else {
+        panic!("A shared check on a striped record writes one stripe key, not {writes:?}");
+    };
+    (0..stripes)
+        .find(|stripe| *key == crate::fence::fence_stripe_key(table, id, *stripe))
+        .unwrap_or_else(|| panic!("'{key}' is not a stripe key of {table} {id}"))
+}
+
+async fn staged_shared_check<T: crate::types::TitoModelConstraints>(
+    engine: &MemoryEngine,
+    model: &crate::TitoModel<MemoryEngine, T>,
+    id: &str,
+) -> (MemoryTransaction, u16) {
+    let tx = engine.begin_transaction().await.unwrap();
+    engine.start_recording_writes().await;
+    model.assert_current_shared(id, &tx).await.unwrap();
+    let writes = engine.take_recorded_writes().await;
+    let stripe = picked_stripe(&writes, &T::table(), id, T::fence_stripes());
+    assert_eq!(
+        stripe,
+        crate::fence::shared_fence_stripe(tx.shared_fence_pick(), T::fence_stripes())
+    );
+    (tx, stripe)
+}
+
+async fn transaction_in_stripe(
+    engine: &MemoryEngine,
+    stripes: u16,
+    wanted: impl Fn(u16) -> bool,
+) -> MemoryTransaction {
+    for _ in 0..1_000 {
+        let tx = engine.begin_transaction().await.unwrap();
+        let picked = crate::fence::shared_fence_stripe(tx.shared_fence_pick(), stripes);
+        if wanted(picked) {
+            return tx;
+        }
+        tx.rollback().await.unwrap();
+    }
+    panic!("No transaction within 1000 begins picked a wanted stripe of {stripes}");
+}
+
+async fn shared_check_in_stripe<T: crate::types::TitoModelConstraints>(
+    engine: &MemoryEngine,
+    model: &crate::TitoModel<MemoryEngine, T>,
+    id: &str,
+    stripe: u16,
+) -> MemoryTransaction {
+    let tx = transaction_in_stripe(engine, T::fence_stripes(), |picked| picked == stripe).await;
+    engine.start_recording_writes().await;
+    model.assert_current_shared(id, &tx).await.unwrap();
+    let writes = engine.take_recorded_writes().await;
+    assert_eq!(
+        picked_stripe(&writes, &T::table(), id, T::fence_stripes()),
+        stripe
+    );
+    tx
+}
+
+async fn assert_shared_checks_take_turns_only_within_one_stripe<
+    T: crate::types::TitoModelConstraints,
+>(
+    engine: &MemoryEngine,
+    model: &crate::TitoModel<MemoryEngine, T>,
+    id: &str,
+) {
+    let mut first = Vec::new();
+    let mut second = Vec::new();
+    for stripe in 0..T::fence_stripes() {
+        first.push(shared_check_in_stripe(engine, model, id, stripe).await);
+        second.push(shared_check_in_stripe(engine, model, id, stripe).await);
+    }
+    for tx in first {
+        tx.commit().await.unwrap();
+    }
+    for tx in second {
+        assert!(matches!(tx.commit().await, Err(TitoError::Retryable(_))));
+    }
 }
 
 fn cursor_for_key(key: &str) -> String {

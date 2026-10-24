@@ -39,8 +39,19 @@ to the complete `cargo test --locked --all-targets` phase. Every native case is 
   deliveries of one row conflict at commit and the retry skips, so the change applies once; a
   rolled-back handler transaction leaves the row and its owner index pending for redelivery; an
   undelivered event, a completed-row key and another event's pending row are refused without writes;
-- reference fences: a new pointer conflicts at commit with a concurrent removal or deleting mark
-  of its target, and two new pointers to one target conflict;
+- reference fences on a target with one fence stripe: a new pointer conflicts at commit with a
+  concurrent removal or deleting mark of the target; new pointers from sources in different link
+  stripes commit together, and two from sources in one link stripe conflict and the retry keeps
+  both;
+- reference fences on a target with sixteen fence stripes: a new pointer conflicts at commit with a
+  concurrent removal and with a concurrent deleting mark of the target; new pointers from sources
+  in different link stripes commit together, and two from sources in one link stripe conflict and
+  the retry keeps both;
+- shared checks: on a record with one stripe, two `assert_current_shared` checks conflict with
+  each other and each conflicts with an update; on records with sixteen stripes, two transactions
+  whose `shared_fence_pick()` falls in different stripes check twenty records and commit together,
+  two whose picks fall in one stripe conflict and the retry passes, and a check conflicts with an
+  update of the record in either commit order;
 - `assert_current` against a concurrent update in both commit orders, and `assert_version` against
   a concurrent update;
 - two concurrent claims of one unique value conflict and the retry is refused, while values that

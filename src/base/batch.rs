@@ -50,6 +50,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         timestamps: bool,
         tx: &E::Transaction,
     ) -> Result<Vec<T>, TitoError> {
+        let stripes = self.stripes()?;
         if replacements.is_empty() || replacements.len() > MAX_REPLACE_MANY_RECORDS {
             return Err(TitoError::InvalidInput(format!(
                 "Batch replacement requires 1..={} records",
@@ -267,9 +268,19 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                 }
             }
             deletes.extend(
-                self.check_reference_targets(&external, &replacement.reference_keys, tx)
-                    .await?,
+                self.check_reference_targets(
+                    &replacement.id,
+                    &external,
+                    &replacement.reference_keys,
+                    tx,
+                )
+                .await?,
             );
+            let old_marker = replacement
+                .reference_keys
+                .contains(&deleting_marker_key(&T::table(), &replacement.id));
+            let marker_written = old_marker != replacement.marker.is_some();
+            deletes.extend(Self::fence_keys(stripes, &replacement.id, marker_written));
         }
 
         let mut writes = BTreeMap::new();

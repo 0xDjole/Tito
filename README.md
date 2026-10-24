@@ -130,6 +130,9 @@ impl TitoModelTrait for User {
 
 `references` and `is_deleting` have no default, so a model can't forget them. A model that points
 at nothing returns an empty list, and a model with no deleting state returns `false`.
+`fence_stripes()` defaults to 1, which means the record itself is its fence. A model whose records
+many transactions check with `assert_current_shared` at the same time returns more, such as 16, and
+0 is refused (see [Fences](#fences)).
 
 ## CRUD Operations
 
@@ -155,7 +158,11 @@ Tito reads and writes one model at a time. Applications load related records exp
 domain and API boundaries determine when an additional read is required. When a transaction
 depends on an existing record remaining unchanged, `model.assert_current(id, &tx)` reads and stages
 the exact primary bytes after validating its storage metadata, without deserializing the model,
-changing timestamps, touching indexes, or creating a second lock record.
+changing timestamps, touching indexes, or creating a second lock record. Two such fences on one
+record conflict with each other. When a transaction only needs the record to still exist and be
+current, it uses `model.assert_current_shared(id, &tx)`. On a model with several fence stripes
+the checks of two transactions take turns only when the transactions pick the same stripe; see
+[Fences](#fences).
 
 `model.get_versioned(id, transaction)` returns `TitoVersioned<T>` with the model in `value` and
 an opaque `TitoRecordVersion` in `version`. The version is the positive transaction version saved
@@ -262,16 +269,96 @@ goes too. Keys that other records hold pointing at the erased record stay until 
 **Index repair.** `rebuild_indexes_for_restore` rebuilds reference keys and the marker from the
 record, like index keys. It doesn't read the targets, so records can be restored in any order.
 
-**Concurrency.** Tito's TiKV transactions are optimistic, and reads aren't checked at commit, so the
-guard writes a key that conflicting transactions share. Three operations write the target's marker
-key:
-- a save that adds a pointer deletes it, which changes nothing because the key is absent;
-- a remove of the target deletes it;
-- marking the target deleting puts it.
+**Concurrency.** A save that adds a pointer writes one of its target's 16 link stripes, and every
+remove and deleting mark of the target writes all 16, so a pointer added while its target is
+removed or marked deleting conflicts at commit and the retry sees the new state. Two pointers added
+to one target at the same moment conflict only when their sources fall in the same link stripe,
+whatever the target's own stripes. See [Fences](#fences).
 
-So a pointer added while its target is removed or marked deleting conflicts at commit, and the
-retried transaction sees the new state. Two saves that each add a pointer to the same target at the
-same moment also conflict, and one retries. A save that only keeps its pointers writes no fence.
+## Fences
+
+Tito's TiKV transactions are optimistic and reads aren't checked at commit, so a transaction that
+depends on a record writes a key that every transaction it must not overlap also writes. TiKV
+cancels one of two overlapping transactions that write the same key, Tito retries it at most 10
+times, and the retry sees the new state.
+
+**Stripe keys.** A record's fence stripes are keys of this form:
+
+```
+fence:{table}:{id}:{stripe}
+```
+
+The table and id are escaped like reference keys. A stripe key is only ever written as a delete. No
+value is stored at it, so it is never listed in a manifest and erase and index repair have nothing
+to clean up. A manifest that lists one is an integrity error. A record has two sets of stripes, both
+counted from 0:
+- **Record stripes.** A model says how many fence stripes its records have, the way a hot lock is
+  striped: `fence_stripes() -> u16`. The default, 1, means the record itself is its only stripe, so
+  it has no record stripe keys. A model with N stripes, N of at least 2, gives each record stripes
+  0 to N - 1.
+- **Link stripes.** Every record has 16, stripes 0 to 15, whatever its model's N. They fence new
+  pointers to the record against its removal and deleting mark.
+
+With N = 16 both sets are the same 16 keys. An operation that writes both writes each key once:
+stripes 0 to max(N, 16) - 1.
+
+Each operation writes these fence keys of a record, besides its ordinary keys:
+
+| What happens to a record | Fence keys written |
+| --- | --- |
+| `assert_current` or `assert_version` on it | its primary key, rewritten unchanged |
+| `assert_current_shared` on it | with 1 stripe, its primary key, rewritten unchanged as `assert_current` does; with N, its record stripe `tx.shared_fence_pick() % N` |
+| another record's save adds a pointer to it | one of its 16 link stripes, picked from the source's table and id |
+| another record's save keeps its pointer to it | nothing |
+| a save, `replace_many`, `erase` or `rebuild_indexes_for_restore` of it that doesn't write its deleting marker | its N record stripes, none with 1 stripe |
+| an operation that writes its deleting marker: every `remove`, a save or `replace_many` that marks it deleting or clears the mark, and an `erase` or `rebuild_indexes_for_restore` while it is deleting | its record stripes and its 16 link stripes, each once |
+
+So:
+- a new pointer conflicts with every removal or deleting mark of its target that it overlaps,
+  whatever the target's stripes; the retry fails with `ReferenceMissing` or `ReferenceDeleting`, or
+  the remove's retry fails with `Referenced`;
+- two new pointers to one target conflict only when their sources fall in the same link stripe, and
+  then one retries;
+- a new pointer commits beside a plain save of a target with 1 stripe; a plain save of a target with
+  N stripes writes stripes 0 to N - 1, so it conflicts with the new pointers whose link stripe is
+  below N, which with 16 is every new pointer;
+- on a record with 1 stripe, shared checks conflict with each other, with `assert_current` and with
+  every save of the record, exactly like `assert_current`;
+- on a record with N stripes, the shared checks of two transactions conflict only when the
+  transactions pick the same stripe, every save, deleting mark, remove and erase of the record
+  conflicts with every shared check it overlaps, and `assert_current` and `assert_version` don't
+  conflict with shared checks, because neither kind changes the record.
+
+**Stripe choice.** A pointer's link stripe is FNV-1a 64 of `{source table}:{source id}`, escaped as
+in keys, modulo 16, so one source always fences the same link stripe of a target, pointers from many
+sources spread over the 16, and Tito needs nothing from the target's model to pick it. A
+transaction draws one random 64-bit number when it begins, `tx.shared_fence_pick()`, and every
+shared check in it writes stripe `pick % N` of its record. So one transaction writes the same stripe
+number on every record with N stripes it checks, and checking a record twice writes one key. Two
+transactions take turns on their shared checks only when their picks fall in the same stripe: with
+16, one pair in 16, however many such records both check. A retry is a new transaction, so it draws
+again. An engine that implements `TitoTransaction` draws a new pick for each transaction it begins.
+
+**Choosing N.** 1 costs nothing and suits most models, and pointers to their records already spread
+over the 16 link stripes. A model whose records many concurrent transactions check with
+`assert_current_shared`, such as a store during a sale, returns more: with 16, the checks of two
+transactions take turns only when the transactions pick the same stripe, and every save, remove,
+erase and repair of the record pays 16 stripe deletes. Busy models that the same transactions check
+should share one N, because the record with the fewest stripes among those two transactions both
+check sets how often they take turns. Changing a model's count is like a Tito upgrade: don't run
+writers that disagree on it together, because a save by one doesn't write the stripe a shared check
+by the other writes.
+
+**Shared checks.** `model.assert_current_shared(id, &tx)` works on every model. It reads and
+validates the record like `assert_current` and fails with `NotFound` when it is missing. On a model
+with 1 stripe it is `assert_current`; with N stripes it writes the stripe key of its transaction's
+pick and changes no stored byte and no record version. Use it where a transaction only needs the
+record to still exist and be current, such as a store that must not be closing while orders are
+written in it. Keep `assert_current` or `assert_version` where the fence is a compare-and-set.
+
+**Zero stripes.** A model whose `fence_stripes()` is 0 is refused with `TitoError::Configuration`,
+never rounded up: `set`, `replace_many`, `remove`, `erase`, `rebuild_indexes_for_restore` and
+`assert_current_shared` fail before they read or write.
 
 ## Storage integrity and pagination
 
@@ -281,10 +368,12 @@ expected serialized record, and each replacement keeps its source ID. The method
 serializes the complete batch before staging any write. Unique keys may move between included
 sources, including swap cycles; a final duplicate key or an owner outside the batch is refused.
 References use the batch's final target states: existing links may remain while a target becomes
-Deleting, but a new link cannot point at a final Deleting target. External target checks retain
-the normal deleting-marker conflict fences. Each source primary is replaced, fencing concurrent
-source changes, and all manifests receive the transaction's record version. Timestamp handling
-matches `set`; pass `timestamps(false)` to retain application-authored times.
+Deleting, but a new link cannot point at a final Deleting target. External target checks keep the
+normal reference fence: a new link writes one of its target's 16 link stripes, a replaced record of
+a model with several fence stripes has all of them written, and a replacement that marks a record
+deleting or clears the mark also writes its 16 link stripes. Each source primary is replaced,
+fencing concurrent source changes, and all manifests receive the transaction's record version.
+Timestamp handling matches `set`; pass `timestamps(false)` to retain application-authored times.
 
 A batch contains 1–100 distinct existing records. Its combined old and prepared storage keys
 must fit 10,000 keys, and its prepared writes and deletion keys must fit 8 MiB. Invalid input,
@@ -297,7 +386,7 @@ Each persisted model row has a matching `reverse-index:{primary-key}` manifest c
 required record `version` and index-key `value` array, including models with no secondary indexes.
 Primary, metadata and secondary indexes commit atomically. The manifest may name ordinary `index:` keys ending in that exact
 primary key, model-scoped `unique-index:` keys whose stored owner matches that primary record, the
-record's own `ref:` keys and its own `deleting:` marker.
+record's own `ref:` keys and its own `deleting:` marker. It never names a `fence:` stripe key.
 Updates and removals validate the pair and every unique owner before mutating either side. A
 missing, orphaned, malformed, or syntactically cross-record manifest is an integrity error; Tito
 does not reinterpret it as a missing entity or follow it to an unrelated key.
@@ -312,8 +401,10 @@ application's explicit pre-production reset and backup-format cutover.
 
 For offline repair of lost or stale secondary indexes under an unchanged model,
 `model.rebuild_indexes_for_restore(id, &tx)` validates the retained primary and reverse manifest,
-then rewrites only their declared index values, reference keys and deleting marker. The primary
-bytes, manifest bytes and original record version are preserved and fenced in the same transaction.
+then rewrites only their declared index values, reference keys and deleting marker. A record of a
+model with several fence stripes also has all its stripe keys written, as a save would, and a
+deleting record also has its 16 link stripes written with its marker. The primary bytes, manifest
+bytes and original record version are preserved and fenced in the same transaction.
 Missing secondary keys are allowed; a unique key owned by another record is not. Ordinary writes
 still reject missing unique keys. Missing versions, duplicate or foreign manifest keys, a
 primary/key mismatch, or a manifest that differs from the current model's indexes, references or
@@ -340,6 +431,35 @@ advancing the final character can skip keys such as `a20` after `a2`. Use `key_a
 Secondary index values intentionally remain complete clones of the primary JSON document. This
 preserves the existing storage wire format and query behavior. Removing that redundancy requires a
 separately designed release that rehydrates primary rows and migrates every existing index.
+
+### 0.18.4 fence stripes
+
+- `TitoModelTrait` gains `fence_stripes() -> u16`, default 1, and `TitoModel` gains
+  `assert_current_shared(id, &tx)` for every model. On a model with 1 stripe the shared check
+  rewrites the record like `assert_current`, and saves of its records write no record stripe.
+- `TitoTransaction` gains `shared_fence_pick() -> u64` beside `start_version()`: a random number the
+  transaction draws when it begins. `TiKVBackend::begin_transaction` and the in-memory test engine
+  draw one for every transaction, and an engine that implements `TitoTransaction` must too.
+- A model with N stripes, N of at least 2, has N record stripe keys per record,
+  `fence:{table}:{id}:{stripe}`. A shared check writes stripe `pick % N`, where the pick is its
+  transaction's `shared_fence_pick()`, so all shared checks of one transaction write one stripe
+  number and a retry draws again; every save, `replace_many`, remove, erase and repair of the record
+  writes all N. Shared checks of transactions whose picks fall in different stripes stop taking
+  turns, while every change of the record still conflicts with each of them.
+- Every record has 16 link stripes under the same key format, whatever its model's N. A new pointer
+  writes one of its target's, picked from the source's table and id, instead of the target's
+  `deleting:` key. Every write of a record's deleting marker (a remove, a deleting mark or its
+  clearing, and an erase or repair of a deleting record) also writes all 16. So a new pointer still
+  conflicts with every removal and deleting mark of its target, while new pointers to one target
+  conflict only when their sources share a link stripe.
+- A model whose `fence_stripes()` is 0 is refused with `TitoError::Configuration`.
+- Stripe keys are write-only deletes: stored records, manifests and key formats are unchanged, and
+  nothing needs migrating. Don't run 0.18.3 writers beside 0.18.4 writers: a remove or mark by a
+  0.18.3 writer doesn't write the link stripe a new pointer by a 0.18.4 writer writes. Don't run
+  writers that disagree on a model's stripes together either: a save by one doesn't write the stripe
+  a shared check by the other writes.
+- The in-memory test engine detects write-write conflicts at commit, applies only the keys a
+  transaction wrote, and retries a conflicting commit like `TiKVBackend::transaction`.
 
 ### 0.18.3 exact index values, fixed partitions and bounded reads
 
@@ -659,7 +779,7 @@ transfer witness. Every phase is required. See [complete verification](docs/veri
 prerequisites, source holds, native ownership, cleanup and retained evidence.
 
 The library cases use the in-memory engine and cover model/index writes, exact index values,
-reference keys, refusals and staged fence writes, queue transitions, fixed partitions, exact
+reference keys, refusals, staged fence writes and fence stripe conflicts, queue transitions, fixed partitions, exact
 signed millisecond scheduling and completion, exact inclusive cutoff buckets and signed extrema,
 configured retention, cluster ownership and leases, worker paging and shutdown, and ambiguous
 transaction outcomes. `tikv_native_orphan_lock_test` creates a real secondary lock after a definite primary
@@ -670,10 +790,18 @@ client's 32 MiB decoding budget, through scans, index pages and a batch get, and
 events of almost 1 MiB. `tikv_native_queue_test` proves that cluster-worker and standalone-worker
 handlers complete their own pending row inside their transaction, that a duplicate delivery
 conflicts on that row and its retry skips, that a rolled-back handler leaves the row pending, and
-that `ack_in_tx` refuses events and keys it does not own without writing. `tikv_native_fence_test` proves on real TiKV that reference fences, `assert_current`,
-`assert_version` and unique claims conflict at commit, and that unique values differing only by
-case or spacing coexist. The in-memory engine never detects conflicts, so conflict behaviour is
-proven only by these native cases. Examples are compiled but not run against a live database.
+that `ack_in_tx` refuses events and keys it does not own without writing. `tikv_native_fence_test`
+proves on real TiKV that a new pointer conflicts with a removal or deleting mark of its target,
+whether the target has 1 fence stripe or 16; that new pointers to a target with 1 stripe or 16
+commit together from sources in different link stripes and conflict from sources in one; that
+shared checks on a record with 1 stripe conflict with each other and with an update, while on
+records with 16, two transactions whose picks fall in different stripes check twenty records and
+commit together, two whose picks fall in one stripe conflict and the retry passes, and a check
+conflicts with an update in either commit order; that `assert_current`, `assert_version` and unique
+claims conflict at commit; and that unique values differing only by case or spacing coexist. The in-memory engine fails a commit with
+`TitoError::Retryable` when another transaction committed one of its keys after it started, as TiKV
+does, so the library cases cover these conflicts too; the native cases prove them on TiKV. Examples
+are compiled but not run against a live database.
 
 Application-level primary-commit response loss, provider effects, backup and restore remain the
 application's complete-suite responsibility against the exact released Tito revision. The native

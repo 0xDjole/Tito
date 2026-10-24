@@ -1,8 +1,8 @@
 use super::*;
+use crate::fence::{fence_stripe_key, link_fence_key, source_fence_stripe, LINK_FENCE_STRIPES};
 use crate::reference::{deleting_marker_key, reference_key};
-use crate::test_support::RecordedWrite;
-use crate::types::TitoTransaction;
 use crate::TitoModel;
+use std::collections::HashSet;
 
 #[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct Picture {
@@ -289,6 +289,77 @@ async fn picture_referenced_by_except(
     result
 }
 
+async fn staged_gallery(engine: &MemoryEngine, value: Gallery) -> MemoryTransaction {
+    let tx = engine.begin_transaction().await.unwrap();
+    galleries(engine)
+        .set(value)
+        .timestamps(false)
+        .execute(&tx)
+        .await
+        .unwrap();
+    tx
+}
+
+async fn staged_pointer(engine: &MemoryEngine, value: Pointer) -> MemoryTransaction {
+    let tx = engine.begin_transaction().await.unwrap();
+    pointers(engine)
+        .set(value)
+        .timestamps(false)
+        .execute(&tx)
+        .await
+        .unwrap();
+    tx
+}
+
+fn link(table: &str, id: &str) -> Vec<TitoReference> {
+    vec![TitoReference::new(table, id, "items.0")]
+}
+
+fn from_pointer(pointer_id: &str) -> TitoIncomingReference {
+    TitoIncomingReference::new("pointers", pointer_id, "items.0")
+}
+
+fn link_stripe(pointer_id: &str) -> u16 {
+    source_fence_stripe("pointers", pointer_id, LINK_FENCE_STRIPES)
+}
+
+fn pointer_ids_in_distinct_link_stripes() -> Vec<String> {
+    let mut picked = HashSet::new();
+    let ids: Vec<String> = (0..1_000)
+        .map(|position| format!("x{position}"))
+        .filter(|id| picked.insert(link_stripe(id)))
+        .take(usize::from(LINK_FENCE_STRIPES))
+        .collect();
+    assert_eq!(ids.len(), usize::from(LINK_FENCE_STRIPES));
+    ids
+}
+
+fn pointer_id_whose_link_stripe(prefix: &str, wanted: impl Fn(u16) -> bool) -> String {
+    (0..1_000)
+        .map(|position| format!("{prefix}{position}"))
+        .find(|id| wanted(link_stripe(id)))
+        .unwrap()
+}
+
+async fn remove_shop(engine: &MemoryEngine, id: &str) -> Result<bool, TitoError> {
+    let model = shops(engine);
+    engine
+        .transaction(|tx| {
+            let model = model.clone();
+            let id = id.to_string();
+            async move { model.remove(&id, &tx).await }
+        })
+        .await
+}
+
+async fn shop_referenced_by(engine: &MemoryEngine, id: &str) -> Vec<TitoIncomingReference> {
+    let model = shops(engine);
+    let tx = engine.begin_transaction().await.unwrap();
+    let result = model.referenced_by(id, &tx).await.unwrap();
+    tx.rollback().await.unwrap();
+    result
+}
+
 async fn put_incoming(
     engine: &MemoryEngine,
     picture_id: &str,
@@ -418,7 +489,11 @@ async fn a_missing_target_fails_the_save_without_writing() {
         }
     );
     assert!(!engine.contains_key("table:galleries:g1").await);
-    assert!(!engine.contains_key("reverse-index:table:galleries:g1").await);
+    assert!(
+        !engine
+            .contains_key("reverse-index:table:galleries:g1")
+            .await
+    );
     assert!(engine.keys_with_prefix("ref:").await.is_empty());
     assert!(engine
         .keys_with_prefix("index:gallery-by-title:")
@@ -623,7 +698,11 @@ async fn remove_drops_the_source_reference_keys_and_its_deleting_marker() {
     assert!(engine.keys_with_prefix("ref:").await.is_empty());
     assert!(!engine.contains_key(&marker).await);
     assert!(!engine.contains_key("table:galleries:g1").await);
-    assert!(!engine.contains_key("reverse-index:table:galleries:g1").await);
+    assert!(
+        !engine
+            .contains_key("reverse-index:table:galleries:g1")
+            .await
+    );
     assert!(engine
         .keys_with_prefix("index:gallery-by-title:")
         .await
@@ -767,9 +846,11 @@ async fn erase_removes_a_referenced_record_without_the_check() {
 
     assert!(!engine.contains_key("table:pictures:p1").await);
     assert!(!engine.contains_key("reverse-index:table:pictures:p1").await);
-    assert!(!engine
-        .contains_key(&deleting_marker_key("pictures", "p1"))
-        .await);
+    assert!(
+        !engine
+            .contains_key(&deleting_marker_key("pictures", "p1"))
+            .await
+    );
     assert!(engine
         .keys_with_prefix("index:picture-by-name:")
         .await
@@ -1003,7 +1084,11 @@ async fn a_manifest_over_the_key_or_byte_limit_fails_the_save() {
 
     let too_large = (0..600)
         .map(|position| {
-            TitoReference::new("pictures", "p1", format!("{position}.{}", "p".repeat(2_000)))
+            TitoReference::new(
+                "pictures",
+                "p1",
+                format!("{position}.{}", "p".repeat(2_000)),
+            )
         })
         .collect();
     assert!(matches!(
@@ -1064,7 +1149,9 @@ async fn key_segments_escape_separators_so_ids_never_collide() {
         vec![TitoIncomingReference::new("pointers", "x3", "items.0")]
     );
 
-    save_pointer(&engine, pointer("x3", Vec::new())).await.unwrap();
+    save_pointer(&engine, pointer("x3", Vec::new()))
+        .await
+        .unwrap();
     assert!(remove_picture(&engine, "back\\slash").await.unwrap());
     assert!(matches!(
         remove_picture(&engine, "a").await,
@@ -1077,24 +1164,33 @@ async fn key_segments_escape_separators_so_ids_never_collide() {
 }
 
 #[tokio::test]
-async fn adding_a_reference_fences_the_target_and_keeping_one_does_not() {
+async fn adding_a_reference_to_a_one_stripe_target_writes_one_link_stripe_and_keeping_one_writes_none(
+) {
     let engine = engine();
-    for id in ["p1", "p2", "p3"] {
+    for id in ["p1", "p2"] {
         save_picture(&engine, picture(id)).await.unwrap();
     }
+    let stripe = source_fence_stripe("galleries", "g1", LINK_FENCE_STRIPES);
 
     engine.start_recording_writes().await;
     save_gallery(&engine, gallery("g1", &["p1"])).await.unwrap();
     let writes = engine.take_recorded_writes().await;
-    assert!(writes.contains(&RecordedWrite::Delete(deleting_marker_key("pictures", "p1"))));
+    assert_eq!(
+        fence_writes(&writes),
+        vec![fence_stripe_key("pictures", "p1", stripe)]
+    );
+    assert!(deleting_writes(&writes).is_empty());
 
     engine.start_recording_writes().await;
     let mut renamed = gallery("g1", &["p1", "p2"]);
     renamed.title = "Renamed".to_string();
     save_gallery(&engine, renamed).await.unwrap();
     let writes = engine.take_recorded_writes().await;
-    assert!(writes.contains(&RecordedWrite::Delete(deleting_marker_key("pictures", "p2"))));
-    assert!(!writes.contains(&RecordedWrite::Delete(deleting_marker_key("pictures", "p1"))));
+    assert_eq!(
+        fence_writes(&writes),
+        vec![fence_stripe_key("pictures", "p2", stripe)]
+    );
+    assert!(deleting_writes(&writes).is_empty());
     assert!(!writes.contains(&RecordedWrite::Put(picture_key(
         "p1",
         "g1",
@@ -1110,16 +1206,711 @@ async fn adding_a_reference_fences_the_target_and_keeping_one_does_not() {
         "g1",
         "picture_ids.1"
     ))));
+    assert!(engine.keys_with_prefix("fence:").await.is_empty());
+}
+
+#[tokio::test]
+async fn every_write_of_a_one_stripe_records_deleting_marker_writes_its_sixteen_link_stripes() {
+    let engine = engine();
+    let model = pictures(&engine);
+    let links = stripe_keys("pictures", "p1", LINK_FENCE_STRIPES);
+    let marker = deleting_marker_key("pictures", "p1");
+    let mut renamed = deleting_picture("p1");
+    renamed.name = "Renamed".to_string();
+
+    let writes = save_writes(&engine, &model, picture("p1")).await;
+    assert!(fence_writes(&writes).is_empty());
+    let writes = repair_writes(&engine, &model, "p1").await;
+    assert!(deleting_writes(&writes).is_empty());
+    assert!(fence_writes(&writes).is_empty());
+
+    let writes = save_writes(&engine, &model, deleting_picture("p1")).await;
+    assert_eq!(
+        deleting_writes(&writes),
+        vec![RecordedWrite::Put(marker.clone())]
+    );
+    assert_eq!(fence_writes(&writes), links);
+
+    let writes = save_writes(&engine, &model, renamed).await;
+    assert!(deleting_writes(&writes).is_empty());
+    assert!(fence_writes(&writes).is_empty());
+
+    let writes = repair_writes(&engine, &model, "p1").await;
+    assert_eq!(
+        deleting_writes(&writes),
+        vec![RecordedWrite::Put(marker.clone())]
+    );
+    assert_eq!(fence_writes(&writes), links);
+
+    let writes = save_writes(&engine, &model, picture("p1")).await;
+    assert_eq!(
+        deleting_writes(&writes),
+        vec![RecordedWrite::Delete(marker.clone())]
+    );
+    assert_eq!(fence_writes(&writes), links);
+
+    let writes = remove_writes(&engine, &model, "p1").await;
+    assert_eq!(
+        deleting_writes(&writes),
+        vec![RecordedWrite::Delete(marker.clone())]
+    );
+    assert_eq!(fence_writes(&writes), links);
+
+    save_picture(&engine, picture("p1")).await.unwrap();
+    let writes = erase_writes(&engine, &model, "p1").await;
+    assert!(deleting_writes(&writes).is_empty());
+    assert!(fence_writes(&writes).is_empty());
+
+    save_picture(&engine, deleting_picture("p1")).await.unwrap();
+    let writes = erase_writes(&engine, &model, "p1").await;
+    assert_eq!(
+        deleting_writes(&writes),
+        vec![RecordedWrite::Delete(marker)]
+    );
+    assert_eq!(fence_writes(&writes), links);
+    assert!(engine.keys_with_prefix("fence:").await.is_empty());
+}
+
+#[tokio::test]
+async fn links_to_a_one_stripe_target_from_sources_in_different_link_stripes_commit_together() {
+    let engine = engine();
+    save_picture(&engine, picture("p1")).await.unwrap();
+    let sources = pointer_ids_in_distinct_link_stripes();
+    let mut staged = Vec::new();
+    for id in &sources {
+        staged.push(staged_pointer(&engine, pointer(id, link("pictures", "p1"))).await);
+    }
+
+    for tx in staged {
+        tx.commit().await.unwrap();
+    }
+
+    let mut pointing = picture_referenced_by(&engine, "p1").await.unwrap();
+    pointing.sort();
+    let mut expected: Vec<TitoIncomingReference> =
+        sources.iter().map(|id| from_pointer(id)).collect();
+    expected.sort();
+    assert_eq!(pointing, expected);
+    assert!(matches!(
+        remove_picture(&engine, "p1").await,
+        Err(TitoError::Referenced { .. })
+    ));
+    assert!(engine.keys_with_prefix("fence:").await.is_empty());
+}
+
+#[tokio::test]
+async fn links_to_a_one_stripe_target_from_sources_in_one_link_stripe_collide_and_the_retry_keeps_both(
+) {
+    let engine = engine();
+    save_picture(&engine, picture("p1")).await.unwrap();
+    let neighbour = pointer_id_whose_link_stripe("y", |stripe| stripe == link_stripe("x1"));
+    let first = staged_pointer(&engine, pointer("x1", link("pictures", "p1"))).await;
+    let second = staged_pointer(&engine, pointer(&neighbour, link("pictures", "p1"))).await;
+
+    first.commit().await.unwrap();
+    assert!(matches!(
+        second.commit().await,
+        Err(TitoError::Retryable(_))
+    ));
+
+    save_pointer(&engine, pointer(&neighbour, link("pictures", "p1")))
+        .await
+        .unwrap();
+    assert_eq!(
+        picture_referenced_by(&engine, "p1").await.unwrap(),
+        vec![from_pointer("x1"), from_pointer(&neighbour)]
+    );
+}
+
+#[tokio::test]
+async fn a_link_to_a_one_stripe_target_collides_with_a_remove_of_it_in_either_order() {
+    let engine = engine();
+    save_picture(&engine, picture("p1")).await.unwrap();
+
+    let pointing = staged_gallery(&engine, gallery("g1", &["p1"])).await;
+    assert!(remove_picture(&engine, "p1").await.unwrap());
+    assert!(matches!(
+        pointing.commit().await,
+        Err(TitoError::Retryable(_))
+    ));
+    assert_eq!(
+        save_gallery(&engine, gallery("g1", &["p1"]))
+            .await
+            .unwrap_err(),
+        TitoError::ReferenceMissing {
+            table: "pictures".to_string(),
+            id: "p1".to_string(),
+            path: "picture_ids.0".to_string(),
+        }
+    );
+    assert!(!engine.contains_key("table:galleries:g1").await);
+    assert!(engine.keys_with_prefix("ref:").await.is_empty());
+
+    save_picture(&engine, picture("p1")).await.unwrap();
+    let removing = engine.begin_transaction().await.unwrap();
+    assert!(pictures(&engine).remove("p1", &removing).await.unwrap());
+    save_gallery(&engine, gallery("g1", &["p1"])).await.unwrap();
+    assert!(matches!(
+        removing.commit().await,
+        Err(TitoError::Retryable(_))
+    ));
+    assert_eq!(
+        remove_picture(&engine, "p1").await.unwrap_err(),
+        TitoError::Referenced {
+            table: "pictures".to_string(),
+            id: "p1".to_string(),
+            by: vec![from_gallery("g1", "picture_ids.0")],
+        }
+    );
+    assert!(engine.contains_key("table:pictures:p1").await);
+    assert!(engine.keys_with_prefix("fence:").await.is_empty());
+}
+
+#[tokio::test]
+async fn a_link_to_a_one_stripe_target_collides_with_a_deleting_mark_of_it_in_either_order() {
+    let engine = engine();
+    save_picture(&engine, picture("p1")).await.unwrap();
+    save_picture(&engine, picture("p2")).await.unwrap();
+
+    let pointing = staged_gallery(&engine, gallery("g1", &["p1"])).await;
+    save_picture(&engine, deleting_picture("p1")).await.unwrap();
+    assert!(matches!(
+        pointing.commit().await,
+        Err(TitoError::Retryable(_))
+    ));
+    assert_eq!(
+        save_gallery(&engine, gallery("g1", &["p1"]))
+            .await
+            .unwrap_err(),
+        TitoError::ReferenceDeleting {
+            table: "pictures".to_string(),
+            id: "p1".to_string(),
+            path: "picture_ids.0".to_string(),
+        }
+    );
+    assert!(picture_referenced_by(&engine, "p1")
+        .await
+        .unwrap()
+        .is_empty());
+
+    let marking = engine.begin_transaction().await.unwrap();
+    pictures(&engine)
+        .set(deleting_picture("p2"))
+        .timestamps(false)
+        .execute(&marking)
+        .await
+        .unwrap();
+    save_gallery(&engine, gallery("g2", &["p2"])).await.unwrap();
+    assert!(matches!(
+        marking.commit().await,
+        Err(TitoError::Retryable(_))
+    ));
+    assert!(
+        !engine
+            .contains_key(&deleting_marker_key("pictures", "p2"))
+            .await
+    );
+    assert_eq!(
+        picture_referenced_by(&engine, "p2").await.unwrap(),
+        vec![from_gallery("g2", "picture_ids.0")]
+    );
+    assert!(engine.keys_with_prefix("fence:").await.is_empty());
+}
+
+#[tokio::test]
+async fn a_link_to_a_one_stripe_target_commits_beside_a_plain_save_of_it() {
+    let engine = engine();
+    save_picture(&engine, picture("p1")).await.unwrap();
+    let mut renamed = picture("p1");
+    renamed.name = "Renamed".to_string();
+
+    let pointing = staged_gallery(&engine, gallery("g1", &["p1"])).await;
+    save_picture(&engine, renamed).await.unwrap();
+    pointing.commit().await.unwrap();
+
+    let mut renamed_again = picture("p1");
+    renamed_again.name = "Renamed again".to_string();
+    let renaming = engine.begin_transaction().await.unwrap();
+    pictures(&engine)
+        .set(renamed_again.clone())
+        .timestamps(false)
+        .execute(&renaming)
+        .await
+        .unwrap();
+    save_gallery(&engine, gallery("g2", &["p1"])).await.unwrap();
+    renaming.commit().await.unwrap();
+
+    assert_eq!(
+        pictures(&engine).get("p1").execute(None).await.unwrap(),
+        renamed_again
+    );
+    assert_eq!(
+        picture_referenced_by(&engine, "p1").await.unwrap(),
+        vec![
+            from_gallery("g1", "picture_ids.0"),
+            from_gallery("g2", "picture_ids.0"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_save_that_keeps_its_link_to_a_one_stripe_target_commits_beside_a_deleting_mark_of_it() {
+    let engine = engine();
+    save_picture(&engine, picture("p1")).await.unwrap();
+    save_gallery(&engine, gallery("g1", &["p1"])).await.unwrap();
+    let mut renamed = gallery("g1", &["p1"]);
+    renamed.title = "Renamed".to_string();
+
+    let renaming = staged_gallery(&engine, renamed.clone()).await;
+    save_picture(&engine, deleting_picture("p1")).await.unwrap();
+    renaming.commit().await.unwrap();
+
+    assert_eq!(
+        galleries(&engine).get("g1").execute(None).await.unwrap(),
+        renamed
+    );
+    assert_eq!(
+        engine
+            .raw_json(&deleting_marker_key("pictures", "p1"))
+            .await
+            .unwrap(),
+        json!(true)
+    );
+}
+
+#[tokio::test]
+async fn adding_a_reference_to_a_sixteen_stripe_target_writes_one_stripe_key_and_keeping_one_writes_none(
+) {
+    let engine = engine();
+    for id in ["s1", "s2"] {
+        save_shop(&engine, shop(id)).await.unwrap();
+    }
+    let stripe = link_stripe("x1");
 
     engine.start_recording_writes().await;
-    assert!(remove_picture(&engine, "p3").await.unwrap());
+    save_pointer(&engine, pointer("x1", link("shops", "s1")))
+        .await
+        .unwrap();
     let writes = engine.take_recorded_writes().await;
-    assert!(writes.contains(&RecordedWrite::Delete(deleting_marker_key("pictures", "p3"))));
+    assert_eq!(
+        fence_writes(&writes),
+        vec![fence_stripe_key("shops", "s1", stripe)]
+    );
+    assert!(!writes.contains(&RecordedWrite::Delete(deleting_marker_key("shops", "s1"))));
 
     engine.start_recording_writes().await;
-    save_picture(&engine, deleting_picture("p2")).await.unwrap();
+    save_pointer(
+        &engine,
+        pointer(
+            "x1",
+            vec![
+                TitoReference::new("shops", "s1", "items.0"),
+                TitoReference::new("shops", "s2", "items.1"),
+            ],
+        ),
+    )
+    .await
+    .unwrap();
     let writes = engine.take_recorded_writes().await;
-    assert!(writes.contains(&RecordedWrite::Put(deleting_marker_key("pictures", "p2"))));
+    assert_eq!(
+        fence_writes(&writes),
+        vec![fence_stripe_key("shops", "s2", stripe)]
+    );
+    assert!(!writes.contains(&RecordedWrite::Delete(deleting_marker_key("shops", "s2"))));
+    let kept = reference_key("shops", "s1", "pointers", "x1", "items.0");
+    assert!(!writes.contains(&RecordedWrite::Put(kept.clone())));
+    assert!(!writes.contains(&RecordedWrite::Delete(kept)));
+    assert!(writes.contains(&RecordedWrite::Put(reference_key(
+        "shops", "s2", "pointers", "x1", "items.1"
+    ))));
+    assert!(engine.keys_with_prefix("fence:").await.is_empty());
+}
+
+#[tokio::test]
+async fn links_to_a_sixteen_stripe_target_from_sources_in_different_stripes_commit_together() {
+    let engine = engine();
+    save_shop(&engine, shop("s1")).await.unwrap();
+    let sources = pointer_ids_in_distinct_link_stripes();
+    let mut staged = Vec::new();
+    for id in &sources {
+        staged.push(staged_pointer(&engine, pointer(id, link("shops", "s1"))).await);
+    }
+
+    for tx in staged {
+        tx.commit().await.unwrap();
+    }
+
+    let mut pointing = shop_referenced_by(&engine, "s1").await;
+    pointing.sort();
+    let mut expected: Vec<TitoIncomingReference> =
+        sources.iter().map(|id| from_pointer(id)).collect();
+    expected.sort();
+    assert_eq!(pointing, expected);
+    assert!(matches!(
+        remove_shop(&engine, "s1").await,
+        Err(TitoError::Referenced { .. })
+    ));
+    assert!(engine.keys_with_prefix("fence:").await.is_empty());
+}
+
+#[tokio::test]
+async fn links_to_a_sixteen_stripe_target_from_sources_in_one_stripe_collide_and_the_retry_keeps_both(
+) {
+    let engine = engine();
+    save_shop(&engine, shop("s1")).await.unwrap();
+    let neighbour = pointer_id_whose_link_stripe("y", |stripe| stripe == link_stripe("x1"));
+    assert_eq!(link_stripe("x1"), link_stripe(&neighbour));
+    let first = staged_pointer(&engine, pointer("x1", link("shops", "s1"))).await;
+    let second = staged_pointer(&engine, pointer(&neighbour, link("shops", "s1"))).await;
+
+    first.commit().await.unwrap();
+    assert!(matches!(
+        second.commit().await,
+        Err(TitoError::Retryable(_))
+    ));
+
+    save_pointer(&engine, pointer(&neighbour, link("shops", "s1")))
+        .await
+        .unwrap();
+    assert_eq!(
+        shop_referenced_by(&engine, "s1").await,
+        vec![from_pointer("x1"), from_pointer(&neighbour)]
+    );
+}
+
+#[tokio::test]
+async fn a_link_to_a_sixteen_stripe_target_collides_with_a_remove_of_it_in_either_order() {
+    let engine = engine();
+    save_shop(&engine, shop("s1")).await.unwrap();
+
+    let pointing = staged_pointer(&engine, pointer("x1", link("shops", "s1"))).await;
+    assert!(remove_shop(&engine, "s1").await.unwrap());
+    assert!(matches!(
+        pointing.commit().await,
+        Err(TitoError::Retryable(_))
+    ));
+    assert_eq!(
+        save_pointer(&engine, pointer("x1", link("shops", "s1")))
+            .await
+            .unwrap_err(),
+        TitoError::ReferenceMissing {
+            table: "shops".to_string(),
+            id: "s1".to_string(),
+            path: "items.0".to_string(),
+        }
+    );
+    assert!(!engine.contains_key("table:pointers:x1").await);
+    assert!(engine.keys_with_prefix("ref:").await.is_empty());
+
+    save_shop(&engine, shop("s1")).await.unwrap();
+    let removing = engine.begin_transaction().await.unwrap();
+    assert!(shops(&engine).remove("s1", &removing).await.unwrap());
+    save_pointer(&engine, pointer("x1", link("shops", "s1")))
+        .await
+        .unwrap();
+    assert!(matches!(
+        removing.commit().await,
+        Err(TitoError::Retryable(_))
+    ));
+    assert_eq!(
+        remove_shop(&engine, "s1").await.unwrap_err(),
+        TitoError::Referenced {
+            table: "shops".to_string(),
+            id: "s1".to_string(),
+            by: vec![from_pointer("x1")],
+        }
+    );
+    assert!(engine.contains_key("table:shops:s1").await);
+    assert!(engine.keys_with_prefix("fence:").await.is_empty());
+}
+
+#[tokio::test]
+async fn a_link_to_a_sixteen_stripe_target_collides_with_a_deleting_mark_of_it_in_either_order() {
+    let engine = engine();
+    save_shop(&engine, shop("s1")).await.unwrap();
+    save_shop(&engine, shop("s2")).await.unwrap();
+
+    let pointing = staged_pointer(&engine, pointer("x1", link("shops", "s1"))).await;
+    save_shop(
+        &engine,
+        Shop {
+            deleting: true,
+            ..shop("s1")
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        pointing.commit().await,
+        Err(TitoError::Retryable(_))
+    ));
+    assert_eq!(
+        save_pointer(&engine, pointer("x1", link("shops", "s1")))
+            .await
+            .unwrap_err(),
+        TitoError::ReferenceDeleting {
+            table: "shops".to_string(),
+            id: "s1".to_string(),
+            path: "items.0".to_string(),
+        }
+    );
+    assert!(shop_referenced_by(&engine, "s1").await.is_empty());
+
+    let marking = engine.begin_transaction().await.unwrap();
+    shops(&engine)
+        .set(Shop {
+            deleting: true,
+            ..shop("s2")
+        })
+        .timestamps(false)
+        .execute(&marking)
+        .await
+        .unwrap();
+    save_pointer(&engine, pointer("x2", link("shops", "s2")))
+        .await
+        .unwrap();
+    assert!(matches!(
+        marking.commit().await,
+        Err(TitoError::Retryable(_))
+    ));
+    assert!(
+        !engine
+            .contains_key(&deleting_marker_key("shops", "s2"))
+            .await
+    );
+    assert_eq!(
+        shop_referenced_by(&engine, "s2").await,
+        vec![from_pointer("x2")]
+    );
+    assert!(engine.keys_with_prefix("fence:").await.is_empty());
+}
+
+#[tokio::test]
+async fn a_link_to_a_sixteen_stripe_target_collides_with_a_plain_save_of_it_in_either_order() {
+    let engine = engine();
+    save_shop(&engine, shop("s1")).await.unwrap();
+
+    let pointing = staged_pointer(&engine, pointer("x1", link("shops", "s1"))).await;
+    save_shop(
+        &engine,
+        Shop {
+            name: "Renamed".to_string(),
+            ..shop("s1")
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        pointing.commit().await,
+        Err(TitoError::Retryable(_))
+    ));
+    save_pointer(&engine, pointer("x1", link("shops", "s1")))
+        .await
+        .unwrap();
+
+    let renaming = engine.begin_transaction().await.unwrap();
+    shops(&engine)
+        .set(Shop {
+            name: "Renamed again".to_string(),
+            ..shop("s1")
+        })
+        .timestamps(false)
+        .execute(&renaming)
+        .await
+        .unwrap();
+    save_pointer(&engine, pointer("x2", link("shops", "s1")))
+        .await
+        .unwrap();
+    assert!(matches!(
+        renaming.commit().await,
+        Err(TitoError::Retryable(_))
+    ));
+
+    assert_eq!(
+        shops(&engine).get("s1").execute(None).await.unwrap().name,
+        "Renamed"
+    );
+    assert_eq!(
+        shop_referenced_by(&engine, "s1").await,
+        vec![from_pointer("x1"), from_pointer("x2")]
+    );
+}
+
+#[tokio::test]
+async fn a_save_that_keeps_its_link_to_a_sixteen_stripe_target_commits_beside_a_deleting_mark_of_it(
+) {
+    let engine = engine();
+    save_shop(&engine, shop("s1")).await.unwrap();
+    save_pointer(&engine, pointer("x1", link("shops", "s1")))
+        .await
+        .unwrap();
+
+    let keeping = staged_pointer(&engine, pointer("x1", link("shops", "s1"))).await;
+    save_shop(
+        &engine,
+        Shop {
+            deleting: true,
+            ..shop("s1")
+        },
+    )
+    .await
+    .unwrap();
+    keeping.commit().await.unwrap();
+
+    assert_eq!(
+        engine
+            .raw_json(&deleting_marker_key("shops", "s1"))
+            .await
+            .unwrap(),
+        json!(true)
+    );
+    assert_eq!(
+        shop_referenced_by(&engine, "s1").await,
+        vec![from_pointer("x1")]
+    );
+}
+
+#[tokio::test]
+async fn links_to_a_two_stripe_target_write_one_of_its_sixteen_link_stripes() {
+    let engine = engine();
+    let model = stands::<2>(&engine);
+    for id in ["k1", "k2", "k3", "k4"] {
+        save_stand(&engine, stand::<2>(id)).await.unwrap();
+    }
+    let sources = pointer_ids_in_distinct_link_stripes();
+
+    engine.start_recording_writes().await;
+    let mut staged = Vec::new();
+    for id in &sources {
+        staged.push(staged_pointer(&engine, pointer(id, link("stands-2", "k1"))).await);
+    }
+    assert_eq!(
+        fence_writes(&engine.take_recorded_writes().await),
+        sources
+            .iter()
+            .map(|id| fence_stripe_key("stands-2", "k1", link_stripe(id)))
+            .collect::<Vec<_>>()
+    );
+    for tx in staged {
+        tx.commit().await.unwrap();
+    }
+
+    let low = pointer_id_whose_link_stripe("w", |stripe| stripe < 2);
+    let high = pointer_id_whose_link_stripe("w", |stripe| stripe >= 2);
+    let low_link = staged_pointer(&engine, pointer(&low, link("stands-2", "k2"))).await;
+    let high_link = staged_pointer(&engine, pointer(&high, link("stands-2", "k2"))).await;
+    save_stand(
+        &engine,
+        Stand::<2> {
+            name: "Renamed".to_string(),
+            ..stand("k2")
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        low_link.commit().await,
+        Err(TitoError::Retryable(_))
+    ));
+    high_link.commit().await.unwrap();
+
+    let removed = pointer_id_whose_link_stripe("v", |stripe| stripe >= 2);
+    let pointing = staged_pointer(&engine, pointer(&removed, link("stands-2", "k3"))).await;
+    assert!(engine
+        .transaction(|tx| {
+            let model = model.clone();
+            async move { model.remove("k3", &tx).await }
+        })
+        .await
+        .unwrap());
+    assert!(matches!(
+        pointing.commit().await,
+        Err(TitoError::Retryable(_))
+    ));
+    assert!(matches!(
+        save_pointer(&engine, pointer(&removed, link("stands-2", "k3"))).await,
+        Err(TitoError::ReferenceMissing { .. })
+    ));
+
+    let marked = pointer_id_whose_link_stripe("u", |stripe| stripe >= 2);
+    let pointing = staged_pointer(&engine, pointer(&marked, link("stands-2", "k4"))).await;
+    save_stand(
+        &engine,
+        Stand::<2> {
+            deleting: true,
+            ..stand("k4")
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        pointing.commit().await,
+        Err(TitoError::Retryable(_))
+    ));
+    assert!(matches!(
+        save_pointer(&engine, pointer(&marked, link("stands-2", "k4"))).await,
+        Err(TitoError::ReferenceDeleting { .. })
+    ));
+    assert!(engine.keys_with_prefix("fence:").await.is_empty());
+}
+
+#[tokio::test]
+async fn a_link_to_a_table_no_model_was_built_for_writes_one_link_stripe() {
+    let engine = engine();
+    engine
+        .put_json("table:unbuilt-targets:u1", &json!({"id": "u1"}))
+        .await;
+    engine.start_recording_writes().await;
+
+    save_pointer(&engine, pointer("x1", link("unbuilt-targets", "u1")))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fence_writes(&engine.take_recorded_writes().await),
+        vec![link_fence_key("unbuilt-targets", "u1", "pointers", "x1")]
+    );
+    assert_eq!(
+        engine.keys_with_prefix("ref:").await,
+        vec![reference_key(
+            "unbuilt-targets",
+            "u1",
+            "pointers",
+            "x1",
+            "items.0"
+        )]
+    );
+}
+
+#[tokio::test]
+async fn a_manifest_may_not_list_a_fence_stripe_key() {
+    let engine = engine();
+    let model = galleries(&engine);
+    save_picture(&engine, picture("p1")).await.unwrap();
+    save_gallery(&engine, gallery("g1", &["p1"])).await.unwrap();
+    let reverse_key = "reverse-index:table:galleries:g1";
+    let mut listed = engine.raw_json(reverse_key).await.unwrap();
+    listed["value"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!(fence_stripe_key("galleries", "g1", 0)));
+    engine.put_json(reverse_key, &listed).await;
+
+    assert!(matches!(
+        save_gallery(&engine, gallery("g1", &["p1"])).await,
+        Err(TitoError::IndexError(_))
+    ));
+    assert!(matches!(
+        remove_gallery(&engine, "g1").await,
+        Err(TitoError::IndexError(_))
+    ));
+    let tx = engine.begin_transaction().await.unwrap();
+    assert!(matches!(
+        model.rebuild_indexes_for_restore("g1", &tx).await,
+        Err(TitoError::IndexError(_))
+    ));
+    tx.rollback().await.unwrap();
+    assert_eq!(engine.raw_json(reverse_key).await.unwrap(), listed);
 }
 
 #[tokio::test]
@@ -1151,7 +1942,10 @@ async fn referenced_by_except_leaves_out_the_listed_source_tables() {
         pointed.clone(),
     ];
 
-    assert_eq!(picture_referenced_by(&engine, "p1").await.unwrap(), everyone);
+    assert_eq!(
+        picture_referenced_by(&engine, "p1").await.unwrap(),
+        everyone
+    );
     assert_eq!(
         picture_referenced_by_except(&engine, "p1", &[], 10)
             .await
@@ -1186,9 +1980,14 @@ async fn referenced_by_except_leaves_out_the_listed_source_tables() {
     .unwrap()
     .is_empty());
     assert_eq!(
-        picture_referenced_by_except(&engine, "p1", &["gallerie", "pointer", "album", "missing"], 10)
-            .await
-            .unwrap(),
+        picture_referenced_by_except(
+            &engine,
+            "p1",
+            &["gallerie", "pointer", "album", "missing"],
+            10
+        )
+        .await
+        .unwrap(),
         everyone
     );
     assert_eq!(
