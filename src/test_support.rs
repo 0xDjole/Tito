@@ -1,17 +1,58 @@
+use crate::backend::tikv::MAX_TRANSACTION_RETRIES;
 use crate::types::{validate_delete_range, TitoEngine, TitoKvPair, TitoTransaction, TitoValue};
 use crate::TitoError;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+type MemoryWrites = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
+
+#[derive(Default)]
+struct MemoryStore {
+    values: BTreeMap<Vec<u8>, Vec<u8>>,
+    commits: u64,
+    committed_at: HashMap<Vec<u8>, u64>,
+}
+
+impl MemoryStore {
+    fn conflict(&self, writes: &MemoryWrites, snapshot: u64) -> Option<String> {
+        writes
+            .keys()
+            .find(|key| {
+                self.committed_at
+                    .get(*key)
+                    .is_some_and(|commit| *commit > snapshot)
+            })
+            .map(|key| String::from_utf8_lossy(key).into_owned())
+    }
+
+    fn apply(&mut self, writes: MemoryWrites) {
+        if writes.is_empty() {
+            return;
+        }
+        self.commits += 1;
+        for (key, value) in writes {
+            self.committed_at.insert(key.clone(), self.commits);
+            match value {
+                Some(value) => {
+                    self.values.insert(key, value);
+                }
+                None => {
+                    self.values.remove(&key);
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct MemoryEngine {
-    data: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
+    store: Arc<Mutex<MemoryStore>>,
     next_get_error: Arc<Mutex<Option<String>>>,
     next_commit_unknown_after_apply: Arc<Mutex<Option<bool>>>,
     next_transaction_version: Arc<AtomicU64>,
@@ -28,11 +69,14 @@ pub(crate) enum RecordedWrite {
 
 #[derive(Clone)]
 pub(crate) struct MemoryTransaction {
-    data: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
+    store: Arc<Mutex<MemoryStore>>,
     local: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
+    writes: Arc<Mutex<MemoryWrites>>,
+    snapshot: u64,
     next_get_error: Arc<Mutex<Option<String>>>,
     next_commit_unknown_after_apply: Arc<Mutex<Option<bool>>>,
     start_version: u64,
+    shared_fence_pick: u64,
     pending_queue_scans: Arc<AtomicU64>,
     recorded_reads: Arc<Mutex<Option<Vec<Vec<u8>>>>>,
     recorded_writes: Arc<Mutex<Option<Vec<RecordedWrite>>>>,
@@ -56,7 +100,7 @@ impl MemoryEngine {
     }
 
     pub(crate) async fn put_raw_bytes(&self, key: Vec<u8>, value: Vec<u8>) {
-        self.data.lock().await.insert(key, value);
+        self.store.lock().await.values.insert(key, value);
     }
 
     pub(crate) async fn put_raw(&self, key: &str, value: Vec<u8>) {
@@ -80,7 +124,7 @@ impl MemoryEngine {
     }
 
     pub(crate) async fn raw_bytes(&self, key: &str) -> Option<Vec<u8>> {
-        self.data.lock().await.get(key.as_bytes()).cloned()
+        self.store.lock().await.values.get(key.as_bytes()).cloned()
     }
 
     pub(crate) async fn raw_json(&self, key: &str) -> Option<Value> {
@@ -90,13 +134,14 @@ impl MemoryEngine {
     }
 
     pub(crate) async fn contains_key(&self, key: &str) -> bool {
-        self.data.lock().await.contains_key(key.as_bytes())
+        self.store.lock().await.values.contains_key(key.as_bytes())
     }
 
     pub(crate) async fn keys_with_prefix(&self, prefix: &str) -> Vec<String> {
-        self.data
+        self.store
             .lock()
             .await
+            .values
             .keys()
             .filter_map(|key| String::from_utf8(key.clone()).ok())
             .filter(|key| key.starts_with(prefix))
@@ -109,17 +154,23 @@ impl TitoEngine for MemoryEngine {
     type Transaction = MemoryTransaction;
 
     async fn begin_transaction(&self) -> Result<Self::Transaction, TitoError> {
-        let snapshot = self.data.lock().await.clone();
+        let (snapshot, local) = {
+            let store = self.store.lock().await;
+            (store.commits, store.values.clone())
+        };
         let start_version = self
             .next_transaction_version
             .fetch_add(1, Ordering::SeqCst)
             .saturating_add(1);
         Ok(MemoryTransaction {
-            data: self.data.clone(),
-            local: Arc::new(Mutex::new(snapshot)),
+            store: self.store.clone(),
+            local: Arc::new(Mutex::new(local)),
+            writes: Arc::new(Mutex::new(MemoryWrites::new())),
+            snapshot,
             next_get_error: self.next_get_error.clone(),
             next_commit_unknown_after_apply: self.next_commit_unknown_after_apply.clone(),
             start_version,
+            shared_fence_pick: rand::random(),
             pending_queue_scans: self.pending_queue_scans.clone(),
             recorded_reads: self.recorded_reads.clone(),
             recorded_writes: self.recorded_writes.clone(),
@@ -133,15 +184,21 @@ impl TitoEngine for MemoryEngine {
         T: Send,
         E: From<TitoError> + Send + std::fmt::Debug,
     {
-        let tx = self.begin_transaction().await.map_err(E::from)?;
-        match f(tx.clone()).await {
-            Ok(value) => {
-                tx.commit().await.map_err(E::from)?;
-                Ok(value)
-            }
-            Err(error) => {
-                let _ = tx.rollback().await;
-                Err(error)
+        let mut retries = 0;
+        loop {
+            let tx = self.begin_transaction().await.map_err(E::from)?;
+            match f.clone()(tx.clone()).await {
+                Ok(value) => match tx.commit().await {
+                    Ok(()) => return Ok(value),
+                    Err(error) if error.is_retryable() && retries < MAX_TRANSACTION_RETRIES => {
+                        retries += 1;
+                    }
+                    Err(error) => return Err(E::from(error)),
+                },
+                Err(error) => {
+                    let _ = tx.rollback().await;
+                    return Err(error);
+                }
             }
         }
     }
@@ -152,13 +209,14 @@ impl TitoEngine for MemoryEngine {
 
     async fn delete_range(&self, start: &[u8], end: &[u8]) -> Result<(), TitoError> {
         validate_delete_range(start, end)?;
-        let mut data = self.data.lock().await;
-        let keys: Vec<Vec<u8>> = data
+        let mut store = self.store.lock().await;
+        let keys: Vec<Vec<u8>> = store
+            .values
             .range(start.to_vec()..end.to_vec())
             .map(|(key, _)| key.clone())
             .collect();
         for key in keys {
-            data.remove(&key);
+            store.values.remove(&key);
         }
         Ok(())
     }
@@ -168,6 +226,10 @@ impl TitoEngine for MemoryEngine {
 impl TitoTransaction for MemoryTransaction {
     fn start_version(&self) -> u64 {
         self.start_version
+    }
+
+    fn shared_fence_pick(&self) -> u64 {
+        self.shared_fence_pick
     }
 
     async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<TitoValue>, TitoError> {
@@ -194,6 +256,10 @@ impl TitoTransaction for MemoryTransaction {
             .lock()
             .await
             .insert(key.as_ref().to_vec(), value.as_ref().to_vec());
+        self.writes
+            .lock()
+            .await
+            .insert(key.as_ref().to_vec(), Some(value.as_ref().to_vec()));
         Ok(())
     }
 
@@ -204,6 +270,7 @@ impl TitoTransaction for MemoryTransaction {
             ));
         }
         self.local.lock().await.remove(key.as_ref());
+        self.writes.lock().await.insert(key.as_ref().to_vec(), None);
         Ok(())
     }
 
@@ -269,16 +336,23 @@ impl TitoTransaction for MemoryTransaction {
     }
 
     async fn commit(self) -> Result<(), TitoError> {
-        if let Some(after_apply) = self.next_commit_unknown_after_apply.lock().await.take() {
-            if after_apply {
-                *self.data.lock().await = self.local.lock().await.clone();
-            }
-            return Err(TitoError::CommitOutcomeUnknown(
-                "forced indeterminate memory transaction commit".to_string(),
-            ));
+        let writes = std::mem::take(&mut *self.writes.lock().await);
+        let mut store = self.store.lock().await;
+        if let Some(key) = store.conflict(&writes, self.snapshot) {
+            return Err(TitoError::Retryable(format!(
+                "Write conflict: key '{key}' was committed by another transaction after this one started"
+            )));
         }
-        *self.data.lock().await = self.local.lock().await.clone();
-        Ok(())
+        let unknown = self.next_commit_unknown_after_apply.lock().await.take();
+        if unknown != Some(false) {
+            store.apply(writes);
+        }
+        match unknown {
+            Some(_) => Err(TitoError::CommitOutcomeUnknown(
+                "forced indeterminate memory transaction commit".to_string(),
+            )),
+            None => Ok(()),
+        }
     }
 
     async fn rollback(self) -> Result<(), TitoError> {

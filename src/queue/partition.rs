@@ -1,14 +1,7 @@
-const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-pub(crate) fn queue_key_hash(key: &str) -> u64 {
-    key.bytes().fold(FNV_OFFSET_BASIS, |hash, byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
-    })
-}
+use crate::utils::fnv1a_64;
 
 pub fn queue_partition_for_key(key: &str, partition_count: u32) -> u32 {
-    (queue_key_hash(key) % u64::from(partition_count.max(1))) as u32
+    (fnv1a_64(key.as_bytes()) % u64::from(partition_count.max(1))) as u32
 }
 
 #[cfg(test)]
@@ -17,14 +10,14 @@ mod tests {
 
     #[test]
     fn queue_key_hash_is_fnv_1a_64_over_the_utf8_bytes() {
-        assert_eq!(queue_key_hash(""), 0xcbf2_9ce4_8422_2325);
-        assert_eq!(queue_key_hash("a"), 0xaf63_dc4c_8601_ec8c);
-        assert_eq!(queue_key_hash("foobar"), 0x8594_4171_f739_67e8);
+        assert_eq!(fnv1a_64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a_64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a_64(b"foobar"), 0x8594_4171_f739_67e8);
         assert_eq!(
-            queue_key_hash("store:4f6c1a52-7e0b-4f43-9d0c-2b4c1a9e8f10"),
+            fnv1a_64("store:4f6c1a52-7e0b-4f43-9d0c-2b4c1a9e8f10".as_bytes()),
             0x22b8_46cc_ff62_aa2b
         );
-        assert_eq!(queue_key_hash("order:ž"), 0x0d8f_ca86_6173_a478);
+        assert_eq!(fnv1a_64("order:ž".as_bytes()), 0x0d8f_ca86_6173_a478);
     }
 
     #[test]

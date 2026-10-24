@@ -22,6 +22,8 @@ pub use key_encoder::{encode_index_integer, encode_index_string};
 
 mod reference;
 
+mod fence;
+
 mod error;
 
 mod event;

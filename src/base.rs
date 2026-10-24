@@ -5,6 +5,7 @@ use std::marker::PhantomData;
 
 use crate::{
     error::TitoError,
+    fence::{fence_stripe_key, link_fence_key, shared_fence_stripe, FenceStripes},
     query::IndexQueryBuilder,
     reference::{
         deleting_marker_key, parse_reference_key, primary_key, reference_key,
@@ -405,6 +406,25 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             .then(|| deleting_marker_key(&T::table(), raw_id))
     }
 
+    fn stripes(&self) -> Result<FenceStripes, TitoError> {
+        match T::fence_stripes() {
+            0 => Err(TitoError::Configuration(format!(
+                "Model '{}' returns 0 from fence_stripes(); a model has at least 1 stripe",
+                T::table()
+            ))),
+            1 => Ok(FenceStripes::Record),
+            stripes => Ok(FenceStripes::Striped(stripes)),
+        }
+    }
+
+    fn fence_keys(stripes: FenceStripes, raw_id: &str, marker_written: bool) -> Vec<String> {
+        if marker_written {
+            stripes.marker_keys(&T::table(), raw_id)
+        } else {
+            stripes.record_keys(&T::table(), raw_id)
+        }
+    }
+
     fn incoming_value(&self, raw_id: &str, reference: &TitoReference) -> Result<Value, TitoError> {
         serde_json::to_value(TitoIncomingReference::new(
             T::table(),
@@ -438,6 +458,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
     async fn check_reference_targets(
         &self,
+        raw_id: &str,
         references: &BTreeMap<String, TitoReference>,
         old_reference_keys: &HashSet<String>,
         tx: &E::Transaction,
@@ -469,6 +490,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             .into_iter()
             .map(|(key, _)| key)
             .collect();
+        let source_table = T::table();
         let mut fences = Vec::new();
         for ((table, id), path) in targets {
             if !found.contains(primary_key(&table, &id).as_bytes()) {
@@ -477,11 +499,10 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             if kept.contains(&(table.clone(), id.clone())) {
                 continue;
             }
-            let marker = deleting_marker_key(&table, &id);
-            if found.contains(marker.as_bytes()) {
+            if found.contains(deleting_marker_key(&table, &id).as_bytes()) {
                 return Err(TitoError::ReferenceDeleting { table, id, path });
             }
-            fences.push(marker);
+            fences.push(link_fence_key(&table, &id, &source_table, raw_id));
         }
         Ok(fences)
     }
@@ -665,11 +686,32 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         self.fence_primary(&primary_key, tx).await
     }
 
+    pub async fn assert_current_shared(
+        &self,
+        id: &str,
+        tx: &E::Transaction,
+    ) -> Result<(), TitoError> {
+        match self.stripes()? {
+            FenceStripes::Record => self.assert_current(id, tx).await,
+            FenceStripes::Striped(stripes) => {
+                let primary_key = format!("{}:{id}", self.get_table());
+                self.load_index_state(&primary_key, tx)
+                    .await?
+                    .ok_or_else(|| {
+                        TitoError::NotFound(format!("Record '{primary_key}' not found in database"))
+                    })?;
+                let stripe = shared_fence_stripe(tx.shared_fence_pick(), stripes);
+                tx.delete(fence_stripe_key(&T::table(), id, stripe)).await
+            }
+        }
+    }
+
     pub async fn rebuild_indexes_for_restore(
         &self,
         id: &str,
         tx: &E::Transaction,
     ) -> Result<T, TitoError> {
+        let stripes = self.stripes()?;
         if id.is_empty() || id.len() > 512 {
             return Err(TitoError::InvalidInput("Invalid restore record ID".into()));
         }
@@ -707,7 +749,9 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             let incoming = self.incoming_value(id, &reference)?;
             owned.push((key, incoming));
         }
-        if let Some(marker) = self.declared_marker(id, &stored) {
+        let marker = self.declared_marker(id, &stored);
+        let fences = Self::fence_keys(stripes, id, marker.is_some());
+        if let Some(marker) = marker {
             owned.push((marker, Value::Bool(true)));
         }
         let declared: HashSet<_> = metadata.value.iter().collect();
@@ -738,6 +782,9 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         tx.put(reverse_key, reverse).await?;
         for (key, value) in owned {
             self.put_value(key, &value, tx).await?;
+        }
+        for fence in fences {
+            self.delete(fence, tx).await?;
         }
         Ok(stored)
     }
@@ -901,6 +948,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     where
         T: serde::de::DeserializeOwned,
     {
+        let stripes = self.stripes()?;
         let raw_id = payload.id();
         let id = format!("{}:{}", self.get_table(), raw_id);
         let reverse_key = format!("reverse-index:{}", id);
@@ -931,6 +979,8 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                     .collect()
             })
             .unwrap_or_default();
+        let old_marker = old_reference_keys.contains(&deleting_marker_key(&T::table(), &raw_id));
+        let marker_written = old_marker != marker.is_some();
 
         for (key, _) in &all_index_data {
             if let Some(index) = Self::unique_index_name(key) {
@@ -955,9 +1005,10 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             }
         }
 
-        let fences = self
-            .check_reference_targets(&references, &old_reference_keys, tx)
+        let mut fences = self
+            .check_reference_targets(&raw_id, &references, &old_reference_keys, tx)
             .await?;
+        fences.extend(Self::fence_keys(stripes, &raw_id, marker_written));
 
         if let Some(old_index_keys) = old_index_keys {
             for key in old_index_keys.value {
@@ -1309,6 +1360,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     }
 
     pub async fn remove(&self, raw_id: &str, tx: &E::Transaction) -> Result<bool, TitoError> {
+        let stripes = self.stripes()?;
         let id = format!("{}:{}", self.get_table(), raw_id);
 
         let mut keys = match self.load_index_state(&id, tx).await? {
@@ -1328,16 +1380,20 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         }
 
         keys.push(deleting_marker_key(&T::table(), raw_id));
+        keys.extend(stripes.marker_keys(&T::table(), raw_id));
         self.remove_keys(&id, raw_id, keys, tx).await
     }
 
     pub async fn erase(&self, key: String, tx: &E::Transaction) -> Result<bool, TitoError> {
+        let stripes = self.stripes()?;
         let id = format!("{}:{}", self.get_table(), key);
 
-        let keys = match self.load_index_state(&id, tx).await? {
+        let mut keys = match self.load_index_state(&id, tx).await? {
             Some(metadata) => metadata.value,
             None => return Err(TitoError::NotFound(format!("Entity not found: {}", id))),
         };
+        let marked = keys.contains(&deleting_marker_key(&T::table(), &key));
+        keys.extend(Self::fence_keys(stripes, &key, marked));
 
         self.remove_keys(&id, &key, keys, tx).await
     }

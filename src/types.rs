@@ -98,6 +98,8 @@ pub trait TitoEngine: Send + Sync + Clone {
 pub trait TitoTransaction: Send + Sync {
     fn start_version(&self) -> u64;
 
+    fn shared_fence_pick(&self) -> u64;
+
     async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<TitoValue>, TitoError>;
     async fn put<K: AsRef<[u8]> + Send, V: AsRef<[u8]> + Send>(
         &self,
@@ -228,6 +230,10 @@ pub trait TitoModelTrait {
 
     fn key_prefix() -> String {
         format!("table:{}", Self::table())
+    }
+
+    fn fence_stripes() -> u16 {
+        1
     }
 }
 

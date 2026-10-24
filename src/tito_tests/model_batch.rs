@@ -1,6 +1,6 @@
 use super::*;
-use crate::test_support::RecordedWrite;
-use crate::types::TitoTransaction;
+use crate::fence::{fence_stripe_key, source_fence_stripe, LINK_FENCE_STRIPES};
+use crate::reference::deleting_marker_key;
 use crate::{MAX_REPLACE_MANY_BYTES, MAX_REPLACE_MANY_RECORDS};
 
 async fn replace_accounts(
@@ -301,6 +301,7 @@ async fn batch_replacement_stages_source_fences_and_rolls_back_with_its_transact
 struct BatchNode {
     id: String,
     parent_id: Option<String>,
+    shop_id: Option<String>,
     deleting: bool,
     created_at: i64,
     updated_at: i64,
@@ -314,6 +315,11 @@ impl TitoModelTrait for BatchNode {
         self.parent_id
             .iter()
             .map(|id| TitoReference::new("batch-nodes", id, "parent_id"))
+            .chain(
+                self.shop_id
+                    .iter()
+                    .map(|id| TitoReference::new("shops", id, "shop_id")),
+            )
             .collect()
     }
     fn is_deleting(&self) -> bool {
@@ -331,6 +337,7 @@ fn node(id: &str, parent: Option<&str>) -> BatchNode {
     BatchNode {
         id: id.into(),
         parent_id: parent.map(str::to_owned),
+        shop_id: None,
         deleting: false,
         created_at: -4,
         updated_at: -4,
@@ -496,4 +503,193 @@ async fn batch_replacement_checks_final_deleting_targets_and_retains_existing_li
         })
         .await
         .unwrap();
+}
+
+fn sorted(mut keys: Vec<String>) -> Vec<String> {
+    keys.sort();
+    keys
+}
+
+async fn replace_nodes(
+    engine: &MemoryEngine,
+    replacements: Vec<(BatchNode, BatchNode)>,
+) -> Result<Vec<BatchNode>, TitoError> {
+    let model = engine
+        .clone()
+        .model::<BatchNode>(TitoModelOptions::default());
+    engine
+        .transaction(|tx| {
+            let model = model.clone();
+            let replacements = replacements.clone();
+            async move {
+                model
+                    .replace_many(replacements)
+                    .timestamps(false)
+                    .execute(&tx)
+                    .await
+            }
+        })
+        .await
+}
+
+#[tokio::test]
+async fn batch_replacement_fences_each_new_target_by_one_link_stripe_and_each_replaced_record_by_its_stripes(
+) {
+    let engine = engine();
+    for id in ["a", "b", "c", "d"] {
+        save_node(&engine, node(id, None)).await;
+    }
+    save_shop(&engine, shop("s1")).await.unwrap();
+    let model = engine
+        .clone()
+        .model::<BatchNode>(TitoModelOptions::default());
+    let stripe = source_fence_stripe("batch-nodes", "a", LINK_FENCE_STRIPES);
+
+    engine.start_recording_writes().await;
+    replace_nodes(&engine, vec![(node("a", None), node("a", Some("c")))])
+        .await
+        .unwrap();
+    let writes = engine.take_recorded_writes().await;
+    assert_eq!(
+        fence_writes(&writes),
+        vec![fence_stripe_key("batch-nodes", "c", stripe)]
+    );
+    assert!(deleting_writes(&writes).is_empty());
+
+    engine.start_recording_writes().await;
+    replace_nodes(
+        &engine,
+        vec![(
+            node("a", Some("c")),
+            BatchNode {
+                shop_id: Some("s1".to_string()),
+                ..node("a", Some("c"))
+            },
+        )],
+    )
+    .await
+    .unwrap();
+    let writes = engine.take_recorded_writes().await;
+    assert_eq!(
+        fence_writes(&writes),
+        vec![fence_stripe_key("shops", "s1", stripe)]
+    );
+    assert!(deleting_writes(&writes).is_empty());
+
+    let pointing = engine.begin_transaction().await.unwrap();
+    model
+        .replace_many(vec![(node("b", None), node("b", Some("d")))])
+        .timestamps(false)
+        .execute(&pointing)
+        .await
+        .unwrap();
+    assert!(engine
+        .transaction(|tx| {
+            let model = model.clone();
+            async move { model.remove("d", &tx).await }
+        })
+        .await
+        .unwrap());
+    assert!(matches!(
+        pointing.commit().await,
+        Err(TitoError::Retryable(_))
+    ));
+    assert!(matches!(
+        replace_nodes(&engine, vec![(node("b", None), node("b", Some("d")))]).await,
+        Err(TitoError::ReferenceMissing { .. })
+    ));
+
+    let marker = deleting_marker_key("batch-nodes", "b");
+    let links = sorted(stripe_keys("batch-nodes", "b", LINK_FENCE_STRIPES));
+    let deleting = BatchNode {
+        deleting: true,
+        ..node("b", None)
+    };
+    engine.start_recording_writes().await;
+    replace_nodes(&engine, vec![(node("b", None), deleting.clone())])
+        .await
+        .unwrap();
+    let writes = engine.take_recorded_writes().await;
+    assert_eq!(
+        deleting_writes(&writes),
+        vec![RecordedWrite::Put(marker.clone())]
+    );
+    assert_eq!(sorted(fence_writes(&writes)), links);
+
+    engine.start_recording_writes().await;
+    replace_nodes(&engine, vec![(deleting, node("b", None))])
+        .await
+        .unwrap();
+    let writes = engine.take_recorded_writes().await;
+    assert_eq!(
+        deleting_writes(&writes),
+        vec![RecordedWrite::Delete(marker)]
+    );
+    assert_eq!(sorted(fence_writes(&writes)), links);
+
+    let shops = shops(&engine);
+    let check = engine.begin_transaction().await.unwrap();
+    shops.assert_current_shared("s1", &check).await.unwrap();
+    engine.start_recording_writes().await;
+    engine
+        .transaction(|tx| {
+            let shops = shops.clone();
+            async move {
+                shops
+                    .replace_many(vec![(
+                        shop("s1"),
+                        Shop {
+                            name: "Renamed".to_string(),
+                            ..shop("s1")
+                        },
+                    )])
+                    .timestamps(false)
+                    .execute(&tx)
+                    .await
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        sorted(fence_writes(&engine.take_recorded_writes().await)),
+        sorted(stripe_keys("shops", "s1", 16))
+    );
+    assert!(matches!(check.commit().await, Err(TitoError::Retryable(_))));
+
+    let stands = stands::<2>(&engine);
+    save_stand(&engine, stand::<2>("k1")).await.unwrap();
+    let renamed = Stand::<2> {
+        name: "Renamed".to_string(),
+        ..stand("k1")
+    };
+    let marked = Stand::<2> {
+        deleting: true,
+        ..renamed.clone()
+    };
+    for (expected, next, stripes) in [
+        (stand::<2>("k1"), renamed.clone(), 2),
+        (renamed, marked, LINK_FENCE_STRIPES),
+    ] {
+        engine.start_recording_writes().await;
+        engine
+            .transaction(|tx| {
+                let stands = stands.clone();
+                let expected = expected.clone();
+                let next = next.clone();
+                async move {
+                    stands
+                        .replace_many(vec![(expected, next)])
+                        .timestamps(false)
+                        .execute(&tx)
+                        .await
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            sorted(fence_writes(&engine.take_recorded_writes().await)),
+            sorted(stripe_keys("stands-2", "k1", stripes))
+        );
+    }
+    assert!(engine.keys_with_prefix("fence:").await.is_empty());
 }

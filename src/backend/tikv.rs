@@ -15,7 +15,7 @@ use std::time::Duration;
 use tikv_client::{Timestamp, TimestampExt, Transaction, TransactionClient};
 use tokio::time::sleep;
 
-const MAX_TRANSACTION_RETRIES: u32 = 10;
+pub(crate) const MAX_TRANSACTION_RETRIES: u32 = 10;
 const MAX_READ_LOCK_RESOLUTION_ATTEMPTS: u32 = 8;
 const READ_LOCK_RESOLUTION_BACKOFF: Duration = Duration::from_millis(25);
 const TIKV_GRPC_MAX_DECODING_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
@@ -181,6 +181,7 @@ impl TitoEngine for TiKVBackend {
             had_retryable_error: Arc::new(AtomicBool::new(false)),
             commit_started: Arc::new(AtomicBool::new(false)),
             start_version,
+            shared_fence_pick: rand::random(),
         })
     }
 
@@ -409,6 +410,7 @@ pub struct TiKVTransaction {
     pub had_retryable_error: Arc<AtomicBool>,
     commit_started: Arc<AtomicBool>,
     start_version: u64,
+    shared_fence_pick: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -505,6 +507,10 @@ impl TiKVTransaction {
 impl TitoTransaction for TiKVTransaction {
     fn start_version(&self) -> u64 {
         self.start_version
+    }
+
+    fn shared_fence_pick(&self) -> u64 {
+        self.shared_fence_pick
     }
 
     async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<TitoValue>, TitoError> {
