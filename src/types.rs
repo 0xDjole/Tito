@@ -94,11 +94,18 @@ pub trait TitoEngine: Send + Sync + Clone {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TitoGuard {
+    Shared,
+    Exclusive,
+    Written,
+}
+
 #[async_trait]
 pub trait TitoTransaction: Send + Sync {
     fn start_version(&self) -> u64;
 
-    fn shared_fence_pick(&self) -> u64;
+    async fn guard(&self, table: &str, id: &str, guard: TitoGuard);
 
     async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<TitoValue>, TitoError>;
     async fn put<K: AsRef<[u8]> + Send, V: AsRef<[u8]> + Send>(
@@ -112,6 +119,12 @@ pub trait TitoTransaction: Send + Sync {
         range: Range<K>,
         limit: u32,
     ) -> Result<Vec<TitoKvPair>, TitoError>;
+
+    async fn scan_keys<K: AsRef<[u8]> + Send>(
+        &self,
+        range: Range<K>,
+        limit: u32,
+    ) -> Result<Vec<Vec<u8>>, TitoError>;
 
     async fn scan_reverse<K: AsRef<[u8]> + Send>(
         &self,
@@ -170,10 +183,17 @@ pub struct TitoTemporalIndex {
     pub range_field: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitoIndexValue {
+    RecordCopy,
+    RecordReference,
+}
+
 pub struct TitoIndexConfig {
     pub condition: bool,
     pub fields: Vec<TitoIndexField>,
     pub name: String,
+    pub value: TitoIndexValue,
 }
 
 #[derive(Debug, Clone)]
@@ -182,58 +202,16 @@ pub struct TitoRelIndexConfig {
     pub field: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TitoReference {
-    pub table: String,
-    pub id: String,
-    pub path: String,
-}
-
-impl TitoReference {
-    pub fn new(table: impl Into<String>, id: impl Into<String>, path: impl Into<String>) -> Self {
-        Self {
-            table: table.into(),
-            id: id.into(),
-            path: path.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TitoIncomingReference {
-    pub table: String,
-    pub id: String,
-    pub path: String,
-}
-
-impl TitoIncomingReference {
-    pub fn new(table: impl Into<String>, id: impl Into<String>, path: impl Into<String>) -> Self {
-        Self {
-            table: table.into(),
-            id: id.into(),
-            path: path.into(),
-        }
-    }
-}
-
 pub trait TitoModelTrait {
     fn indexes(&self) -> Vec<TitoIndexConfig>;
     fn unique_indexes(&self) -> Vec<TitoIndexConfig> {
         Vec::new()
     }
-    fn references(&self) -> Vec<TitoReference>;
-    fn is_deleting(&self) -> bool;
     fn table() -> String;
     fn id(&self) -> String;
 
     fn key_prefix() -> String {
         format!("table:{}", Self::table())
-    }
-
-    fn fence_stripes() -> u16 {
-        1
     }
 }
 

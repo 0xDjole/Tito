@@ -1,5 +1,6 @@
 use super::*;
 use crate::encode_index_integer;
+use crate::types::TitoIndexValue;
 use serde_json::Value;
 
 #[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -19,6 +20,7 @@ fn numeric_index(
     condition: bool,
 ) -> TitoIndexConfig {
     TitoIndexConfig {
+        value: TitoIndexValue::RecordReference,
         name: name.to_string(),
         fields: fields
             .iter()
@@ -69,14 +71,6 @@ impl TitoModelTrait for NumericRecord {
             ],
             self.indexed && self.unique,
         )]
-    }
-
-    fn references(&self) -> Vec<TitoReference> {
-        Vec::new()
-    }
-
-    fn is_deleting(&self) -> bool {
-        false
     }
 
     fn table() -> String {
@@ -165,10 +159,7 @@ async fn signed_integer_writes_and_exact_queries_share_one_encoding_at_every_wid
         assert_eq!(saved.value, json!(value));
         let encoded = encode_index_integer(value);
         let key = format!("index:numeric-by-value:value:{encoded}:table:numeric-records:{id}");
-        assert_eq!(
-            engine.raw_json(&key).await.unwrap(),
-            serde_json::to_value(&saved).unwrap()
-        );
+        assert_eq!(engine.raw_bytes(&key).await.unwrap(), Vec::<u8>::new());
         for reverse in [false, true] {
             let mut query = model.query_by_index("numeric-by-value");
             query.value(value.to_string());
@@ -371,10 +362,7 @@ async fn numeric_array_and_map_entries_use_the_same_signed_encoding() {
     }
     for (name, value) in &record.measurements {
         let key = format!("index:numeric-by-measurements:measurements:{name}:{}:table:numeric-records:collections", encode_index_integer(value.as_i64().unwrap()));
-        assert_eq!(
-            engine.raw_json(&key).await.unwrap(),
-            serde_json::to_value(&record).unwrap()
-        );
+        assert_eq!(engine.raw_bytes(&key).await.unwrap(), Vec::<u8>::new());
     }
 }
 
@@ -394,10 +382,7 @@ async fn numeric_map_entry_keys_are_encoded_exactly() {
             "index:numeric-by-measurements:measurements:{encoded_name}:{}:table:numeric-records:map-keys",
             encode_index_integer(value)
         );
-        assert_eq!(
-            engine.raw_json(&key).await.unwrap(),
-            serde_json::to_value(&record).unwrap()
-        );
+        assert_eq!(engine.raw_bytes(&key).await.unwrap(), Vec::<u8>::new());
     }
     assert_eq!(
         engine

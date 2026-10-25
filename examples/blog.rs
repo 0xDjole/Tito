@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
+use tito::types::TitoIndexValue;
 use tito::{
     types::{
         DBUuid, TitoEngine, TitoIndexConfig, TitoIndexField, TitoIndexFieldType, TitoModelTrait,
-        TitoReference,
     },
     TiKV, TitoError, TitoModelOptions,
 };
@@ -28,6 +28,7 @@ struct Post {
 impl TitoModelTrait for Tag {
     fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![TitoIndexConfig {
+            value: TitoIndexValue::RecordReference,
             condition: true,
             name: "tag-by-name".to_string(),
             fields: vec![TitoIndexField {
@@ -35,14 +36,6 @@ impl TitoModelTrait for Tag {
                 r#type: TitoIndexFieldType::String,
             }],
         }]
-    }
-
-    fn references(&self) -> Vec<TitoReference> {
-        Vec::new()
-    }
-
-    fn is_deleting(&self) -> bool {
-        false
     }
 
     fn table() -> String {
@@ -58,6 +51,7 @@ impl TitoModelTrait for Post {
     fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![
             TitoIndexConfig {
+                value: TitoIndexValue::RecordReference,
                 condition: true,
                 name: "post-by-author".to_string(),
                 fields: vec![TitoIndexField {
@@ -66,6 +60,7 @@ impl TitoModelTrait for Post {
                 }],
             },
             TitoIndexConfig {
+                value: TitoIndexValue::RecordReference,
                 condition: true,
                 name: "post-by-tag".to_string(),
                 fields: vec![TitoIndexField {
@@ -74,20 +69,6 @@ impl TitoModelTrait for Post {
                 }],
             },
         ]
-    }
-
-    fn references(&self) -> Vec<TitoReference> {
-        self.tag_ids
-            .iter()
-            .enumerate()
-            .map(|(position, tag_id)| {
-                TitoReference::new("tag", tag_id, format!("tag_ids.{position}"))
-            })
-            .collect()
-    }
-
-    fn is_deleting(&self) -> bool {
-        false
     }
 
     fn table() -> String {
@@ -143,6 +124,7 @@ async fn main() -> Result<(), TitoError> {
     let post = tito_db
         .transaction(|tx| {
             let post_model = post_model.clone();
+            let tag_model = tag_model.clone();
             let post = Post {
                 id: DBUuid::new_v4().to_string(),
                 title: "Using Rust with TiKV".to_string(),
@@ -153,6 +135,15 @@ async fn main() -> Result<(), TitoError> {
             };
             let post_clone = post.clone();
             async move {
+                let tags = tag_model
+                    .get_many(post_clone.tag_ids.clone())
+                    .execute(Some(&tx))
+                    .await?;
+                if tags.len() != post_clone.tag_ids.len() {
+                    return Err(TitoError::NotFound(
+                        "A post names a tag that does not exist".to_string(),
+                    ));
+                }
                 post_model.set(post_clone).execute(&tx).await?;
                 Ok::<_, TitoError>(post)
             }
@@ -161,32 +152,32 @@ async fn main() -> Result<(), TitoError> {
 
     println!("Created post: {}", post.title);
 
-    let refusal = tito_db
+    let holder = tito_db
         .transaction(|tx| {
+            let post_model = post_model.clone();
             let tag_model = tag_model.clone();
             let rust_tag_id = rust_tag.id.clone();
-            async move { tag_model.remove(&rust_tag_id, &tx).await }
-        })
-        .await;
-    if let Err(TitoError::Referenced { by, .. }) = refusal {
-        println!(
-            "Tag {} stays: {} post reference(s) use it",
-            rust_tag.name,
-            by.len()
-        );
-    }
-
-    let used_by = tito_db
-        .transaction(|tx| {
-            let tag_model = tag_model.clone();
-            let tech_tag_id = tech_tag.id.clone();
-            async move { tag_model.referenced_by(&tech_tag_id, &tx).await }
+            async move {
+                let mut query = post_model.query_by_index("post-by-tag");
+                query.value(rust_tag_id.clone()).limit(Some(1));
+                let holder = query.execute_ids(Some(&tx)).await?.items.into_iter().next();
+                if holder.is_none() {
+                    tag_model.remove(&rust_tag_id, &tx).await?;
+                }
+                Ok::<_, TitoError>(holder)
+            }
         })
         .await?;
-    for reference in &used_by {
+    if let Some(holder) = holder {
+        println!("Tag {} stays: post {} uses it", rust_tag.name, holder);
+    }
+
+    let mut used_by = post_model.query_by_index("post-by-tag");
+    used_by.value(tech_tag.id.clone()).limit(Some(20));
+    for holder in used_by.execute(None).await?.items {
         println!(
-            "Tag {} is used by {} {} at {}",
-            tech_tag.name, reference.table, reference.id, reference.path
+            "Tag {} is used by post {} ({})",
+            tech_tag.name, holder.id, holder.title
         );
     }
 

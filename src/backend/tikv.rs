@@ -1,6 +1,7 @@
 use crate::error::TitoError;
+use crate::fence::{guard_keys, note_guard, Guards};
 use crate::types::{
-    validate_delete_range, DBUuid, TitoEngine, TitoKvPair, TitoTransaction, TitoValue,
+    validate_delete_range, DBUuid, TitoEngine, TitoGuard, TitoKvPair, TitoTransaction, TitoValue,
 };
 use crate::utils::key_after_bytes;
 use async_trait::async_trait;
@@ -180,6 +181,8 @@ impl TitoEngine for TiKVBackend {
             inner: Arc::new(tokio::sync::Mutex::new(tx)),
             had_retryable_error: Arc::new(AtomicBool::new(false)),
             commit_started: Arc::new(AtomicBool::new(false)),
+            wrote: Arc::new(AtomicBool::new(false)),
+            guards: Arc::new(tokio::sync::Mutex::new(Guards::new())),
             start_version,
             shared_fence_pick: rand::random(),
         })
@@ -409,6 +412,8 @@ pub struct TiKVTransaction {
     pub inner: Arc<tokio::sync::Mutex<Transaction>>,
     pub had_retryable_error: Arc<AtomicBool>,
     commit_started: Arc<AtomicBool>,
+    wrote: Arc<AtomicBool>,
+    guards: Arc<tokio::sync::Mutex<Guards>>,
     start_version: u64,
     shared_fence_pick: u64,
 }
@@ -435,9 +440,24 @@ impl TiKVTransaction {
         end: &[u8],
         limit: u32,
         direction: ScanDirection,
+        keys_only: bool,
     ) -> Result<Vec<TitoKvPair>, tikv_client::Error> {
         let range: tikv_client::BoundRange = (start.to_vec()..end.to_vec()).into();
         let mut transaction = self.inner.lock().await;
+        if keys_only {
+            return match direction {
+                ScanDirection::Forward => Ok(transaction
+                    .scan_keys(range, limit)
+                    .await?
+                    .map(|key| (key.into(), Vec::new()))
+                    .collect()),
+                ScanDirection::Reverse => Ok(transaction
+                    .scan_keys_reverse(range, limit)
+                    .await?
+                    .map(|key| (key.into(), Vec::new()))
+                    .collect()),
+            };
+        }
         match direction {
             ScanDirection::Forward => Ok(transaction
                 .scan(range, limit)
@@ -458,6 +478,7 @@ impl TiKVTransaction {
         mut end: Vec<u8>,
         limit: u32,
         direction: ScanDirection,
+        keys_only: bool,
     ) -> Result<Vec<TitoKvPair>, TitoError> {
         let mut rows: Vec<TitoKvPair> = Vec::new();
         let mut rpc_rows = SCAN_RPC_FIRST_ROWS;
@@ -467,7 +488,10 @@ impl TiKVTransaction {
                 break;
             }
             let requested = remaining.min(rpc_rows);
-            let page = match self.scan_rpc(&start, &end, requested, direction).await {
+            let page = match self
+                .scan_rpc(&start, &end, requested, direction, keys_only)
+                .await
+            {
                 Ok(page) => page,
                 Err(error) if requested > 1 && exceeds_message_limit(&error) => {
                     rpc_rows = requested / 2;
@@ -509,8 +533,8 @@ impl TitoTransaction for TiKVTransaction {
         self.start_version
     }
 
-    fn shared_fence_pick(&self) -> u64 {
-        self.shared_fence_pick
+    async fn guard(&self, table: &str, id: &str, guard: TitoGuard) {
+        note_guard(&mut *self.guards.lock().await, table, id, guard);
     }
 
     async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<TitoValue>, TitoError> {
@@ -553,14 +577,25 @@ impl TitoTransaction for TiKVTransaction {
             .await
             .put(tikv_key, value_bytes)
             .await
-            .map_err(|e| classify_tikv_error(e, "Put operation failed", &self.had_retryable_error))
+            .map_err(|e| {
+                classify_tikv_error(e, "Put operation failed", &self.had_retryable_error)
+            })?;
+        self.wrote.store(true, Ordering::Release);
+        Ok(())
     }
 
     async fn delete<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<(), TitoError> {
         let tikv_key: tikv_client::Key = key.as_ref().to_vec().into();
-        self.inner.lock().await.delete(tikv_key).await.map_err(|e| {
-            classify_tikv_error(e, "Delete operation failed", &self.had_retryable_error)
-        })
+        self.inner
+            .lock()
+            .await
+            .delete(tikv_key)
+            .await
+            .map_err(|e| {
+                classify_tikv_error(e, "Delete operation failed", &self.had_retryable_error)
+            })?;
+        self.wrote.store(true, Ordering::Release);
+        Ok(())
     }
 
     async fn scan<K: AsRef<[u8]> + Send>(
@@ -573,8 +608,28 @@ impl TitoTransaction for TiKVTransaction {
             range.end.as_ref().to_vec(),
             limit,
             ScanDirection::Forward,
+            false,
         )
         .await
+    }
+
+    async fn scan_keys<K: AsRef<[u8]> + Send>(
+        &self,
+        range: Range<K>,
+        limit: u32,
+    ) -> Result<Vec<Vec<u8>>, TitoError> {
+        Ok(self
+            .scan_pages(
+                range.start.as_ref().to_vec(),
+                range.end.as_ref().to_vec(),
+                limit,
+                ScanDirection::Forward,
+                true,
+            )
+            .await?
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect())
     }
 
     async fn scan_reverse<K: AsRef<[u8]> + Send>(
@@ -587,6 +642,7 @@ impl TitoTransaction for TiKVTransaction {
             range.end.as_ref().to_vec(),
             limit,
             ScanDirection::Reverse,
+            false,
         )
         .await
     }
@@ -634,6 +690,16 @@ impl TitoTransaction for TiKVTransaction {
 
     async fn commit(self) -> Result<(), TitoError> {
         let mut transaction = self.inner.lock().await;
+        let keys = guard_keys(
+            &*self.guards.lock().await,
+            self.wrote.load(Ordering::Acquire),
+            self.shared_fence_pick,
+        );
+        for key in keys {
+            transaction.delete(key.into_bytes()).await.map_err(|e| {
+                classify_tikv_error(e, "Guard delete failed", &self.had_retryable_error)
+            })?;
+        }
         self.commit_started.store(true, Ordering::Release);
         transaction.commit().await.map(|_| ()).map_err(|e| {
             classify_tikv_error(e, "Transaction commit failed", &self.had_retryable_error)

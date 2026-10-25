@@ -1,5 +1,5 @@
 use super::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const MAX_REPLACE_MANY_RECORDS: usize = 100;
 pub const MAX_REPLACE_MANY_KEYS: usize = 10_000;
@@ -27,10 +27,7 @@ impl<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> ReplaceManyBuilde
 struct PreparedReplacement<T> {
     id: String,
     old: ReverseIndex,
-    reference_keys: HashSet<String>,
-    references: BTreeMap<String, TitoReference>,
-    marker: Option<String>,
-    indexes: Vec<(String, Value)>,
+    indexes: Vec<(String, Vec<u8>)>,
     stored: T,
     writes: BTreeMap<String, Vec<u8>>,
 }
@@ -50,7 +47,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         timestamps: bool,
         tx: &E::Transaction,
     ) -> Result<Vec<T>, TitoError> {
-        let stripes = self.stripes()?;
         if replacements.is_empty() || replacements.len() > MAX_REPLACE_MANY_RECORDS {
             return Err(TitoError::InvalidInput(format!(
                 "Batch replacement requires 1..={} records",
@@ -91,7 +87,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                     "Batch replacement found duplicate source manifest keys".into(),
                 ));
             }
-            let (_, current) = self.get_raw(&primary, tx).await?;
+            let current = self.get_key(&primary, tx).await?;
             let expected = serde_json::to_value(expected)
                 .map_err(|error| TitoError::SerializationFailed(error.to_string()))?;
             if current != expected {
@@ -113,20 +109,10 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                 ))
             })?;
             let indexes = self.get_index_keys(primary.clone(), &next, &value)?;
-            let references = self.declared_references(&id, &next)?;
-            let marker = self.declared_marker(&id, &next);
-            let reference_keys = old
-                .value
-                .iter()
-                .filter(|key| Self::is_reference_state_key(key))
-                .cloned()
-                .collect::<HashSet<_>>();
-            let mut keys = indexes
+            let keys = indexes
                 .iter()
                 .map(|(key, _)| key.clone())
                 .collect::<Vec<_>>();
-            keys.extend(references.keys().cloned());
-            keys.extend(marker.iter().cloned());
             if keys.iter().collect::<HashSet<_>>().len() != keys.len() {
                 return Err(TitoError::InvalidInput(
                     "Batch replacement contains duplicate final manifest keys".into(),
@@ -148,25 +134,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                         });
                     }
                 }
-                writes.insert(
-                    key.clone(),
-                    serde_json::to_vec(value)
-                        .map_err(|error| TitoError::SerializationFailed(error.to_string()))?,
-                );
-            }
-            for (key, reference) in &references {
-                if !reference_keys.contains(key) {
-                    writes.insert(
-                        key.clone(),
-                        serde_json::to_vec(&self.incoming_value(&id, reference)?)
-                            .map_err(|error| TitoError::SerializationFailed(error.to_string()))?,
-                    );
-                }
-            }
-            if let Some(marker) = &marker {
-                if !reference_keys.contains(marker) {
-                    writes.insert(marker.clone(), b"true".to_vec());
-                }
+                writes.insert(key.clone(), value.clone());
             }
             prepared_keys.extend(writes.keys().cloned());
             if prepared_keys.len() > MAX_REPLACE_MANY_KEYS {
@@ -190,9 +158,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             prepared.push(PreparedReplacement {
                 id,
                 old,
-                reference_keys,
-                references,
-                marker,
                 indexes,
                 stored,
                 writes,
@@ -210,21 +175,14 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                         T::table()
                     )));
                 }
-                if !Self::is_reference_state_key(key)
-                    || (!replacement.references.contains_key(key)
-                        && replacement.marker.as_ref() != Some(key))
-                {
-                    deletes.insert(key.clone());
-                }
+                deletes.insert(key.clone());
             }
             for (key, _) in &replacement.indexes {
                 let Some(index) = Self::unique_index_name(key) else {
                     continue;
                 };
                 if let Some(bytes) = tx.get(key).await? {
-                    let owner: T = serde_json::from_slice(&bytes)
-                        .map_err(|error| TitoError::DeserializationFailed(error.to_string()))?;
-                    let owner_id = owner.id();
+                    let owner_id = Self::unique_owner_id(key, bytes)?;
                     let Some(position) = ids.get(&owner_id) else {
                         return Err(TitoError::UniqueViolation {
                             model: T::table(),
@@ -239,48 +197,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                     }
                 }
             }
-            let kept = replacement
-                .reference_keys
-                .iter()
-                .filter_map(|key| parse_reference_key(key))
-                .map(|key| (key.target_table, key.target_id))
-                .collect::<HashSet<_>>();
-            let mut external = BTreeMap::new();
-            for (key, reference) in &replacement.references {
-                let target = (reference.table == T::table())
-                    .then(|| ids.get(&reference.id))
-                    .flatten();
-                match target {
-                    Some(position) => {
-                        if prepared[*position].marker.is_some()
-                            && !kept.contains(&(reference.table.clone(), reference.id.clone()))
-                        {
-                            return Err(TitoError::ReferenceDeleting {
-                                table: reference.table.clone(),
-                                id: reference.id.clone(),
-                                path: reference.path.clone(),
-                            });
-                        }
-                    }
-                    None => {
-                        external.insert(key.clone(), reference.clone());
-                    }
-                }
-            }
-            deletes.extend(
-                self.check_reference_targets(
-                    &replacement.id,
-                    &external,
-                    &replacement.reference_keys,
-                    tx,
-                )
-                .await?,
-            );
-            let old_marker = replacement
-                .reference_keys
-                .contains(&deleting_marker_key(&T::table(), &replacement.id));
-            let marker_written = old_marker != replacement.marker.is_some();
-            deletes.extend(Self::fence_keys(stripes, &replacement.id, marker_written));
+            deletes.extend(record_fence_keys(&T::table(), &replacement.id));
         }
 
         let mut writes = BTreeMap::new();
@@ -319,6 +236,10 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         }
         for (key, value) in writes {
             tx.put(key, value).await?;
+        }
+        for replacement in &prepared {
+            tx.guard(&T::table(), &replacement.id, TitoGuard::Written)
+                .await;
         }
         Ok(prepared
             .into_iter()

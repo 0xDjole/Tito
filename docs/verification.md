@@ -32,28 +32,35 @@ to the complete `cargo test --locked --all-targets` phase. Every native case is 
 
 - the actual secondary-lock recovery and atomic batch replacement cases;
 - 40 records of 1 MiB, more than the client's 32 MiB decoding budget, read in one forward scan,
-  one reverse scan, ordinary index pages and one batch get, and 16 queue events of almost 1 MiB
-  pulled, completed and cleared;
+  one reverse scan, ordinary index pages (each reads its entry keys, then its records in one batch
+  get) and one batch get, and 16 queue events of almost 1 MiB pulled, completed and cleared;
+- explicitly selected reference entries hold no record data: a record of 1 MiB with five ordinary index entries and one
+  unique entry, where get, scan and batch get return an empty value for every ordinary entry and
+  get returns the owner's id for the unique entry, while an index list and the unique lookup
+  return the record, `execute_ids` returns its id, and its remove deletes every entry;
+- six mixed-mode cases verify exact copied-record and reference bytes, forward and reverse pages,
+  cursors and key-only IDs, copy reads without primary records, malformed or mismatched copies,
+  refresh after non-indexed edits, timestamps, conditional keys, rollback, removal, concurrent unique
+  claims, batch ownership swaps, guards and same-schema restore with preserved versions;
 - a cluster-worker and a standalone-worker handler each complete their own pending queue row inside
   the transaction that applies their change, and the later acknowledgement changes nothing; two
   deliveries of one row conflict at commit and the retry skips, so the change applies once; a
   rolled-back handler transaction leaves the row and its owner index pending for redelivery; an
   undelivered event, a completed-row key and another event's pending row are refused without writes;
-- reference fences on a target with one fence stripe: a new pointer conflicts at commit with a
-  concurrent removal or deleting mark of the target; new pointers from sources in different link
-  stripes commit together, and two from sources in one link stripe conflict and the retry keeps
-  both;
-- reference fences on a target with sixteen fence stripes: a new pointer conflicts at commit with a
-  concurrent removal and with a concurrent deleting mark of the target; new pointers from sources
-  in different link stripes commit together, and two from sources in one link stripe conflict and
-  the retry keeps both;
-- shared checks: on a record with one stripe, two `assert_current_shared` checks conflict with
-  each other and each conflicts with an update; on records with sixteen stripes, two transactions
-  whose `shared_fence_pick()` falls in different stripes check twenty records and commit together,
-  two whose picks fall in one stripe conflict and the retry passes, and a check conflicts with an
-  update of the record in either commit order;
-- `assert_current` against a concurrent update in both commit orders, and `assert_version` against
-  a concurrent update;
+- guards on fence keys, which Tito only deletes (in TiKV a delete is a write: it leaves a Delete
+  entry in the key's history until garbage collection, and reads never see it): a read by id in a
+  transaction that writes (`get`, `get_many`, `get_versioned`, a hit of `find_one_by_unique_index`
+  and `get_exclusive`) conflicts at commit with a save of its record, and a later versioned read
+  returns the new version, while index reads (lists, which read their records in one batched read,
+  and `execute_ids`, which reads keys only), scans and reads that find nothing add no guard; of
+  480 pairs of transactions reading the same twenty records, 4 to 75 conflict; two exclusive reads
+  of one record always conflict and the retry passes; a shared and an exclusive read of one record
+  commit together in either order; a save and a remove conflict with shared and exclusive reads in
+  either commit order; a transaction that only reads by id adds no guard, while `get_exclusive`
+  counts as a write; and a retried transaction starts without the guards of the attempt before;
+- ids held by other records: a new holder that reads the record it names and a delete of that
+  record that checks the holders' index in its own transaction conflict in either commit order,
+  and the retry refuses the delete or finds the record gone;
 - two concurrent claims of one unique value conflict and the retry is refused, while values that
   differ only by case or spacing coexist and are found exactly.
 

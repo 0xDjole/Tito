@@ -2,10 +2,11 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tito::backend::tikv::TiKV;
+use tito::types::TitoIndexValue;
 use tito::types::{
     TitoFindOneByIndexPayload, TitoIndexConfig, TitoIndexField, TitoIndexFieldType, TitoTransaction,
 };
-use tito::{TitoEngine, TitoError, TitoModelOptions, TitoModelTrait, TitoReference};
+use tito::{TitoEngine, TitoError, TitoModelOptions, TitoModelTrait};
 use uuid::Uuid;
 
 #[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -22,6 +23,7 @@ impl TitoModelTrait for NativeOwner {
     }
     fn unique_indexes(&self) -> Vec<TitoIndexConfig> {
         vec![TitoIndexConfig {
+            value: TitoIndexValue::RecordReference,
             condition: true,
             name: "native-owner-slot".into(),
             fields: vec![
@@ -35,12 +37,6 @@ impl TitoModelTrait for NativeOwner {
                 },
             ],
         }]
-    }
-    fn references(&self) -> Vec<TitoReference> {
-        Vec::new()
-    }
-    fn is_deleting(&self) -> bool {
-        false
     }
     fn table() -> String {
         "native-batch-owners".into()

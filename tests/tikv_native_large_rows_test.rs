@@ -1,14 +1,16 @@
+use tito::types::TitoIndexValue;
 mod native;
 
 use native::{native_endpoint, native_engine, remove, save};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tito::types::{
-    TitoFindByIndexPayload, TitoIndexConfig, TitoIndexField, TitoIndexFieldType, TitoScanPayload,
+    TitoFindByIndexPayload, TitoFindOneByIndexPayload, TitoIndexConfig, TitoIndexField,
+    TitoIndexFieldType, TitoScanPayload, TitoTransaction,
 };
 use tito::{
-    Queue, QueueConfig, QueueEvent, QueueEventStatus, TitoEngine, TitoModelOptions,
-    TitoModelTrait, TitoReference, MAX_QUEUE_EVENT_BYTES,
+    Queue, QueueConfig, QueueEvent, QueueEventStatus, TitoEngine, TitoModelOptions, TitoModelTrait,
+    MAX_QUEUE_EVENT_BYTES,
 };
 use uuid::Uuid;
 
@@ -26,6 +28,7 @@ struct NativeLargeRecord {
 impl TitoModelTrait for NativeLargeRecord {
     fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![TitoIndexConfig {
+            value: TitoIndexValue::RecordReference,
             condition: true,
             name: "native-large-by-scope".into(),
             fields: vec![TitoIndexField {
@@ -35,16 +38,55 @@ impl TitoModelTrait for NativeLargeRecord {
         }]
     }
 
-    fn references(&self) -> Vec<TitoReference> {
-        Vec::new()
+    fn table() -> String {
+        "native-large-records".into()
     }
 
-    fn is_deleting(&self) -> bool {
-        false
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+}
+
+#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct NativeIndexedRecord {
+    id: String,
+    scope: String,
+    kind: String,
+    code: String,
+    tags: Vec<String>,
+    body: String,
+}
+
+fn native_index(name: &str, fields: &[&str]) -> TitoIndexConfig {
+    TitoIndexConfig {
+        value: TitoIndexValue::RecordReference,
+        condition: true,
+        name: name.into(),
+        fields: fields
+            .iter()
+            .map(|field| TitoIndexField {
+                name: field.to_string(),
+                r#type: TitoIndexFieldType::String,
+            })
+            .collect(),
+    }
+}
+
+impl TitoModelTrait for NativeIndexedRecord {
+    fn indexes(&self) -> Vec<TitoIndexConfig> {
+        vec![
+            native_index("native-indexed-by-scope", &["scope"]),
+            native_index("native-indexed-by-scope-kind", &["scope", "kind"]),
+            native_index("native-indexed-by-tag", &["tags"]),
+        ]
+    }
+
+    fn unique_indexes(&self) -> Vec<TitoIndexConfig> {
+        vec![native_index("native-indexed-code", &["scope", "code"])]
     }
 
     fn table() -> String {
-        "native-large-records".into()
+        "native-indexed-records".into()
     }
 
     fn id(&self) -> String {
@@ -205,6 +247,133 @@ async fn native_reads_forty_one_mib_records_through_byte_bounded_requests() {
     })
     .await
     .expect("The native large-row reads must finish within their owned run");
+}
+
+#[tokio::test]
+async fn native_index_entries_of_a_large_record_store_no_record_data_and_a_list_reads_the_record() {
+    let (endpoint, run_id) = native_endpoint();
+    tokio::time::timeout(Duration::from_secs(120), async move {
+        let engine = native_engine(endpoint).await;
+        let model = engine
+            .clone()
+            .model::<NativeIndexedRecord>(TitoModelOptions::default());
+        let scope = format!("{run_id}-{}", Uuid::new_v4());
+        let record = NativeIndexedRecord {
+            id: format!("{scope}:record"),
+            scope: scope.clone(),
+            kind: "large".into(),
+            code: "only".into(),
+            tags: (0..3).map(|position| format!("{scope}-tag-{position}")).collect(),
+            body: body(7, ROW_BYTES),
+        };
+        save(&engine, &model, record.clone()).await.unwrap();
+        let primary = format!("table:native-indexed-records:{}", record.id);
+
+        let tx = engine.begin_transaction().await.unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &tx.get(format!("reverse-index:{primary}"))
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let keys = manifest["value"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|key| key.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        let ordinary = keys
+            .iter()
+            .filter(|key| key.starts_with("index:"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(ordinary.len(), 5);
+        assert_eq!(keys.len(), 6);
+        for key in &keys {
+            let stored = tx.get(key.clone()).await.unwrap().unwrap();
+            if key.starts_with("unique-index:") {
+                assert_eq!(
+                    key,
+                    &format!("unique-index:native-indexed-records:native-indexed-code:scope:{scope}:code:only")
+                );
+                assert_eq!(stored, record.id.as_bytes());
+            } else {
+                assert!(key.ends_with(&format!(":{primary}")));
+                assert!(stored.is_empty());
+                assert_eq!(
+                    tx.scan(
+                        key.clone().into_bytes()..tito::key_after(key.clone()).into_bytes(),
+                        2
+                    )
+                    .await
+                    .unwrap(),
+                    vec![(key.clone().into_bytes(), Vec::new())]
+                );
+            }
+        }
+        let fetched = tx.batch_get(ordinary.clone()).await.unwrap();
+        assert_eq!(fetched.len(), ordinary.len());
+        assert!(fetched.iter().all(|(_, value)| value.is_empty()));
+        tx.rollback().await.unwrap();
+
+        let by_scope = model
+            .find_by_index(
+                TitoFindByIndexPayload {
+                    index: "native-indexed-by-scope".into(),
+                    values: vec![scope.clone()],
+                    limit: Some(10),
+                    cursor: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(by_scope.items, vec![record.clone()]);
+        assert!(by_scope.cursor.is_none());
+        let mut by_tag = model.query_by_index("native-indexed-by-tag");
+        by_tag.value(record.tags[1].clone());
+        assert_eq!(
+            by_tag.execute(None).await.unwrap().items,
+            vec![record.clone()]
+        );
+        assert_eq!(
+            by_tag.execute_ids(None).await.unwrap().items,
+            vec![record.id.clone()]
+        );
+        let mut by_kind = model.query_by_index("native-indexed-by-scope-kind");
+        by_kind.value(scope.clone());
+        assert_eq!(
+            by_kind.execute_reverse(None).await.unwrap().items,
+            vec![record.clone()]
+        );
+        assert_eq!(
+            model
+                .find_one_by_unique_index(
+                    TitoFindOneByIndexPayload {
+                        index: "native-indexed-code".into(),
+                        values: vec![scope.clone(), "only".into()],
+                    },
+                    None,
+                )
+                .await
+                .unwrap(),
+            record
+        );
+
+        assert!(remove(&engine, &model, &record.id).await.unwrap());
+        let tx = engine.begin_transaction().await.unwrap();
+        for key in &keys {
+            assert!(tx.get(key.clone()).await.unwrap().is_none());
+        }
+        tx.rollback().await.unwrap();
+        println!(
+            "native Tito index entries: record_body_bytes={ROW_BYTES}, ordinary_entries=5, unique_entries=1, unique_value_bytes={}",
+            record.id.len()
+        );
+    })
+    .await
+    .expect("The native index entries of a large record must finish within their owned run");
 }
 
 #[tokio::test]

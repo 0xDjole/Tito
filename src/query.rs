@@ -61,31 +61,33 @@ where
         self
     }
 
-    pub async fn execute(
-        &mut self,
-        tx: Option<&E::Transaction>,
-    ) -> Result<TitoPaginated<T>, TitoError> {
-        let payload = TitoFindByIndexPayload {
+    fn payload(&self) -> TitoFindByIndexPayload {
+        TitoFindByIndexPayload {
             index: self.index.clone(),
             values: self.values.clone(),
             limit: self.limit,
             cursor: self.cursor.clone(),
-        };
+        }
+    }
 
-        self.model.find_by_index(payload, tx).await
+    pub async fn execute(
+        &mut self,
+        tx: Option<&E::Transaction>,
+    ) -> Result<TitoPaginated<T>, TitoError> {
+        self.model.find_by_index(self.payload(), tx).await
     }
 
     pub async fn execute_reverse(
         &mut self,
         tx: Option<&E::Transaction>,
     ) -> Result<TitoPaginated<T>, TitoError> {
-        let payload = TitoFindByIndexPayload {
-            index: self.index.clone(),
-            values: self.values.clone(),
-            limit: self.limit,
-            cursor: self.cursor.clone(),
-        };
+        self.model.find_by_index_reverse(self.payload(), tx).await
+    }
 
-        self.model.find_by_index_reverse(payload, tx).await
+    pub async fn execute_ids(
+        &mut self,
+        tx: Option<&E::Transaction>,
+    ) -> Result<TitoPaginated<String>, TitoError> {
+        self.model.index_ids(self.payload(), tx).await
     }
 }

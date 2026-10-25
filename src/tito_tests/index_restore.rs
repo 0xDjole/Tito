@@ -68,10 +68,13 @@ async fn offline_index_rebuild_preserves_exact_primary_metadata_and_version_on_r
         assert_eq!(engine.raw_bytes(primary_key).await.unwrap(), primary);
         assert_eq!(engine.raw_bytes(&reverse_key).await.unwrap(), reverse);
         for key in metadata["value"].as_array().unwrap() {
-            assert_eq!(
-                engine.raw_json(key.as_str().unwrap()).await.unwrap(),
-                json!(value)
-            );
+            let key = key.as_str().unwrap();
+            let expected = if key.starts_with("unique-index:") {
+                b"a1".to_vec()
+            } else {
+                Vec::new()
+            };
+            assert_eq!(engine.raw_bytes(key).await.unwrap(), expected);
         }
         assert_eq!(
             model
@@ -115,7 +118,7 @@ async fn offline_index_rebuild_rejects_another_unique_owner_without_changing_it(
     assert_eq!(engine.raw_json(&reverse_key).await.unwrap(), metadata);
     for (key, _) in indexes {
         if key.starts_with("unique-index:") {
-            assert_eq!(engine.raw_json(&key).await.unwrap(), json!(first));
+            assert_eq!(engine.raw_bytes(&key).await.unwrap(), b"a1".to_vec());
         } else {
             assert!(engine.raw_bytes(&key).await.is_none());
         }

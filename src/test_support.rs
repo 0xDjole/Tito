@@ -1,5 +1,8 @@
 use crate::backend::tikv::MAX_TRANSACTION_RETRIES;
-use crate::types::{validate_delete_range, TitoEngine, TitoKvPair, TitoTransaction, TitoValue};
+use crate::fence::{guard_keys, note_guard, Guards};
+use crate::types::{
+    validate_delete_range, TitoEngine, TitoGuard, TitoKvPair, TitoTransaction, TitoValue,
+};
 use crate::TitoError;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -58,6 +61,7 @@ pub(crate) struct MemoryEngine {
     next_transaction_version: Arc<AtomicU64>,
     pending_queue_scans: Arc<AtomicU64>,
     recorded_reads: Arc<Mutex<Option<Vec<Vec<u8>>>>>,
+    recorded_batch_gets: Arc<Mutex<Option<Vec<Vec<String>>>>>,
     recorded_writes: Arc<Mutex<Option<Vec<RecordedWrite>>>>,
 }
 
@@ -72,6 +76,7 @@ pub(crate) struct MemoryTransaction {
     store: Arc<Mutex<MemoryStore>>,
     local: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
     writes: Arc<Mutex<MemoryWrites>>,
+    guards: Arc<Mutex<Guards>>,
     snapshot: u64,
     next_get_error: Arc<Mutex<Option<String>>>,
     next_commit_unknown_after_apply: Arc<Mutex<Option<bool>>>,
@@ -79,6 +84,7 @@ pub(crate) struct MemoryTransaction {
     shared_fence_pick: u64,
     pending_queue_scans: Arc<AtomicU64>,
     recorded_reads: Arc<Mutex<Option<Vec<Vec<u8>>>>>,
+    recorded_batch_gets: Arc<Mutex<Option<Vec<Vec<String>>>>>,
     recorded_writes: Arc<Mutex<Option<Vec<RecordedWrite>>>>,
 }
 
@@ -89,6 +95,18 @@ impl MemoryEngine {
 
     pub(crate) async fn take_recorded_reads(&self) -> Vec<Vec<u8>> {
         self.recorded_reads.lock().await.take().unwrap_or_default()
+    }
+
+    pub(crate) async fn start_recording_batch_gets(&self) {
+        *self.recorded_batch_gets.lock().await = Some(Vec::new());
+    }
+
+    pub(crate) async fn take_recorded_batch_gets(&self) -> Vec<Vec<String>> {
+        self.recorded_batch_gets
+            .lock()
+            .await
+            .take()
+            .unwrap_or_default()
     }
 
     pub(crate) async fn start_recording_writes(&self) {
@@ -166,6 +184,7 @@ impl TitoEngine for MemoryEngine {
             store: self.store.clone(),
             local: Arc::new(Mutex::new(local)),
             writes: Arc::new(Mutex::new(MemoryWrites::new())),
+            guards: Arc::new(Mutex::new(Guards::new())),
             snapshot,
             next_get_error: self.next_get_error.clone(),
             next_commit_unknown_after_apply: self.next_commit_unknown_after_apply.clone(),
@@ -173,6 +192,7 @@ impl TitoEngine for MemoryEngine {
             shared_fence_pick: rand::random(),
             pending_queue_scans: self.pending_queue_scans.clone(),
             recorded_reads: self.recorded_reads.clone(),
+            recorded_batch_gets: self.recorded_batch_gets.clone(),
             recorded_writes: self.recorded_writes.clone(),
         })
     }
@@ -222,14 +242,20 @@ impl TitoEngine for MemoryEngine {
     }
 }
 
+impl MemoryTransaction {
+    pub(crate) fn shared_fence_pick(&self) -> u64 {
+        self.shared_fence_pick
+    }
+}
+
 #[async_trait]
 impl TitoTransaction for MemoryTransaction {
     fn start_version(&self) -> u64 {
         self.start_version
     }
 
-    fn shared_fence_pick(&self) -> u64 {
-        self.shared_fence_pick
+    async fn guard(&self, table: &str, id: &str, guard: TitoGuard) {
+        note_guard(&mut *self.guards.lock().await, table, id, guard);
     }
 
     async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<TitoValue>, TitoError> {
@@ -297,6 +323,26 @@ impl TitoTransaction for MemoryTransaction {
             .collect())
     }
 
+    async fn scan_keys<K: AsRef<[u8]> + Send>(
+        &self,
+        range: Range<K>,
+        limit: u32,
+    ) -> Result<Vec<Vec<u8>>, TitoError> {
+        let start = range.start.as_ref().to_vec();
+        let end = range.end.as_ref().to_vec();
+        if let Some(reads) = self.recorded_reads.lock().await.as_mut() {
+            reads.push([b"scan-keys:", start.as_slice()].concat());
+        }
+        Ok(self
+            .local
+            .lock()
+            .await
+            .range(start..end)
+            .take(limit as usize)
+            .map(|(key, _)| key.clone())
+            .collect())
+    }
+
     async fn scan_reverse<K: AsRef<[u8]> + Send>(
         &self,
         range: Range<K>,
@@ -325,6 +371,13 @@ impl TitoTransaction for MemoryTransaction {
         if let Some(reads) = self.recorded_reads.lock().await.as_mut() {
             reads.extend(keys.iter().map(|key| key.as_ref().to_vec()));
         }
+        if let Some(batches) = self.recorded_batch_gets.lock().await.as_mut() {
+            batches.push(
+                keys.iter()
+                    .map(|key| String::from_utf8_lossy(key.as_ref()).into_owned())
+                    .collect(),
+            );
+        }
         let data = self.local.lock().await;
         Ok(keys
             .into_iter()
@@ -336,7 +389,18 @@ impl TitoTransaction for MemoryTransaction {
     }
 
     async fn commit(self) -> Result<(), TitoError> {
-        let writes = std::mem::take(&mut *self.writes.lock().await);
+        let mut writes = std::mem::take(&mut *self.writes.lock().await);
+        let keys = guard_keys(
+            &*self.guards.lock().await,
+            !writes.is_empty(),
+            self.shared_fence_pick,
+        );
+        for key in keys {
+            if let Some(recorded) = self.recorded_writes.lock().await.as_mut() {
+                recorded.push(RecordedWrite::Delete(key.clone()));
+            }
+            writes.insert(key.into_bytes(), None);
+        }
         let mut store = self.store.lock().await;
         if let Some(key) = store.conflict(&writes, self.snapshot) {
             return Err(TitoError::Retryable(format!(

@@ -1,10 +1,6 @@
 use super::*;
 use crate::backend::tikv::MAX_TRANSACTION_RETRIES;
-use crate::fence::{
-    fence_stripe_key, link_fence_key, shared_fence_stripe, source_fence_stripe, FenceStripes,
-    LINK_FENCE_STRIPES,
-};
-use crate::reference::deleting_marker_key;
+use crate::fence::{exclusive_fence_key, record_fence_keys, shared_fence_key};
 use crate::TitoModel;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -12,193 +8,58 @@ fn tags(engine: &MemoryEngine) -> TitoModel<MemoryEngine, Tag> {
     engine.clone().model::<Tag>(TitoModelOptions::default())
 }
 
-async fn staged_shared_checks(
-    engine: &MemoryEngine,
-    id: &str,
-    checks: usize,
-) -> Vec<MemoryTransaction> {
-    let model = shops(engine);
-    let mut transactions = Vec::new();
-    for _ in 0..checks {
-        let tx = engine.begin_transaction().await.unwrap();
-        model.assert_current_shared(id, &tx).await.unwrap();
-        transactions.push(tx);
+fn unique_accounts(engine: &MemoryEngine) -> TitoModel<MemoryEngine, UniqueAccount> {
+    engine
+        .clone()
+        .model::<UniqueAccount>(TitoModelOptions::default())
+}
+
+fn account_by_email(email: &str) -> TitoFindOneByIndexPayload {
+    TitoFindOneByIndexPayload {
+        index: "verified-account-by-tenant-email".to_string(),
+        values: vec!["tenant".to_string(), email.to_string()],
     }
-    transactions
+}
+
+fn seventeen_fence_keys(table_and_id: &str) -> Vec<String> {
+    let mut keys = (0..16)
+        .map(|number| format!("fence:{table_and_id}:{number}"))
+        .collect::<Vec<_>>();
+    keys.push(format!("fence:{table_and_id}:exclusive"));
+    keys
 }
 
 #[tokio::test]
-async fn assert_current_requires_an_existing_record_and_preserves_exact_bytes() {
-    let engine = engine();
-    let model = engine.clone().model::<Tag>(TitoModelOptions::default());
-    save_tag(&engine, tag("t1", "database")).await;
-    let before = engine.raw_bytes("table:tags:t1").await.unwrap();
-
-    engine
-        .transaction(|tx| {
-            let model = model.clone();
-            async move { model.assert_current("t1", &tx).await }
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(engine.raw_bytes("table:tags:t1").await.unwrap(), before);
-    let missing = engine
-        .transaction(|tx| {
-            let model = model.clone();
-            async move { model.assert_current("missing", &tx).await }
-        })
-        .await
-        .unwrap_err();
-    assert!(matches!(missing, TitoError::NotFound(_)));
-}
-
-#[tokio::test]
-async fn assert_current_observes_a_write_already_staged_in_the_transaction() {
-    let engine = engine();
-    let model = engine.clone().model::<Tag>(TitoModelOptions::default());
-
-    engine
-        .transaction(|tx| {
-            let model = model.clone();
-            async move {
-                model
-                    .set(tag("t1", "database"))
-                    .timestamps(false)
-                    .execute(&tx)
-                    .await?;
-                model.assert_current("t1", &tx).await
-            }
-        })
-        .await
-        .unwrap();
-
-    assert_eq!(
-        model.get("t1").execute(None).await.unwrap().name,
-        "database"
-    );
-}
-
-#[tokio::test]
-async fn assert_current_shared_on_a_one_stripe_record_rewrites_it_like_assert_current() {
-    let engine = engine();
-    let model = tags(&engine);
-    save_tag(&engine, tag("t1", "database")).await;
-    let before = engine.raw_bytes("table:tags:t1").await.unwrap();
-    let version = model.get_versioned("t1", None).await.unwrap().version;
-
-    let tx = engine.begin_transaction().await.unwrap();
-    assert!(matches!(
-        model.assert_current_shared("missing", &tx).await,
-        Err(TitoError::NotFound(_))
-    ));
-    tx.rollback().await.unwrap();
-
-    engine.start_recording_writes().await;
-    let tx = engine.begin_transaction().await.unwrap();
-    model.assert_current_shared("t1", &tx).await.unwrap();
-    tx.commit().await.unwrap();
-
-    assert_eq!(
-        engine.take_recorded_writes().await,
-        vec![RecordedWrite::Put("table:tags:t1".to_string())]
-    );
-    assert_eq!(engine.raw_bytes("table:tags:t1").await.unwrap(), before);
-    assert_eq!(
-        model.get_versioned("t1", None).await.unwrap().version,
-        version
-    );
-    assert!(engine.keys_with_prefix("fence:").await.is_empty());
-}
-
-#[tokio::test]
-async fn one_stripe_shared_checks_collide_with_each_other_with_assert_current_and_with_saves() {
-    let engine = engine();
-    let model = tags(&engine);
-    save_tag(&engine, tag("t1", "database")).await;
-
-    let first = engine.begin_transaction().await.unwrap();
-    let second = engine.begin_transaction().await.unwrap();
-    model.assert_current_shared("t1", &first).await.unwrap();
-    model.assert_current_shared("t1", &second).await.unwrap();
-    first.commit().await.unwrap();
-    assert!(matches!(
-        second.commit().await,
-        Err(TitoError::Retryable(_))
-    ));
-
-    let shared = engine.begin_transaction().await.unwrap();
-    let exclusive = engine.begin_transaction().await.unwrap();
-    model.assert_current_shared("t1", &shared).await.unwrap();
-    model.assert_current("t1", &exclusive).await.unwrap();
-    exclusive.commit().await.unwrap();
-    assert!(matches!(
-        shared.commit().await,
-        Err(TitoError::Retryable(_))
-    ));
-
-    let checked = engine.begin_transaction().await.unwrap();
-    model.assert_current_shared("t1", &checked).await.unwrap();
-    save_tag(&engine, tag("t1", "renamed by a committed writer")).await;
-    assert!(matches!(
-        checked.commit().await,
-        Err(TitoError::Retryable(_))
-    ));
-
-    let check_first = engine.begin_transaction().await.unwrap();
-    let late_writer = engine.begin_transaction().await.unwrap();
-    model
-        .assert_current_shared("t1", &check_first)
-        .await
-        .unwrap();
-    model
-        .set(tag("t1", "renamed by a late writer"))
-        .timestamps(false)
-        .execute(&late_writer)
-        .await
-        .unwrap();
-    check_first.commit().await.unwrap();
-    assert!(matches!(
-        late_writer.commit().await,
-        Err(TitoError::Retryable(_))
-    ));
-    assert_eq!(
-        model.get("t1").execute(None).await.unwrap().name,
-        "renamed by a committed writer"
-    );
-    assert!(engine.keys_with_prefix("fence:").await.is_empty());
-}
-
-#[tokio::test]
-async fn assert_current_shared_on_a_sixteen_stripe_record_writes_the_stripe_of_its_transactions_pick(
-) {
+async fn get_exclusive_requires_an_existing_record_and_changes_no_stored_byte() {
     let engine = engine();
     let model = shops(&engine);
     save_shop(&engine, shop("s1")).await.unwrap();
-    let before = engine.raw_bytes("table:shops:s1").await.unwrap();
+    let primary = engine.raw_bytes("table:shops:s1").await.unwrap();
+    let manifest = engine
+        .raw_bytes("reverse-index:table:shops:s1")
+        .await
+        .unwrap();
     let version = model.get_versioned("s1", None).await.unwrap().version;
 
     let tx = engine.begin_transaction().await.unwrap();
     assert!(matches!(
-        model.assert_current_shared("missing", &tx).await,
+        model.get_exclusive("missing", &tx).await,
         Err(TitoError::NotFound(_))
     ));
-    tx.rollback().await.unwrap();
+    assert_eq!(model.get_exclusive("s1", &tx).await.unwrap(), shop("s1"));
+    assert_eq!(
+        commit_writes(&engine, tx).await,
+        vec![RecordedWrite::Delete(exclusive_fence_key("shops", "s1"))]
+    );
 
-    for _ in 0..3 {
-        let tx = engine.begin_transaction().await.unwrap();
-        let stripe = shared_fence_stripe(tx.shared_fence_pick(), 16);
-        let key = fence_stripe_key("shops", "s1", stripe);
-        engine.start_recording_writes().await;
-        model.assert_current_shared("s1", &tx).await.unwrap();
-        assert_eq!(
-            engine.take_recorded_writes().await,
-            vec![RecordedWrite::Delete(key)]
-        );
-        tx.commit().await.unwrap();
-    }
-
-    assert_eq!(engine.raw_bytes("table:shops:s1").await.unwrap(), before);
+    assert_eq!(engine.raw_bytes("table:shops:s1").await.unwrap(), primary);
+    assert_eq!(
+        engine
+            .raw_bytes("reverse-index:table:shops:s1")
+            .await
+            .unwrap(),
+        manifest
+    );
     assert_eq!(
         model.get_versioned("s1", None).await.unwrap().version,
         version
@@ -207,53 +68,381 @@ async fn assert_current_shared_on_a_sixteen_stripe_record_writes_the_stripe_of_i
 }
 
 #[tokio::test]
-async fn sixteen_stripe_shared_checks_on_one_record_take_turns_only_when_they_pick_one_stripe() {
+async fn a_read_by_id_in_a_writing_transaction_deletes_one_shared_key_of_its_pick_at_commit() {
+    let engine = engine();
+    let model = shops(&engine);
+    let accounts = unique_accounts(&engine);
+    save_shop(&engine, shop("s1")).await.unwrap();
+    save_unique_account(
+        &engine,
+        unique_account("a1", "tenant", "a1@example.com", true),
+    )
+    .await;
+
+    let tx = engine.begin_transaction().await.unwrap();
+    model.get("s1").execute(Some(&tx)).await.unwrap();
+    write_scratch(&tx).await;
+    let key = shared_fence_key("shops", "s1", picked_number(&tx));
+    assert_eq!(
+        commit_writes(&engine, tx).await,
+        vec![RecordedWrite::Delete(key)]
+    );
+
+    let tx = engine.begin_transaction().await.unwrap();
+    model
+        .get_many(vec!["s1".to_string()])
+        .execute(Some(&tx))
+        .await
+        .unwrap();
+    write_scratch(&tx).await;
+    let key = shared_fence_key("shops", "s1", picked_number(&tx));
+    assert_eq!(
+        commit_writes(&engine, tx).await,
+        vec![RecordedWrite::Delete(key)]
+    );
+
+    let tx = engine.begin_transaction().await.unwrap();
+    model.get_versioned("s1", Some(&tx)).await.unwrap();
+    write_scratch(&tx).await;
+    let key = shared_fence_key("shops", "s1", picked_number(&tx));
+    assert_eq!(
+        commit_writes(&engine, tx).await,
+        vec![RecordedWrite::Delete(key)]
+    );
+
+    let tx = engine.begin_transaction().await.unwrap();
+    accounts
+        .find_one_by_unique_index(account_by_email("a1@example.com"), Some(&tx))
+        .await
+        .unwrap();
+    write_scratch(&tx).await;
+    let key = shared_fence_key("unique-accounts", "a1", picked_number(&tx));
+    assert_eq!(
+        commit_writes(&engine, tx).await,
+        vec![RecordedWrite::Delete(key)]
+    );
+    assert!(engine.keys_with_prefix("fence:").await.is_empty());
+}
+
+#[tokio::test]
+async fn get_exclusive_deletes_the_exclusive_key_at_commit_in_place_of_the_shared_one() {
+    let engine = engine();
+    let model = shops(&engine);
+    save_shop(&engine, shop("s1")).await.unwrap();
+    save_shop(&engine, shop("s2")).await.unwrap();
+
+    let tx = engine.begin_transaction().await.unwrap();
+    model.get("s1").execute(Some(&tx)).await.unwrap();
+    model.get_exclusive("s1", &tx).await.unwrap();
+    model.get_exclusive("s2", &tx).await.unwrap();
+    model
+        .get_many(vec!["s1".to_string(), "s2".to_string()])
+        .execute(Some(&tx))
+        .await
+        .unwrap();
+    model.get_versioned("s2", Some(&tx)).await.unwrap();
+    write_scratch(&tx).await;
+    assert_eq!(
+        commit_writes(&engine, tx).await,
+        vec![
+            RecordedWrite::Delete(exclusive_fence_key("shops", "s1")),
+            RecordedWrite::Delete(exclusive_fence_key("shops", "s2")),
+        ]
+    );
+    assert!(engine.keys_with_prefix("fence:").await.is_empty());
+}
+
+#[tokio::test]
+async fn a_transaction_that_writes_nothing_and_a_read_without_a_transaction_add_no_guard() {
+    let engine = engine();
+    let model = shops(&engine);
+    let accounts = unique_accounts(&engine);
+    save_shop(&engine, shop("s1")).await.unwrap();
+    save_unique_account(
+        &engine,
+        unique_account("a1", "tenant", "a1@example.com", true),
+    )
+    .await;
+
+    let tx = engine.begin_transaction().await.unwrap();
+    model.get("s1").execute(Some(&tx)).await.unwrap();
+    model
+        .get_many(vec!["s1".to_string()])
+        .execute(Some(&tx))
+        .await
+        .unwrap();
+    model.get_versioned("s1", Some(&tx)).await.unwrap();
+    accounts
+        .find_one_by_unique_index(account_by_email("a1@example.com"), Some(&tx))
+        .await
+        .unwrap();
+    assert!(commit_writes(&engine, tx).await.is_empty());
+
+    engine.start_recording_writes().await;
+    model.get("s1").execute(None).await.unwrap();
+    model
+        .get_many(vec!["s1".to_string()])
+        .execute(None)
+        .await
+        .unwrap();
+    model.get_versioned("s1", None).await.unwrap();
+    accounts
+        .find_one_by_unique_index(account_by_email("a1@example.com"), None)
+        .await
+        .unwrap();
+    assert!(engine.take_recorded_writes().await.is_empty());
+    assert!(engine.keys_with_prefix("fence:").await.is_empty());
+}
+
+#[tokio::test]
+async fn get_exclusive_counts_as_a_write_so_its_transaction_deletes_every_key_it_noted() {
+    let engine = engine();
+    let model = shops(&engine);
+    for id in ["s1", "s2", "s3"] {
+        save_shop(&engine, shop(id)).await.unwrap();
+    }
+
+    let tx = engine.begin_transaction().await.unwrap();
+    model.get("s1").execute(Some(&tx)).await.unwrap();
+    model
+        .get_many(vec!["s2".to_string()])
+        .execute(Some(&tx))
+        .await
+        .unwrap();
+    model.get_exclusive("s3", &tx).await.unwrap();
+    let number = picked_number(&tx);
+    assert_eq!(
+        commit_writes(&engine, tx).await,
+        vec![
+            RecordedWrite::Delete(shared_fence_key("shops", "s1", number)),
+            RecordedWrite::Delete(shared_fence_key("shops", "s2", number)),
+            RecordedWrite::Delete(exclusive_fence_key("shops", "s3")),
+        ]
+    );
+
+    let first = engine.begin_transaction().await.unwrap();
+    let second = engine.begin_transaction().await.unwrap();
+    model.get_exclusive("s1", &first).await.unwrap();
+    model.get_exclusive("s1", &second).await.unwrap();
+    second.commit().await.unwrap();
+    assert!(matches!(first.commit().await, Err(TitoError::Retryable(_))));
+
+    let reader = engine.begin_transaction().await.unwrap();
+    model.get_exclusive("s1", &reader).await.unwrap();
+    model.get("s2").execute(Some(&reader)).await.unwrap();
+    save_shop(
+        &engine,
+        Shop {
+            name: "Renamed".to_string(),
+            ..shop("s2")
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        reader.commit().await,
+        Err(TitoError::Retryable(_))
+    ));
+    assert!(engine.keys_with_prefix("fence:").await.is_empty());
+}
+
+#[tokio::test]
+async fn a_record_saved_or_removed_in_its_own_transaction_adds_no_guard() {
     let engine = engine();
     let model = shops(&engine);
     save_shop(&engine, shop("s1")).await.unwrap();
 
-    assert_shared_checks_take_turns_only_within_one_stripe(&engine, &model, "s1").await;
+    let tx = engine.begin_transaction().await.unwrap();
+    model.get("s1").execute(Some(&tx)).await.unwrap();
+    engine.start_recording_writes().await;
+    model
+        .set(Shop {
+            name: "Renamed".to_string(),
+            ..shop("s1")
+        })
+        .timestamps(false)
+        .execute(&tx)
+        .await
+        .unwrap();
+    assert_eq!(
+        fence_writes(&engine.take_recorded_writes().await),
+        record_fence_keys("shops", "s1")
+    );
+    assert!(commit_writes(&engine, tx).await.is_empty());
 
+    let tx = engine.begin_transaction().await.unwrap();
+    model.get_exclusive("s1", &tx).await.unwrap();
+    engine.start_recording_writes().await;
+    model
+        .set(shop("s1"))
+        .timestamps(false)
+        .execute(&tx)
+        .await
+        .unwrap();
+    assert_eq!(
+        fence_writes(&engine.take_recorded_writes().await),
+        record_fence_keys("shops", "s1")
+    );
+    assert!(commit_writes(&engine, tx).await.is_empty());
+
+    let tx = engine.begin_transaction().await.unwrap();
+    engine.start_recording_writes().await;
+    model
+        .set(shop("s2"))
+        .timestamps(false)
+        .execute(&tx)
+        .await
+        .unwrap();
+    assert_eq!(
+        fence_writes(&engine.take_recorded_writes().await),
+        record_fence_keys("shops", "s2")
+    );
+    model.get("s2").execute(Some(&tx)).await.unwrap();
+    model.get_exclusive("s2", &tx).await.unwrap();
+    assert!(commit_writes(&engine, tx).await.is_empty());
+
+    let tx = engine.begin_transaction().await.unwrap();
+    model.get("s1").execute(Some(&tx)).await.unwrap();
+    model.get_exclusive("s2", &tx).await.unwrap();
+    engine.start_recording_writes().await;
+    assert!(model.remove("s1", &tx).await.unwrap());
+    assert!(model.remove("s2", &tx).await.unwrap());
+    let mut removed = record_fence_keys("shops", "s1");
+    removed.extend(record_fence_keys("shops", "s2"));
+    assert_eq!(fence_writes(&engine.take_recorded_writes().await), removed);
+    assert!(commit_writes(&engine, tx).await.is_empty());
+    assert!(engine.keys_with_prefix("table:shops:").await.is_empty());
     assert!(engine.keys_with_prefix("fence:").await.is_empty());
 }
 
 #[tokio::test]
-async fn every_shared_check_of_one_transaction_writes_the_stripe_of_its_pick() {
+async fn index_reads_scans_and_misses_add_no_guard() {
     let engine = engine();
     let model = shops(&engine);
-    let pairs = stands::<2>(&engine);
+    let accounts = unique_accounts(&engine);
+    save_shop(&engine, shop("s1")).await.unwrap();
+    let by_name = TitoFindByIndexPayload {
+        index: "shop-by-name".to_string(),
+        values: vec!["Shop s1".to_string()],
+        limit: Some(10),
+        cursor: None,
+    };
+    let scan = || TitoScanPayload {
+        start: "table:shops:".to_string(),
+        end: None,
+        limit: Some(10),
+        cursor: None,
+    };
+
+    let tx = engine.begin_transaction().await.unwrap();
+    assert_eq!(
+        model
+            .find_by_index(by_name.clone(), Some(&tx))
+            .await
+            .unwrap()
+            .items,
+        vec![shop("s1")]
+    );
+    assert_eq!(
+        model
+            .find_by_index_reverse(by_name, Some(&tx))
+            .await
+            .unwrap()
+            .items,
+        vec![shop("s1")]
+    );
+    let mut query = model.query_by_index("shop-by-name");
+    query.value("Shop s1");
+    assert_eq!(
+        query.execute(Some(&tx)).await.unwrap().items,
+        vec![shop("s1")]
+    );
+    assert_eq!(
+        query.execute_reverse(Some(&tx)).await.unwrap().items,
+        vec![shop("s1")]
+    );
+    assert_eq!(
+        query.execute_ids(Some(&tx)).await.unwrap().items,
+        vec!["s1"]
+    );
+    assert_eq!(
+        model
+            .find_one_by_index(
+                TitoFindOneByIndexPayload {
+                    index: "shop-by-name".to_string(),
+                    values: vec!["Shop s1".to_string()],
+                },
+                Some(&tx),
+            )
+            .await
+            .unwrap(),
+        shop("s1")
+    );
+    assert_eq!(model.scan(scan(), &tx).await.unwrap().0.len(), 1);
+    assert_eq!(model.scan_reverse(scan(), &tx).await.unwrap().0.len(), 1);
+    assert!(matches!(
+        model.get("missing").execute(Some(&tx)).await,
+        Err(TitoError::NotFound(_))
+    ));
+    assert!(model
+        .get_many(vec!["missing".to_string()])
+        .execute(Some(&tx))
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(matches!(
+        model.get_versioned("missing", Some(&tx)).await,
+        Err(TitoError::NotFound(_))
+    ));
+    assert!(matches!(
+        model.get_exclusive("missing", &tx).await,
+        Err(TitoError::NotFound(_))
+    ));
+    assert!(matches!(
+        accounts
+            .find_one_by_unique_index(account_by_email("missing@example.com"), Some(&tx))
+            .await,
+        Err(TitoError::NotFound(_))
+    ));
+    write_scratch(&tx).await;
+    assert!(commit_writes(&engine, tx).await.is_empty());
+}
+
+#[tokio::test]
+async fn every_read_of_one_transaction_uses_the_shared_key_of_its_pick_once_per_record() {
+    let engine = engine();
+    let model = shops(&engine);
     let ids = (0..20).map(|n| format!("s{n}")).collect::<Vec<_>>();
     for id in &ids {
         save_shop(&engine, shop(id)).await.unwrap();
     }
-    save_stand(&engine, stand::<2>("k1")).await.unwrap();
 
     let tx = engine.begin_transaction().await.unwrap();
-    let pick = tx.shared_fence_pick();
-    engine.start_recording_writes().await;
     for id in &ids {
-        model.assert_current_shared(id, &tx).await.unwrap();
-        model.assert_current_shared(id, &tx).await.unwrap();
+        model.get(id).execute(Some(&tx)).await.unwrap();
+        model.get_versioned(id, Some(&tx)).await.unwrap();
     }
-    pairs.assert_current_shared("k1", &tx).await.unwrap();
-
-    let shop_stripe = shared_fence_stripe(pick, 16);
-    let mut expected = Vec::new();
-    for id in &ids {
-        let key = fence_stripe_key("shops", id, shop_stripe);
-        expected.push(RecordedWrite::Delete(key.clone()));
-        expected.push(RecordedWrite::Delete(key));
-    }
-    let pair_key = fence_stripe_key("stands-2", "k1", shared_fence_stripe(pick, 2));
-    expected.push(RecordedWrite::Delete(pair_key));
-    assert_eq!(engine.take_recorded_writes().await, expected);
-    tx.commit().await.unwrap();
-    assert!(engine.keys_with_prefix("fence:").await.is_empty());
+    model
+        .get_many(ids.clone())
+        .execute(Some(&tx))
+        .await
+        .unwrap();
+    write_scratch(&tx).await;
+    let number = picked_number(&tx);
+    let writes = commit_writes(&engine, tx).await;
+    assert_eq!(writes.len(), ids.len());
+    assert_eq!(
+        sorted(fence_writes(&writes)),
+        sorted(
+            ids.iter()
+                .map(|id| format!("fence:shops:{id}:{number}"))
+                .collect()
+        )
+    );
 }
 
 #[tokio::test]
-async fn transactions_in_different_stripes_check_twenty_records_side_by_side_and_one_stripe_takes_turns(
-) {
+async fn shared_reads_take_turns_only_when_their_transactions_pick_one_key() {
     let engine = engine();
     let model = shops(&engine);
     let ids = (0..20).map(|n| format!("s{n}")).collect::<Vec<_>>();
@@ -262,13 +451,15 @@ async fn transactions_in_different_stripes_check_twenty_records_side_by_side_and
     }
 
     let first = engine.begin_transaction().await.unwrap();
-    let stripe = shared_fence_stripe(first.shared_fence_pick(), 16);
-    let other = transaction_in_stripe(&engine, 16, |picked| picked != stripe).await;
-    let same = transaction_in_stripe(&engine, 16, |picked| picked == stripe).await;
-    for id in &ids {
-        for tx in [&first, &other, &same] {
-            model.assert_current_shared(id, tx).await.unwrap();
-        }
+    let number = picked_number(&first);
+    let other = transaction_with_shared_key(&engine, |picked| picked != number).await;
+    let same = transaction_with_shared_key(&engine, |picked| picked == number).await;
+    for tx in [&first, &other, &same] {
+        assert_eq!(
+            model.get_many(ids.clone()).execute(Some(tx)).await.unwrap(),
+            ids.iter().map(|id| shop(id)).collect::<Vec<_>>()
+        );
+        write_scratch(tx).await;
     }
     first.commit().await.unwrap();
     other.commit().await.unwrap();
@@ -277,36 +468,37 @@ async fn transactions_in_different_stripes_check_twenty_records_side_by_side_and
 }
 
 #[tokio::test]
-async fn every_attempt_of_a_retried_transaction_checks_in_the_stripe_of_its_own_pick() {
+async fn every_attempt_of_a_retried_transaction_guards_with_its_own_pick_and_starts_clean() {
     let engine = engine();
     let model = shops(&engine);
     save_shop(&engine, shop("s1")).await.unwrap();
-    let attempts = Arc::new(tokio::sync::Mutex::new(Vec::<(u64, u16)>::new()));
+    save_shop(&engine, shop("s2")).await.unwrap();
+    let numbers = Arc::new(tokio::sync::Mutex::new(Vec::<u16>::new()));
 
     engine
         .transaction(|tx| {
             let engine = engine.clone();
             let model = model.clone();
-            let attempts = attempts.clone();
+            let numbers = numbers.clone();
             async move {
-                engine.start_recording_writes().await;
-                model.assert_current_shared("s1", &tx).await?;
-                let writes = engine.take_recorded_writes().await;
-                let stripe = picked_stripe(&writes, "shops", "s1", 16);
-                let first = {
-                    let mut attempts = attempts.lock().await;
-                    attempts.push((tx.shared_fence_pick(), stripe));
-                    attempts.len() == 1
+                let attempt = {
+                    let mut numbers = numbers.lock().await;
+                    numbers.push(picked_number(&tx));
+                    numbers.len()
                 };
-                if first {
-                    save_shop(
-                        &engine,
-                        Shop {
-                            name: "Renamed".to_string(),
-                            ..shop("s1")
-                        },
-                    )
-                    .await?;
+                let read = if attempt == 1 { "s1" } else { "s2" };
+                model.get(read).execute(Some(&tx)).await?;
+                write_scratch(&tx).await;
+                save_shop(
+                    &engine,
+                    Shop {
+                        name: format!("Renamed during attempt {attempt}"),
+                        ..shop("s1")
+                    },
+                )
+                .await?;
+                if attempt > 1 {
+                    engine.start_recording_writes().await;
                 }
                 Ok::<_, TitoError>(())
             }
@@ -314,325 +506,121 @@ async fn every_attempt_of_a_retried_transaction_checks_in_the_stripe_of_its_own_
         .await
         .unwrap();
 
-    let attempts = attempts.lock().await;
-    assert_eq!(attempts.len(), 2);
-    for (pick, stripe) in attempts.iter() {
-        assert_eq!(*stripe, shared_fence_stripe(*pick, 16));
-    }
-    assert!(engine.keys_with_prefix("fence:").await.is_empty());
+    let numbers = numbers.lock().await;
+    assert_eq!(numbers.len(), 2);
+    assert_eq!(
+        engine.take_recorded_writes().await,
+        vec![RecordedWrite::Delete(shared_fence_key(
+            "shops", "s2", numbers[1]
+        ))]
+    );
+    assert_eq!(
+        shops(&engine).get("s1").execute(None).await.unwrap().name,
+        "Renamed during attempt 2"
+    );
 }
 
 #[tokio::test]
-async fn every_save_remove_and_erase_of_a_sixteen_stripe_record_collides_with_its_shared_checks() {
+async fn every_save_replace_remove_and_repair_deletes_the_seventeen_escaped_fence_keys() {
     let engine = engine();
     let model = shops(&engine);
-    save_shop(&engine, shop("s1")).await.unwrap();
+    let tag_model = tags(&engine);
+    let id = "a:b\\c";
+    let escaped = seventeen_fence_keys("shops:a\\:b\\\\c");
+    assert_eq!(escaped[7], "fence:shops:a\\:b\\\\c:7");
+    let renamed = Shop {
+        name: "Renamed".to_string(),
+        ..shop(id)
+    };
 
-    let checks = staged_shared_checks(&engine, "s1", 4).await;
-    save_shop(
-        &engine,
-        Shop {
-            deleting: true,
-            ..shop("s1")
-        },
-    )
-    .await
-    .unwrap();
-    for tx in checks {
-        assert!(matches!(tx.commit().await, Err(TitoError::Retryable(_))));
-    }
-
-    let renaming = engine.begin_transaction().await.unwrap();
-    let (check, _) = staged_shared_check(&engine, &model, "s1").await;
-    model
-        .set(Shop {
-            name: "Renamed".to_string(),
-            ..shop("s1")
-        })
-        .timestamps(false)
-        .execute(&renaming)
-        .await
-        .unwrap();
-    check.commit().await.unwrap();
-    assert!(matches!(
-        renaming.commit().await,
-        Err(TitoError::Retryable(_))
-    ));
-
-    let checks = staged_shared_checks(&engine, "s1", 4).await;
-    let plain = engine.begin_transaction().await.unwrap();
-    model
-        .set(Shop {
-            deleting: true,
-            name: "Renamed while deleting".to_string(),
-            ..shop("s1")
-        })
-        .timestamps(false)
-        .execute(&plain)
-        .await
-        .unwrap();
-    plain.commit().await.unwrap();
-    for tx in checks {
-        assert!(matches!(tx.commit().await, Err(TitoError::Retryable(_))));
-    }
-
-    let checks = staged_shared_checks(&engine, "s1", 4).await;
-    assert!(engine
+    assert_eq!(
+        fence_writes(&save_writes(&engine, &model, shop(id)).await),
+        escaped
+    );
+    assert_eq!(
+        fence_writes(&save_writes(&engine, &model, renamed.clone()).await),
+        escaped
+    );
+    engine.start_recording_writes().await;
+    engine
         .transaction(|tx| {
             let model = model.clone();
-            async move { model.remove("s1", &tx).await }
+            let renamed = renamed.clone();
+            async move {
+                model
+                    .replace_many(vec![(renamed, shop(id))])
+                    .timestamps(false)
+                    .execute(&tx)
+                    .await
+            }
         })
-        .await
-        .unwrap());
-    for tx in checks {
-        assert!(matches!(tx.commit().await, Err(TitoError::Retryable(_))));
-    }
-
-    save_shop(&engine, shop("s2")).await.unwrap();
-    let checks = staged_shared_checks(&engine, "s2", 4).await;
-    assert!(engine
-        .transaction(|tx| {
-            let model = model.clone();
-            async move { model.erase("s2".to_string(), &tx).await }
-        })
-        .await
-        .unwrap());
-    for tx in checks {
-        assert!(matches!(tx.commit().await, Err(TitoError::Retryable(_))));
-    }
-    assert!(engine.keys_with_prefix("fence:").await.is_empty());
-}
-
-#[tokio::test]
-async fn a_sixteen_stripe_model_writes_all_sixteen_stripe_keys_on_every_save_remove_erase_and_repair(
-) {
-    let engine = engine();
-    let model = shops(&engine);
-    let every = stripe_keys("shops", "s1", 16);
-    let marker = deleting_marker_key("shops", "s1");
-    let deleting = Shop {
-        deleting: true,
-        ..shop("s1")
-    };
-
-    let writes = save_writes(&engine, &model, shop("s1")).await;
-    assert_eq!(fence_writes(&writes), every);
-    let writes = repair_writes(&engine, &model, "s1").await;
-    assert_eq!(fence_writes(&writes), every);
-
-    let writes = save_writes(&engine, &model, deleting).await;
-    assert!(writes.contains(&RecordedWrite::Put(marker.clone())));
-    assert_eq!(fence_writes(&writes), every);
-    let writes = repair_writes(&engine, &model, "s1").await;
-    assert!(writes.contains(&RecordedWrite::Put(marker.clone())));
-    assert_eq!(fence_writes(&writes), every);
-
-    let writes = save_writes(&engine, &model, shop("s1")).await;
-    assert!(writes.contains(&RecordedWrite::Delete(marker.clone())));
-    assert_eq!(fence_writes(&writes), every);
-
-    let writes = remove_writes(&engine, &model, "s1").await;
-    assert!(writes.contains(&RecordedWrite::Delete(marker)));
-    assert_eq!(fence_writes(&writes), every);
-
-    save_shop(&engine, shop("s1")).await.unwrap();
-    let writes = erase_writes(&engine, &model, "s1").await;
-    assert_eq!(fence_writes(&writes), every);
-
-    engine.start_recording_writes().await;
-    save_tag(&engine, tag("t1", "database")).await;
-    assert!(fence_writes(&engine.take_recorded_writes().await).is_empty());
-    assert!(engine.keys_with_prefix("fence:").await.is_empty());
-}
-
-#[tokio::test]
-async fn a_two_stripe_model_writes_its_two_stripe_keys_and_all_sixteen_link_stripes_with_its_deleting_marker(
-) {
-    let engine = engine();
-    let model = stands::<2>(&engine);
-    let two = stripe_keys("stands-2", "k1", 2);
-    let sixteen = stripe_keys("stands-2", "k1", LINK_FENCE_STRIPES);
-    let marker = deleting_marker_key("stands-2", "k1");
-    let deleting = Stand::<2> {
-        deleting: true,
-        ..stand("k1")
-    };
-    let renamed = Stand::<2> {
-        name: "Renamed".to_string(),
-        ..deleting.clone()
-    };
-
-    let writes = save_writes(&engine, &model, stand::<2>("k1")).await;
-    assert_eq!(fence_writes(&writes), two);
-    let writes = repair_writes(&engine, &model, "k1").await;
-    assert_eq!(fence_writes(&writes), two);
-
-    let writes = save_writes(&engine, &model, deleting.clone()).await;
-    assert!(writes.contains(&RecordedWrite::Put(marker.clone())));
-    assert_eq!(fence_writes(&writes), sixteen);
-
-    let writes = save_writes(&engine, &model, renamed).await;
-    assert!(deleting_writes(&writes).is_empty());
-    assert_eq!(fence_writes(&writes), two);
-
-    let writes = repair_writes(&engine, &model, "k1").await;
-    assert!(writes.contains(&RecordedWrite::Put(marker.clone())));
-    assert_eq!(fence_writes(&writes), sixteen);
-
-    let writes = erase_writes(&engine, &model, "k1").await;
-    assert!(writes.contains(&RecordedWrite::Delete(marker.clone())));
-    assert_eq!(fence_writes(&writes), sixteen);
-
-    save_stand(&engine, deleting).await.unwrap();
-    let writes = save_writes(&engine, &model, stand::<2>("k1")).await;
-    assert!(writes.contains(&RecordedWrite::Delete(marker.clone())));
-    assert_eq!(fence_writes(&writes), sixteen);
-
-    let writes = remove_writes(&engine, &model, "k1").await;
-    assert!(writes.contains(&RecordedWrite::Delete(marker)));
-    assert_eq!(fence_writes(&writes), sixteen);
-
-    save_stand(&engine, stand::<2>("k1")).await.unwrap();
-    let writes = erase_writes(&engine, &model, "k1").await;
-    assert!(deleting_writes(&writes).is_empty());
-    assert_eq!(fence_writes(&writes), two);
-    assert!(engine.keys_with_prefix("fence:").await.is_empty());
-}
-
-#[tokio::test]
-async fn two_stripe_shared_checks_pick_one_of_its_two_stripes_and_collide_with_every_save() {
-    let engine = engine();
-    let model = stands::<2>(&engine);
-    save_stand(&engine, stand::<2>("k1")).await.unwrap();
-
-    assert_shared_checks_take_turns_only_within_one_stripe(&engine, &model, "k1").await;
-
-    let mut checks = Vec::new();
-    for _ in 0..4 {
-        checks.push(staged_shared_check(&engine, &model, "k1").await);
-    }
-    let renamed = Stand::<2> {
-        name: "Renamed".to_string(),
-        ..stand("k1")
-    };
-    save_stand(&engine, renamed).await.unwrap();
-    for (tx, _) in checks {
-        assert!(matches!(tx.commit().await, Err(TitoError::Retryable(_))));
-    }
-    assert!(engine.keys_with_prefix("fence:").await.is_empty());
-}
-
-#[tokio::test]
-async fn assert_current_collides_with_saves_and_exclusive_fences_but_not_with_striped_shared_checks(
-) {
-    let engine = engine();
-    let model = shops(&engine);
-    save_shop(&engine, shop("s1")).await.unwrap();
-
-    let fenced = engine.begin_transaction().await.unwrap();
-    model.assert_current("s1", &fenced).await.unwrap();
-    save_shop(
-        &engine,
-        Shop {
-            name: "Renamed by a committed writer".to_string(),
-            ..shop("s1")
-        },
-    )
-    .await
-    .unwrap();
-    assert!(matches!(
-        fenced.commit().await,
-        Err(TitoError::Retryable(_))
-    ));
-
-    let fence_first = engine.begin_transaction().await.unwrap();
-    let late_writer = engine.begin_transaction().await.unwrap();
-    model.assert_current("s1", &fence_first).await.unwrap();
-    model
-        .set(Shop {
-            name: "Renamed by a late writer".to_string(),
-            ..shop("s1")
-        })
-        .timestamps(false)
-        .execute(&late_writer)
         .await
         .unwrap();
-    fence_first.commit().await.unwrap();
-    assert!(matches!(
-        late_writer.commit().await,
-        Err(TitoError::Retryable(_))
-    ));
+    assert_eq!(
+        sorted(fence_writes(&engine.take_recorded_writes().await)),
+        sorted(escaped.clone())
+    );
+    assert_eq!(
+        fence_writes(&repair_writes(&engine, &model, id).await),
+        escaped
+    );
+    assert_eq!(
+        fence_writes(&remove_writes(&engine, &model, id).await),
+        escaped
+    );
 
-    let first = engine.begin_transaction().await.unwrap();
-    let second = engine.begin_transaction().await.unwrap();
-    model.assert_current("s1", &first).await.unwrap();
-    model.assert_current("s1", &second).await.unwrap();
-    first.commit().await.unwrap();
-    assert!(matches!(
-        second.commit().await,
-        Err(TitoError::Retryable(_))
-    ));
-
-    let version = model.get_versioned("s1", None).await.unwrap().version;
-    let versioned = engine.begin_transaction().await.unwrap();
-    assert!(model
-        .assert_version("s1", version, &versioned)
-        .await
-        .unwrap());
-    save_shop(&engine, shop("s1")).await.unwrap();
-    assert!(matches!(
-        versioned.commit().await,
-        Err(TitoError::Retryable(_))
-    ));
-
-    let exclusive = engine.begin_transaction().await.unwrap();
-    let shared = engine.begin_transaction().await.unwrap();
-    model.assert_current("s1", &exclusive).await.unwrap();
-    model.assert_current_shared("s1", &shared).await.unwrap();
-    exclusive.commit().await.unwrap();
-    shared.commit().await.unwrap();
+    let tag_keys = seventeen_fence_keys("tags:t1");
+    assert_eq!(
+        fence_writes(&save_writes(&engine, &tag_model, tag("t1", "database")).await),
+        tag_keys
+    );
+    assert_eq!(
+        fence_writes(&save_writes(&engine, &tag_model, tag("t1", "storage")).await),
+        tag_keys
+    );
+    assert_eq!(
+        fence_writes(&repair_writes(&engine, &tag_model, "t1").await),
+        tag_keys
+    );
+    assert_eq!(
+        fence_writes(&remove_writes(&engine, &tag_model, "t1").await),
+        tag_keys
+    );
+    assert!(engine.keys_with_prefix("fence:").await.is_empty());
 }
 
 #[tokio::test]
-async fn a_model_with_zero_stripes_is_refused_before_any_read_or_write() {
-    let engine = engine();
-    let model = stands::<0>(&engine);
-    engine.start_recording_reads().await;
-    engine.start_recording_writes().await;
+async fn a_manifest_may_not_list_a_fence_key() {
+    for fence in ["fence:shops:s1:0", "fence:shops:s1:exclusive"] {
+        let engine = engine();
+        let model = shops(&engine);
+        save_shop(&engine, shop("s1")).await.unwrap();
+        let reverse_key = "reverse-index:table:shops:s1";
+        let mut listed = engine.raw_json(reverse_key).await.unwrap();
+        listed["value"].as_array_mut().unwrap().push(json!(fence));
+        engine.put_json(reverse_key, &listed).await;
 
-    let tx = engine.begin_transaction().await.unwrap();
-    let refusals = vec![
-        model
-            .set(stand::<0>("z1"))
-            .timestamps(false)
-            .execute(&tx)
-            .await
-            .map(|_| ()),
-        model
-            .replace_many(vec![(stand::<0>("z1"), stand::<0>("z1"))])
-            .timestamps(false)
-            .execute(&tx)
-            .await
-            .map(|_| ()),
-        model.assert_current_shared("z1", &tx).await,
-        model.remove("z1", &tx).await.map(|_| ()),
-        model.erase("z1".to_string(), &tx).await.map(|_| ()),
-        model
-            .rebuild_indexes_for_restore("z1", &tx)
-            .await
-            .map(|_| ()),
-    ];
-    tx.rollback().await.unwrap();
-
-    for refusal in refusals {
         assert!(matches!(
-            refusal,
-            Err(TitoError::Configuration(message)) if message.contains("'stands-0'")
+            save_shop(&engine, shop("s1")).await,
+            Err(TitoError::IndexError(_))
         ));
+        assert!(matches!(
+            engine
+                .transaction(|tx| {
+                    let model = model.clone();
+                    async move { model.remove("s1", &tx).await }
+                })
+                .await,
+            Err(TitoError::IndexError(_))
+        ));
+        let tx = engine.begin_transaction().await.unwrap();
+        assert!(matches!(
+            model.rebuild_indexes_for_restore("s1", &tx).await,
+            Err(TitoError::IndexError(_))
+        ));
+        tx.rollback().await.unwrap();
+        assert_eq!(engine.raw_json(reverse_key).await.unwrap(), listed);
     }
-    assert!(engine.take_recorded_reads().await.is_empty());
-    assert!(engine.take_recorded_writes().await.is_empty());
-    assert!(engine.keys_with_prefix("").await.is_empty());
 }
 
 #[tokio::test]
@@ -735,61 +723,6 @@ async fn memory_transactions_retry_a_conflicting_commit_within_the_tikv_budget()
         MAX_TRANSACTION_RETRIES as usize + 1
     );
     assert_eq!(engine.raw_bytes("counter").await.unwrap(), b"competing");
-}
-
-#[test]
-fn fence_stripe_keys_escape_their_segments_and_link_and_shared_stripes_are_fixed() {
-    assert_eq!(
-        fence_stripe_key("shops", "a:b\\c", 7),
-        "fence:shops:a\\:b\\\\c:7"
-    );
-    let keys_below = |stripes: u16| {
-        (0..stripes)
-            .map(|stripe| format!("fence:shops:s1:{stripe}"))
-            .collect::<Vec<_>>()
-    };
-    assert!(FenceStripes::Record.record_keys("shops", "s1").is_empty());
-    assert_eq!(
-        FenceStripes::Striped(2).record_keys("shops", "s1"),
-        keys_below(2)
-    );
-    assert_eq!(
-        FenceStripes::Striped(16).record_keys("shops", "s1"),
-        keys_below(16)
-    );
-    for stripes in [
-        FenceStripes::Record,
-        FenceStripes::Striped(2),
-        FenceStripes::Striped(16),
-    ] {
-        assert_eq!(
-            stripes.marker_keys("shops", "s1"),
-            keys_below(LINK_FENCE_STRIPES)
-        );
-    }
-    assert_eq!(
-        FenceStripes::Striped(32).marker_keys("shops", "s1"),
-        keys_below(32)
-    );
-    assert_eq!(
-        link_fence_key("pictures", "a:b", "galleries", "g1"),
-        "fence:pictures:a\\:b:9"
-    );
-    assert_eq!(
-        link_fence_key("shops", "s1", "galleries", "g1"),
-        "fence:shops:s1:9"
-    );
-    assert_eq!(source_fence_stripe("galleries", "g1", 16), 9);
-    assert_eq!(
-        source_fence_stripe("orders", "4f6c1a52-7e0b-4f43-9d0c-2b4c1a9e8f10", 16),
-        13
-    );
-    assert_eq!(source_fence_stripe("a:b", "c\\d", 16), 13);
-    assert_eq!(shared_fence_stripe(0, 16), 0);
-    assert_eq!(shared_fence_stripe(37, 16), 5);
-    assert_eq!(shared_fence_stripe(u64::MAX, 16), 15);
-    assert_eq!(shared_fence_stripe(37, 2), 1);
-    assert_eq!(shared_fence_stripe(u64::MAX, 3), 0);
 }
 
 #[tokio::test]

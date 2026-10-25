@@ -1,4 +1,5 @@
 use super::*;
+use crate::types::TitoIndexValue;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,6 +40,7 @@ impl ComputedRecord {
             });
         }
         TitoIndexConfig {
+            value: TitoIndexValue::RecordReference,
             name: name.to_string(),
             condition: self.enabled && (!unique || self.unique),
             fields,
@@ -49,14 +51,6 @@ impl ComputedRecord {
 impl TitoModelTrait for ComputedRecord {
     fn id(&self) -> String {
         self.id.clone()
-    }
-
-    fn references(&self) -> Vec<TitoReference> {
-        Vec::new()
-    }
-
-    fn is_deleting(&self) -> bool {
-        false
     }
 
     fn table() -> String {
@@ -114,17 +108,26 @@ async fn custom_string_uses_existing_encoding_without_a_stored_field_and_default
     assert!(json.get("target_key").is_none());
     let encoded = encode_index_string(&stored.target_key());
     assert_eq!(
-        engine.raw_json(&format!(
+        engine.raw_bytes(&format!(
             "index:computed-by-target:tenant:store-1:target_key:{encoded}:table:computed-records:first"
         )).await.unwrap(),
-        json
+        Vec::<u8>::new()
     );
     assert_eq!(
-        engine.raw_json(&format!(
+        engine.raw_bytes(&format!(
             "index:computed-by-target-rank:tenant:store-1:target_key:{encoded}:rank:{}:table:computed-records:first",
             crate::encode_index_integer(-1)
         )).await.unwrap(),
-        json
+        Vec::<u8>::new()
+    );
+    assert_eq!(
+        engine
+            .raw_bytes(&format!(
+                "unique-index:computed-records:computed-unique-target:tenant:store-1:target_key:{encoded}"
+            ))
+            .await
+            .unwrap(),
+        b"first".to_vec()
     );
     let query = TitoFindByIndexPayload {
         index: "computed-by-target".to_string(),
@@ -200,11 +203,17 @@ async fn computed_unique_ownership_is_scoped_and_updates_release_old_reverse_ind
     for prefix in [
         "index:computed-by-target:",
         "index:computed-by-target-rank:",
-        "unique-index:computed-records:",
     ] {
         for key in engine.keys_with_prefix(prefix).await {
-            assert_ne!(engine.raw_json(&key).await.unwrap()["id"], "owner");
+            assert!(!key.ends_with(":table:computed-records:owner"));
+            assert_eq!(engine.raw_bytes(&key).await.unwrap(), Vec::<u8>::new());
         }
+    }
+    for key in engine
+        .keys_with_prefix("unique-index:computed-records:")
+        .await
+    {
+        assert_ne!(engine.raw_bytes(&key).await.unwrap(), b"owner".to_vec());
     }
     assert_eq!(model.get("owner").execute(None).await.unwrap(), owner);
     assert_eq!(model.get("foreign").execute(None).await.unwrap(), foreign);

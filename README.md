@@ -6,8 +6,8 @@ A database layer on TiKV with indexing, transactions, and a built-in partitioned
 
 - **Data Storage**: Models with CRUD operations
 - **Indexing**: Conditional ordinary and unique composite indexes for efficient queries
-- **References**: Records declare what they point at; Tito checks every pointer on save, keeps one
-  key per pointer, refuses to remove a record while anything points at it, and lists who does
+- **Guards**: A read by id in a transaction that writes guards its record, so a concurrent save or
+  remove of that record makes one of the two transactions retry
 - **Transactions**: Full ACID transactions
 - **Query Builder**: Fluent API for querying by index
 - **Transactional Publication**: Queue events can be written atomically with application data
@@ -43,9 +43,50 @@ Ordinary indexes are declared by `indexes`; their keys include the primary recor
 have many owners. Exclusive value ownership is declared separately by `unique_indexes`; its key
 includes the model, index name, and complete indexed value but not the claimant ID. A competing
 claim therefore conflicts on one real ownership key and returns `TitoError::UniqueViolation`
-without exposing the indexed value. `find_one_by_unique_index` performs an exact key read and then
-loads the authoritative primary record. Conditional unique indexes are omitted when their model
-instance sets `condition` to false.
+without exposing the indexed value. `find_one_by_unique_index` performs an exact key read and
+resolves the record according to the index's value mode; in a transaction that writes, a hit guards that record like
+`get` (see [Guards](#guards)). Conditional unique indexes are omitted when their model instance sets
+`condition` to false.
+
+Every ordinary and unique `TitoIndexConfig` requires an explicit `value`. There is no default:
+
+```rust
+pub enum TitoIndexValue {
+    RecordCopy,
+    RecordReference,
+}
+```
+
+`RecordCopy` stores the full serialized record in each index entry. A record read uses that copy
+without another primary lookup. Every write refreshes the copy, including changes to fields that
+are not indexed. Copies use more stored and written bytes; they remove the extra record fetch.
+
+`RecordReference` keeps entries small. An ordinary entry,
+`index:{index}:{field}:{value}…:{primary key}`, stores an empty value because its key already ends
+with `table:{table}:{id}`. A unique entry,
+`unique-index:{table}:{index}:{field}:{value}…`, stores its owner's id as UTF-8 bytes. Record reads
+resolve the original in the same transaction. `get_index_keys` returns each key with the bytes
+chosen by its declaration.
+
+The mode belongs to the index schema and must be the same for every record declaring that index.
+This schema is installed on a fresh database. There is no migration or old-format compatibility
+path: Tito reads exactly the declared format. Restore rebuilds indexes from backups of this same
+schema. Writers with different declarations must not run together.
+
+- An index list (`find_by_index`, `find_by_index_reverse`, `find_one_by_index`,
+  `query_by_index(..).execute` and `.execute_reverse`, and their `_raw` forms) uses copied records
+  directly and fetches referenced records in one batch in the same transaction. Order, limits,
+  cursors and has-more come from the keys. A missing referenced record, a copied record that
+  disagrees with its key, or a key outside the model fails with `TitoError::IndexError` naming the
+  key; nothing is skipped. A copy read does not separately check whether its primary exists.
+- `query_by_index(..).execute_ids(tx)` reads the entry keys only and returns
+  `TitoPaginated<String>` of record ids, with the same limits and cursors as `execute`. A check
+  that only needs to know whether any record holds a value uses it with `limit(Some(1))`.
+- `find_one_by_unique_index` reads a copy directly or resolves a referenced owner by id. It fails
+  with `IndexError` when a referenced owner is missing or the returned record no longer declares
+  that unique value. Both modes take the same owner guard.
+- `scan` and `scan_reverse` over an index range return each entry's key with its record's JSON,
+  read the same way; a primary range returns the stored records as before.
 
 ## TiKV client dependency
 
@@ -92,7 +133,6 @@ struct User {
     name: String,
     email: String,
     avatar_id: Option<String>,
-    deleting: bool,
 }
 
 impl TitoModelTrait for User {
@@ -105,34 +145,34 @@ impl TitoModelTrait for User {
     }
 
     fn indexes(&self) -> Vec<TitoIndexConfig> {
-        vec![TitoIndexConfig {
-            condition: true,
-            name: "by_email".to_string(),
-            fields: vec![TitoIndexField {
-                name: "email".to_string(),
-                r#type: TitoIndexFieldType::String,
-            }],
-        }]
-    }
-
-    fn references(&self) -> Vec<TitoReference> {
-        self.avatar_id
-            .iter()
-            .map(|avatar_id| TitoReference::new("media", avatar_id, "avatar_id"))
-            .collect()
-    }
-
-    fn is_deleting(&self) -> bool {
-        self.deleting
+        vec![
+            TitoIndexConfig {
+                condition: true,
+                name: "user-by-email".to_string(),
+                value: TitoIndexValue::RecordCopy,
+                fields: vec![TitoIndexField {
+                    name: "email".to_string(),
+                    r#type: TitoIndexFieldType::String,
+                }],
+            },
+            TitoIndexConfig {
+                condition: true,
+                name: "user-by-avatar".to_string(),
+                value: TitoIndexValue::RecordReference,
+                fields: vec![TitoIndexField {
+                    name: "avatar_id".to_string(),
+                    r#type: TitoIndexFieldType::String,
+                }],
+            },
+        ]
     }
 }
 ```
 
-`references` and `is_deleting` have no default, so a model can't forget them. A model that points
-at nothing returns an empty list, and a model with no deleting state returns `false`.
-`fence_stripes()` defaults to 1, which means the record itself is its fence. A model whose records
-many transactions check with `assert_current_shared` at the same time returns more, such as 16, and
-0 is refused (see [Fences](#fences)).
+A model declares its indexes and, when it has any, its unique indexes. It declares nothing about
+fences: every record of every model has the same 17 fence keys (see [Guards](#guards)). A record
+that holds another record's id, like `avatar_id`, keeps an index on that field so the other
+record's delete can find it (see [Ids held by other records](#ids-held-by-other-records)).
 
 ## CRUD Operations
 
@@ -150,215 +190,134 @@ db.transaction(|tx| {
 
 let user = users.get(&id).execute(None).await?;
 
-let mut query = users.query_by_index("by_email");
+let mut query = users.query_by_index("user-by-email");
 let results = query.value(email.as_str()).limit(Some(10)).execute(None).await?;
+let ids = query.execute_ids(None).await?;
 ```
 
+`execute` reads copied records directly or fetches referenced records in one batch; `execute_ids`
+reads the keys only and returns the record ids in either mode.
+
 Tito reads and writes one model at a time. Applications load related records explicitly so their
-domain and API boundaries determine when an additional read is required. When a transaction
-depends on an existing record remaining unchanged, `model.assert_current(id, &tx)` reads and stages
-the exact primary bytes after validating its storage metadata, without deserializing the model,
-changing timestamps, touching indexes, or creating a second lock record. Two such fences on one
-record conflict with each other. When a transaction only needs the record to still exist and be
-current, it uses `model.assert_current_shared(id, &tx)`. On a model with several fence stripes
-the checks of two transactions take turns only when the transactions pick the same stripe; see
-[Fences](#fences).
+domain and API boundaries determine when an additional read is required.
+
+In a transaction that writes, every read by id guards the record it returns: `get`, `get_many`,
+`get_versioned` and a hit of `find_one_by_unique_index` take a shared guard, and
+`model.get_exclusive(id, &tx)` reads the record and takes the exclusive guard. A save or remove of a
+guarded record by another transaction then makes one of the two retry (see [Guards](#guards)). A
+read without a transaction adds no guard, and neither does a shared read in a transaction that
+writes nothing. `get_exclusive` counts as a write, so its guard is taken even when its transaction
+writes nothing else.
 
 `model.get_versioned(id, transaction)` returns `TitoVersioned<T>` with the model in `value` and
 an opaque `TitoRecordVersion` in `version`. The version is the positive transaction version saved
-by the last model write, not the current reader's transaction version or a business timestamp.
-`model.assert_version(id, expected_version, &tx)` returns `true` only for that stored version and
-stages the primary write fence in the caller's transaction. Check the result before performing
-dependent writes. Concurrent model changes then conflict at commit. A missing or changed record
-returns `false`; invalid storage metadata returns an error.
+by the last model write, not the current reader's transaction version or a business timestamp. To
+act only on a version read earlier, read it again with `get_versioned` in the acting transaction
+and compare: the read's guard makes a concurrent save conflict at commit. A missing record is
+`NotFound`; invalid storage metadata is an error.
 
-Reads and fences do not advance the record version. Every model write installs its write-transaction
+Reads and guards do not advance the record version. Every model write installs its write-transaction
 version, including same-timestamp writes; delete/recreate obtains a new version. Versions serialize
 as exact opaque strings, so clients do not truncate TiKV's integers to JavaScript numbers. They
 are equality tokens, not domain revisions, provider-operation fences or permission to retry an
 external effect. The transaction engine must supply unique positive transaction versions and
 detect write conflicts.
 
-For a single-valued ordinary index, `model.assert_index_match(id, payload, &tx)` checks the exact
-declared field values against the owner's reverse-index manifest and stages the same manifest bytes
-on a match. It does not fetch the primary row or an index's copied owner payload. A missing manifest
-or mismatched value returns `false`; corrupt, duplicate, ambiguous or oversized metadata errors.
-Assertions accept at most one MiB of metadata and 10,000 keys, record IDs up to 512 bytes and field
-values up to 4,096 bytes. Numeric comparisons use exact signed integer encoding.
+## Ids held by other records
 
-This asserts indexed values, not the whole record or permission to access it. Applications using
-it as a projection-revision fence must advance an indexed revision on every content change and
-preserve atomic set/remove maintenance. Raw primary writes/deletes bypass that contract. Adding a
-revision index requires an explicit offline index rebuild before dependent reads; the assertion
-does not repair old manifests or fall back to fetching content. An engine must detect conflicting
-writes to the manifest for the assertion to fence concurrent updates/removals.
+Tito has no foreign keys and keeps no references. A record that holds another record's id, such as
+a variant's `tax_category_id`, holds an ordinary field. The application keeps such ids honest with
+two rules:
 
-## References
-
-Tito has no foreign keys, so a record says what it points at, the way it lists its indexes.
-`references()` returns one `TitoReference { table, id, path }` per pointer:
-- `table` is the target model's `table()`;
-- `id` is the target's record id;
-- `path` says where the pointer sits in the source, such as `gallery.0`.
-
-Table and id are 1 to 512 bytes and the path is 1 to 2,048 bytes. Identical triples count once. A
-pointer to the record itself is ignored, because it goes away with the record.
-
-Tito finds each target at `table:{table}:{id}`, the default `key_prefix`. A model that overrides
-`key_prefix` can't be a reference target.
-
-**On save**, in the caller's transaction:
-1. Tito reads every target. A missing target fails the save with
-   `TitoError::ReferenceMissing { table, id, path }`.
-2. A target the record didn't point at before, under any path, is new. If a new target is marked
-   deleting, the save fails with `TitoError::ReferenceDeleting { table, id, path }`.
-3. A target the record already pointed at may stay while it is deleting, so a cleanup can still edit
-   it away. Moving it to another path keeps it.
-4. Tito writes one key per new pointer and deletes the keys of pointers that went away, in the same
-   transaction. Kept keys are not rewritten.
-
-Each key looks like this:
-
-```
-ref:{target table}:{target id}:{source table}:{source id}:{path}
-```
-
-Its value is the source's `TitoIncomingReference { table, id, path }`. Each segment escapes `\` and
-`:` with a backslash, so ids that contain separators never collide.
-
-**Deleting.** While `is_deleting()` is true, the record also owns the marker key
-`deleting:{table}:{id}`, with the value `true`. That is how Tito knows a target is deleting without
-knowing its Rust type.
-
-**The manifest.** Reference keys and the marker are listed in the record's manifest beside its
-index keys. A save fails with `InvalidInput` when the manifest would hold more than 10,000 keys or
-more than one MiB. Index repair and index assertions enforce the same two limits.
-
-**Remove.** `model.remove(id, &tx)` fails with `TitoError::Referenced { table, id, by }` while any
-other record points at the record. `by` names up to 20 sources in key order. When it succeeds, the
-remove deletes the record's own reference keys and marker with its indexes.
-
-There is no cascade and no unset. A cleanup over many records runs as the application's own batched
-job, which marks the target deleting first.
-
-**Who points.** `model.referenced_by(id, &tx)` returns every other record pointing at a record, in
-key order, paging through the keys internally.
-
-**Who else points.** `model.referenced_by_except(id, &source_tables, limit, &tx)` returns up to
-`limit` sources whose table is not in `source_tables`, in key order. A record that is about to clean
-up its own dependants asks it before it is marked deleting: a category with a hundred thousand
-products, or a collection with its entries, learns whether anything else points at it without
-reading the pointers it will clear itself.
+1. **A save reads every id it holds.** In the save's transaction, read each held record by id. A
+   missing record fails the save with `NotFound`, and the read guards the record.
+2. **A delete checks every model that can hold its id.** In the delete's transaction, read each
+   holder model's index for the id and refuse while one finds a holder.
 
 ```rust
-let others = categories
-    .referenced_by_except(&category_id, &["product", "customer"], 20, &tx)
-    .await?;
+let mut holders = variants.query_by_index("product-variant-by-tax-category");
+holders.value(tax_category_id.clone()).limit(Some(1));
+if holders.execute_ids(Some(&tx)).await?.items.is_empty() {
+    tax_categories.remove(&tax_category_id, &tx).await?;
+}
 ```
 
-- Every key of one source table sits in one contiguous range under the target, so Tito seeks past
-  each skipped range instead of reading it.
-- `limit` must be at least 1. An empty or over-512-byte `id` or source table is `InvalidInput`.
-- Listing a table nothing points from, or the same table twice, is allowed.
-- Keys are checked as in `referenced_by`: a key that disagrees with its value is an `IndexError`.
+The check reads at most two entry keys, the second only to tell whether more follow, and no
+record. A save and a delete that overlap conflict: the save's read deletes one of the held record's
+shared fence keys and the delete's remove deletes all 17. Tito retries one of them. The retried
+delete finds the new holder, or the retried save finds the record gone. The index read has to run
+in the delete's own transaction: TiKV doesn't check reads, and the retried delete reads a new
+snapshot, which includes the holder that committed first. An index read is a list and adds no
+guard.
 
-**Erase.** `model.erase(id, &tx)` removes a record, its indexes, its own reference keys and its
-marker without checking who points at it. It exists for erasing a whole tenant, where every source
-goes too. Keys that other records hold pointing at the erased record stay until those records go.
+`remove` deletes a record, its indexes and its unique keys, whoever holds its id; the check above is
+the application's. A record whose delete takes many steps keeps its own deleting state as an
+ordinary field: Tito stores no deleting marker.
 
-**Index repair.** `rebuild_indexes_for_restore` rebuilds reference keys and the marker from the
-record, like index keys. It doesn't read the targets, so records can be restored in any order.
+## Guards
 
-**Concurrency.** A save that adds a pointer writes one of its target's 16 link stripes, and every
-remove and deleting mark of the target writes all 16, so a pointer added while its target is
-removed or marked deleting conflicts at commit and the retry sees the new state. Two pointers added
-to one target at the same moment conflict only when their sources fall in the same link stripe,
-whatever the target's own stripes. See [Fences](#fences).
+Tito's TiKV transactions are optimistic, and TiKV checks only writes at commit. A transaction that
+read record A and wrote record B commits even if another transaction changed A in between. A guard
+turns the read into a write that both transactions make, so TiKV cancels one of them, Tito retries
+it at most 10 times, and the retry sees the other's result.
 
-## Fences
-
-Tito's TiKV transactions are optimistic and reads aren't checked at commit, so a transaction that
-depends on a record writes a key that every transaction it must not overlap also writes. TiKV
-cancels one of two overlapping transactions that write the same key, Tito retries it at most 10
-times, and the retry sees the new state.
-
-**Stripe keys.** A record's fence stripes are keys of this form:
+**Fence keys.** Every record of every model has 17 fence keys, its 16 shared keys and its exclusive
+key:
 
 ```
-fence:{table}:{id}:{stripe}
+fence:{table}:{id}:0 … fence:{table}:{id}:15
+fence:{table}:{id}:exclusive
 ```
 
-The table and id are escaped like reference keys. A stripe key is only ever written as a delete. No
-value is stored at it, so it is never listed in a manifest and erase and index repair have nothing
-to clean up. A manifest that lists one is an integrity error. A record has two sets of stripes, both
-counted from 0:
-- **Record stripes.** A model says how many fence stripes its records have, the way a hot lock is
-  striped: `fence_stripes() -> u16`. The default, 1, means the record itself is its only stripe, so
-  it has no record stripe keys. A model with N stripes, N of at least 2, gives each record stripes
-  0 to N - 1.
-- **Link stripes.** Every record has 16, stripes 0 to 15, whatever its model's N. They fence new
-  pointers to the record against its removal and deleting mark.
+The table and id are escaped with `encode_index_string`. Tito only ever deletes a fence key and
+never puts one. In TiKV a delete is a write: it conflicts with any other write of the key, and TiKV
+keeps it as a Delete entry in the key's history until garbage collection removes it. Reads never
+see that entry, so to every reader a fence key doesn't exist. No value is stored at a fence key, so
+none is listed in a manifest, and a manifest that lists one is an integrity error.
 
-With N = 16 both sets are the same 16 keys. An operation that writes both writes each key once:
-stripes 0 to max(N, 16) - 1.
-
-Each operation writes these fence keys of a record, besides its ordinary keys:
-
-| What happens to a record | Fence keys written |
+| Operation | Fence keys deleted |
 | --- | --- |
-| `assert_current` or `assert_version` on it | its primary key, rewritten unchanged |
-| `assert_current_shared` on it | with 1 stripe, its primary key, rewritten unchanged as `assert_current` does; with N, its record stripe `tx.shared_fence_pick() % N` |
-| another record's save adds a pointer to it | one of its 16 link stripes, picked from the source's table and id |
-| another record's save keeps its pointer to it | nothing |
-| a save, `replace_many`, `erase` or `rebuild_indexes_for_restore` of it that doesn't write its deleting marker | its N record stripes, none with 1 stripe |
-| an operation that writes its deleting marker: every `remove`, a save or `replace_many` that marks it deleting or clears the mark, and an `erase` or `rebuild_indexes_for_restore` while it is deleting | its record stripes and its 16 link stripes, each once |
+| `get`, `get_many`, `get_versioned`, a hit of `find_one_by_unique_index`, in a transaction that writes | one shared key of each record read, at commit |
+| `get_exclusive` | the record's exclusive key, at commit |
+| `set`, `replace_many`, `remove`, `remove_by_index`, `rebuild_indexes_for_restore` | all 17 keys of each record written or removed |
+| a shared read in a transaction that writes nothing, and any read without a transaction | nothing |
+| index reads (`find_by_index`, `find_by_index_reverse`, `query_by_index` with `execute`, `execute_reverse` and `execute_ids`, `find_one_by_index`) and the batched record read behind them, `scan`, `scan_reverse`, `find`, and a read that finds nothing | nothing |
 
 So:
-- a new pointer conflicts with every removal or deleting mark of its target that it overlaps,
-  whatever the target's stripes; the retry fails with `ReferenceMissing` or `ReferenceDeleting`, or
-  the remove's retry fails with `Referenced`;
-- two new pointers to one target conflict only when their sources fall in the same link stripe, and
-  then one retries;
-- a new pointer commits beside a plain save of a target with 1 stripe; a plain save of a target with
-  N stripes writes stripes 0 to N - 1, so it conflicts with the new pointers whose link stripe is
-  below N, which with 16 is every new pointer;
-- on a record with 1 stripe, shared checks conflict with each other, with `assert_current` and with
-  every save of the record, exactly like `assert_current`;
-- on a record with N stripes, the shared checks of two transactions conflict only when the
-  transactions pick the same stripe, every save, deleting mark, remove and erase of the record
-  conflicts with every shared check it overlaps, and `assert_current` and `assert_version` don't
-  conflict with shared checks, because neither kind changes the record.
 
-**Stripe choice.** A pointer's link stripe is FNV-1a 64 of `{source table}:{source id}`, escaped as
-in keys, modulo 16, so one source always fences the same link stripe of a target, pointers from many
-sources spread over the 16, and Tito needs nothing from the target's model to pick it. A
-transaction draws one random 64-bit number when it begins, `tx.shared_fence_pick()`, and every
-shared check in it writes stripe `pick % N` of its record. So one transaction writes the same stripe
-number on every record with N stripes it checks, and checking a record twice writes one key. Two
-transactions take turns on their shared checks only when their picks fall in the same stripe: with
-16, one pair in 16, however many such records both check. A retry is a new transaction, so it draws
-again. An engine that implements `TitoTransaction` draws a new pick for each transaction it begins.
+- two shared guards of one record conflict only when their transactions picked the same shared
+  key, about one pair in 16;
+- two exclusive guards of one record always conflict;
+- a shared and an exclusive guard of one record don't conflict;
+- a save or remove of a record conflicts with every guard of it that it overlaps.
 
-**Choosing N.** 1 costs nothing and suits most models, and pointers to their records already spread
-over the 16 link stripes. A model whose records many concurrent transactions check with
-`assert_current_shared`, such as a store during a sale, returns more: with 16, the checks of two
-transactions take turns only when the transactions pick the same stripe, and every save, remove,
-erase and repair of the record pays 16 stripe deletes. Busy models that the same transactions check
-should share one N, because the record with the fewest stripes among those two transactions both
-check sets how often they take turns. Changing a model's count is like a Tito upgrade: don't run
-writers that disagree on it together, because a save by one doesn't write the stripe a shared check
-by the other writes.
+**The shared key.** A transaction draws one random number when it begins, and every shared guard
+it adds uses key `number % 16`. Two transactions that read the same twenty records conflict about
+one time in 16, the same as two that read one: either they drew one key or they didn't. A retry is
+a new transaction and draws again.
 
-**Shared checks.** `model.assert_current_shared(id, &tx)` works on every model. It reads and
-validates the record like `assert_current` and fails with `NotFound` when it is missing. On a model
-with 1 stripe it is `assert_current`; with N stripes it writes the stripe key of its transaction's
-pick and changes no stored byte and no record version. Use it where a transaction only needs the
-record to still exist and be current, such as a store that must not be closing while orders are
-written in it. Keep `assert_current` or `assert_version` where the fence is a compare-and-set.
+**When guards are added.** A transaction notes each record it reads by id. At commit, if it wrote
+anything or took an exclusive guard, Tito deletes one key per noted record: the exclusive key for a
+record read with `get_exclusive`, a shared key otherwise. A record read both ways holds only the
+exclusive key. Any write counts: a save or remove, a queue publication or acknowledgement, a raw put
+or delete. `get_exclusive` counts as a write itself: its key is deleted even when the transaction
+writes nothing else, and the transaction's shared guards then apply too. A record the transaction
+saved or removed itself gets nothing more, since its save already deleted all 17. A transaction that
+only reads with `get`, `get_many`, `get_versioned` or a unique hit adds nothing, and neither does a
+read without a transaction: there is no write to protect. Each attempt of a retried transaction
+starts with nothing noted.
 
-**Zero stripes.** A model whose `fence_stripes()` is 0 is refused with `TitoError::Configuration`,
-never rounded up: `set`, `replace_many`, `remove`, `erase`, `rebuild_indexes_for_restore` and
-`assert_current_shared` fail before they read or write.
+**Lists.** A guard covers records read one by one, not a list: an index can gain a row while no
+record read changes. A list reads its records by id in one batched read that notes no guard, so a
+save of a listed record never makes the list's transaction retry. A rule over a list, such as "a
+company keeps at least one manager", takes `get_exclusive` on the list's parent in every
+transaction that changes the list.
+
+**Engines.** `TitoTransaction::guard(table, id, guard)` notes a record as `TitoGuard::Shared`,
+`Exclusive` or `Written`, and the strongest note wins. An engine draws a new number for every
+transaction it begins, and its `commit` deletes the noted keys before committing when the
+transaction wrote or holds an exclusive guard. The TiKV engine and the in-memory test engine do
+both.
 
 ## Storage integrity and pagination
 
@@ -367,29 +326,26 @@ records of one model in the caller's transaction. Every source must still equal 
 expected serialized record, and each replacement keeps its source ID. The method validates and
 serializes the complete batch before staging any write. Unique keys may move between included
 sources, including swap cycles; a final duplicate key or an owner outside the batch is refused.
-References use the batch's final target states: existing links may remain while a target becomes
-Deleting, but a new link cannot point at a final Deleting target. External target checks keep the
-normal reference fence: a new link writes one of its target's 16 link stripes, a replaced record of
-a model with several fence stripes has all of them written, and a replacement that marks a record
-deleting or clears the mark also writes its 16 link stripes. Each source primary is replaced,
-fencing concurrent source changes, and all manifests receive the transaction's record version.
-Timestamp handling matches `set`; pass `timestamps(false)` to retain application-authored times.
+Each replaced record's 17 fence keys are deleted, as a save deletes them. Each source primary is
+replaced, fencing concurrent source changes, and all manifests receive the transaction's record
+version. Timestamp handling matches `set`; pass `timestamps(false)` to retain application-authored
+times.
 
 A batch contains 1–100 distinct existing records. Its combined old and prepared storage keys
 must fit 10,000 keys, and its prepared writes and deletion keys must fit 8 MiB. Invalid input,
-stale expected records, ownership conflicts, missing or deleting targets, and serialization errors
-are returned before the batch writes anything. A later transaction failure rolls back the whole
-batch with its caller's other changes. This operation does not create records or assign temporary
-unique values.
+stale expected records, ownership conflicts and serialization errors are returned before the batch
+writes anything. A later transaction failure rolls back the whole batch with its caller's other
+changes. This operation does not create records or assign temporary unique values.
 
 Each persisted model row has a matching `reverse-index:{primary-key}` manifest containing its
 required record `version` and index-key `value` array, including models with no secondary indexes.
-Primary, metadata and secondary indexes commit atomically. The manifest may name ordinary `index:` keys ending in that exact
-primary key, model-scoped `unique-index:` keys whose stored owner matches that primary record, the
-record's own `ref:` keys and its own `deleting:` marker. It never names a `fence:` stripe key.
-Updates and removals validate the pair and every unique owner before mutating either side. A
-missing, orphaned, malformed, or syntactically cross-record manifest is an integrity error; Tito
-does not reinterpret it as a missing entity or follow it to an unrelated key.
+Primary, metadata and secondary indexes commit atomically. The manifest may name ordinary `index:`
+keys ending in that exact primary key and model-scoped `unique-index:` keys whose stored owner
+matches that primary record. It never names a `fence:` key. A save fails with `InvalidInput` when
+its manifest would hold more than 10,000 keys or more than one MiB, and index repair refuses
+metadata over the same limits. Updates and removals validate the pair and every unique owner before
+mutating either side. A missing, orphaned, malformed, or syntactically cross-record manifest is an
+integrity error; Tito does not reinterpret it as a missing entity or follow it to an unrelated key.
 
 The record version is not an index-schema version, so Tito cannot prove that
 a syntactically valid manifest still enumerates every index created by an older application schema.
@@ -401,19 +357,20 @@ application's explicit pre-production reset and backup-format cutover.
 
 For offline repair of lost or stale secondary indexes under an unchanged model,
 `model.rebuild_indexes_for_restore(id, &tx)` validates the retained primary and reverse manifest,
-then rewrites only their declared index values, reference keys and deleting marker. A record of a
-model with several fence stripes also has all its stripe keys written, as a save would, and a
-deleting record also has its 16 link stripes written with its marker. The primary bytes, manifest
-bytes and original record version are preserved and fenced in the same transaction.
+then rewrites only their declared index values, and deletes the record's 17 fence keys, as a save
+does. The primary bytes, manifest bytes and original record version are preserved and fenced in the
+same transaction.
 Missing secondary keys are allowed; a unique key owned by another record is not. Ordinary writes
 still reject missing unique keys. Missing versions, duplicate or foreign manifest keys, a
-primary/key mismatch, or a manifest that differs from the current model's indexes, references or
-deleting state reject. This is not schema migration, a new record write or permission to invent
-missing authoritative metadata. The caller owns offline operation, bounded primary enumeration and
-domain relationship validation; Tito does not scan related records or read reference targets.
+primary/key mismatch, or a manifest that differs from the current model's indexes reject. This is
+not schema migration, a new record write or permission to invent missing authoritative metadata.
+The caller owns offline operation, bounded primary enumeration and domain relationship validation;
+Tito does not read related records.
 
 Scans fail on malformed JSON, non-UTF-8 keys, and values that do not deserialize into the requested
-model. They never silently shorten a page by dropping corrupt rows. Forward cursors continue from
+model. A scanned index entry follows its declared value mode. A reference whose record is missing
+or a copied record that disagrees with its key fails with `IndexError` naming the entry's key. Scans never silently shorten a page by
+dropping corrupt rows. Forward cursors continue from
 the exact key plus a NUL byte; reverse cursors use the exact key as the exclusive upper bound. Both
 directions reject a cursor outside the requested half-open range. `find` applies its optional `end`
 as an exclusive model-key suffix, and a scan limit of zero is invalid.
@@ -428,38 +385,57 @@ let after = tito::key_after("index:by_store:store_id:abc:table:item:42".to_strin
 `prefix_end` closes a prefix range; it must not be used to continue after an exact key because
 advancing the final character can skip keys such as `a20` after `a2`. Use `key_after` for that.
 
-Secondary index values intentionally remain complete clones of the primary JSON document. This
-preserves the existing storage wire format and query behavior. Removing that redundancy requires a
-separately designed release that rehydrates primary rows and migrates every existing index.
+Secondary index values follow their explicit `TitoIndexValue` declaration (see the index
+paragraphs at the top). Record copies are maintained atomically with their primary; references
+resolve the primary on a record read.
 
-### 0.18.4 fence stripes
+### 0.18.5 guards and index entries
 
-- `TitoModelTrait` gains `fence_stripes() -> u16`, default 1, and `TitoModel` gains
-  `assert_current_shared(id, &tx)` for every model. On a model with 1 stripe the shared check
-  rewrites the record like `assert_current`, and saves of its records write no record stripe.
-- `TitoTransaction` gains `shared_fence_pick() -> u64` beside `start_version()`: a random number the
-  transaction draws when it begins. `TiKVBackend::begin_transaction` and the in-memory test engine
-  draw one for every transaction, and an engine that implements `TitoTransaction` must too.
-- A model with N stripes, N of at least 2, has N record stripe keys per record,
-  `fence:{table}:{id}:{stripe}`. A shared check writes stripe `pick % N`, where the pick is its
-  transaction's `shared_fence_pick()`, so all shared checks of one transaction write one stripe
-  number and a retry draws again; every save, `replace_many`, remove, erase and repair of the record
-  writes all N. Shared checks of transactions whose picks fall in different stripes stop taking
-  turns, while every change of the record still conflicts with each of them.
-- Every record has 16 link stripes under the same key format, whatever its model's N. A new pointer
-  writes one of its target's, picked from the source's table and id, instead of the target's
-  `deleting:` key. Every write of a record's deleting marker (a remove, a deleting mark or its
-  clearing, and an erase or repair of a deleting record) also writes all 16. So a new pointer still
-  conflicts with every removal and deleting mark of its target, while new pointers to one target
-  conflict only when their sources share a link stripe.
-- A model whose `fence_stripes()` is 0 is refused with `TitoError::Configuration`.
-- Stripe keys are write-only deletes: stored records, manifests and key formats are unchanged, and
-  nothing needs migrating. Don't run 0.18.3 writers beside 0.18.4 writers: a remove or mark by a
-  0.18.3 writer doesn't write the link stripe a new pointer by a 0.18.4 writer writes. Don't run
-  writers that disagree on a model's stripes together either: a save by one doesn't write the stripe
-  a shared check by the other writes.
+Against 0.18.3, the last pinned release (0.18.4's fence stripes were never released):
+
+- Every record has 16 shared fence keys and one exclusive key, `fence:{table}:{id}:0` to `:15` and
+  `fence:{table}:{id}:exclusive`, which Tito only deletes. A save, `replace_many`, `remove` and
+  index repair delete all 17. A delete is a TiKV write: it leaves a Delete entry in the key's
+  history until garbage collection, and reads never see it.
+- Reads guard by themselves. In a transaction that writes, `get`, `get_many`, `get_versioned` and a
+  hit of `find_one_by_unique_index` delete one shared key of each record read at commit, and the
+  new `get_exclusive(id, &tx)` deletes the exclusive key. `get_exclusive` counts as a write, so its
+  key is deleted even when the transaction writes nothing else.
+- `assert_current`, `assert_version` and `assert_index_match` are removed. They fenced by rewriting
+  a record or its manifest. `get_exclusive` replaces `assert_current`; `get_versioned` in the
+  acting transaction and a comparison replace `assert_version`.
+- `TitoTransaction` gains `guard(table, id, guard)`, and `TitoGuard` is new. An engine notes guards
+  and deletes their keys at commit when the transaction wrote or holds an exclusive guard.
+- References are removed: `TitoModelTrait::references` and `is_deleting`, `TitoReference`,
+  `TitoIncomingReference`, the `ref:` keys and the `deleting:` marker, `TitoError::Referenced`,
+  `ReferenceMissing` and `ReferenceDeleting`, `referenced_by`, `referenced_by_except` and `erase`.
+  `remove` no longer checks who holds a record's id. Applications read the ids a save holds and
+  check the holders' indexes before a delete (see
+  [Ids held by other records](#ids-held-by-other-records)).
+- `get_key`, `batch_get` and `get_many_raw` on `TitoModel` are no longer public, so every public
+  read by id guards.
+- Every index requires `value: TitoIndexValue::RecordCopy` or `RecordReference`, with no default.
+  A copy stores the full record and reads it directly; a reference stores an empty ordinary value
+  or a unique owner id and fetches the primary. Every index list
+  (`find_by_index`, `find_by_index_reverse`, their `_raw` forms, `find_one_by_index`,
+  `query_by_index(..).execute` and `.execute_reverse`, and `scan` or `scan_reverse` over an index
+  range) reads copies directly and referenced records by id in one batch, without adding a guard.
+  Order, limits, cursors and has-more are unchanged. `query_by_index(..).execute_ids` is new: it
+  reads the keys only and returns `TitoPaginated<String>` of ids. `remove_by_index` reads ids only.
+  `get_index_keys` returns each key with the bytes it stores, `Vec<(String, Vec<u8>)>`.
+- A reference entry whose record is missing, a copied record that disagrees with its key, or a key
+  under an index prefix that is not an entry of the model is a `TitoError::IndexError` naming the key. `find_one_by_unique_index` also answers
+  `IndexError` when the owner no longer declares the unique value.
+- Manifests list only index and unique keys. A record written by 0.18.3 that holds a pointer or is
+  deleting lists `ref:` or `deleting:` keys and fails every update, remove, repair and
+  `get_versioned`: reset and reseed. Primary, index and queue key formats are unchanged, but index
+  values must match the explicitly chosen mode: a unique entry written by 0.18.3 holds a record
+  copy and cannot be read as an owner id. Reset and reseed with the reviewed declarations.
+- Don't run 0.18.3 writers beside 0.18.5 writers: a 0.18.3 save deletes none of the fence keys a
+  0.18.5 guard deletes, and its index values may differ from the explicitly selected modes.
 - The in-memory test engine detects write-write conflicts at commit, applies only the keys a
-  transaction wrote, and retries a conflicting commit like `TiKVBackend::transaction`.
+  transaction wrote, retries a conflicting commit like `TiKVBackend::transaction`, and runs the same
+  guard path as the TiKV engine.
 
 ### 0.18.3 exact index values, fixed partitions and bounded reads
 
@@ -634,8 +610,8 @@ Every new invocation must serialize to at most `MAX_QUEUE_EVENT_BYTES` (1 MiB). 
 larger events before writing anything. Queue range reads preserve their public logical page size while
 asking the engine for at most 16 invocations per scan.
 
-The TiKV engine bounds every read by bytes as well as rows, for models, indexes, references and the
-queue alike. A scan is fetched as a sequence of datastore requests:
+The TiKV engine bounds every read by bytes as well as rows, for models, indexes and the queue
+alike. A scan is fetched as a sequence of datastore requests:
 
 - the first request asks for at most `SCAN_RPC_FIRST_ROWS` (16) rows;
 - each later request asks for as many rows as fit `SCAN_RPC_BYTES` (4 MiB) at the size of the
@@ -778,30 +754,50 @@ eight reconnect regressions and two retained controls, and the actual three-memb
 transfer witness. Every phase is required. See [complete verification](docs/verification.md) for
 prerequisites, source holds, native ownership, cleanup and retained evidence.
 
-The library cases use the in-memory engine and cover model/index writes, exact index values,
-reference keys, refusals, staged fence writes and fence stripe conflicts, queue transitions, fixed partitions, exact
-signed millisecond scheduling and completion, exact inclusive cutoff buckets and signed extrema,
-configured retention, cluster ownership and leases, worker paging and shutdown, and ambiguous
-transaction outcomes. `tikv_native_orphan_lock_test` creates a real secondary lock after a definite primary
+The library cases use the in-memory engine and cover model/index writes, exact index values, index
+reference entries that hold no record data (an empty ordinary entry, an owner id in a unique entry), lists
+that read their records in one batched read in index order, `execute_ids` reading keys only,
+cursors and limits across pages, a missing record behind an entry, moved and removed entries, the
+fence keys each save, remove, batch and repair deletes and each guard a commit adds, queue
+transitions, fixed partitions, exact signed millisecond scheduling and completion, exact inclusive
+cutoff buckets and signed extrema, configured retention, cluster ownership and leases, worker paging
+and shutdown, and ambiguous transaction outcomes. `tikv_native_orphan_lock_test` creates a real secondary lock after a definite primary
 prewrite conflict, waits for its observed native TTL, proves the missing-primary branch through a
 normal Tito read, and verifies recovery preserves the winning primary. It removes only its own
 two UUID-scoped keys. `tikv_native_large_rows_test` reads 40 records of 1 MiB, more than the
-client's 32 MiB decoding budget, through scans, index pages and a batch get, and pulls 16 queue
-events of almost 1 MiB. `tikv_native_queue_test` proves that cluster-worker and standalone-worker
-handlers complete their own pending row inside their transaction, that a duplicate delivery
+client's 32 MiB decoding budget, through scans, index pages (entry keys, then one batch get of
+their records) and a batch get, and pulls 16 queue events of almost 1 MiB. It also saves a record
+of 1 MiB with five ordinary index entries and one unique entry and reads every entry back by get
+and each ordinary entry also by scan and batch get: every ordinary entry stores an empty value and
+the unique entry its owner's id, while lists and the unique lookup return the record and
+`execute_ids` returns its id. `tikv_native_index_values_test` covers both explicit modes together:
+stored bytes, ordinary and unique ranges, forward/reverse pages, copied reads without a primary
+fetch, key-only ID reads, validation of malformed copies, non-indexed updates and timestamps,
+rollback, changed and removed entries, unique claims and batch ownership swaps, shared guards,
+unguarded lists, and restore preserving record versions and refusing another unique owner.
+`tikv_native_queue_test`
+proves that cluster-worker and standalone-worker handlers complete their own pending row inside
+their transaction, that a duplicate delivery
 conflicts on that row and its retry skips, that a rolled-back handler leaves the row pending, and
 that `ack_in_tx` refuses events and keys it does not own without writing. `tikv_native_fence_test`
-proves on real TiKV that a new pointer conflicts with a removal or deleting mark of its target,
-whether the target has 1 fence stripe or 16; that new pointers to a target with 1 stripe or 16
-commit together from sources in different link stripes and conflict from sources in one; that
-shared checks on a record with 1 stripe conflict with each other and with an update, while on
-records with 16, two transactions whose picks fall in different stripes check twenty records and
-commit together, two whose picks fall in one stripe conflict and the retry passes, and a check
-conflicts with an update in either commit order; that `assert_current`, `assert_version` and unique
-claims conflict at commit; and that unique values differing only by case or spacing coexist. The in-memory engine fails a commit with
-`TitoError::Retryable` when another transaction committed one of its keys after it started, as TiKV
-does, so the library cases cover these conflicts too; the native cases prove them on TiKV. Examples
-are compiled but not run against a live database.
+proves on real TiKV:
+
+- every read by id in a transaction that writes conflicts with a save of its record, while index
+  reads (records and `execute_ids`), scans and reads that find nothing don't;
+- two transactions reading the same twenty records conflict in 4 to 75 of 480 pairs, about one time
+  in 16;
+- two exclusive reads of one record always conflict, and a shared and an exclusive read commit
+  together;
+- a save and a remove conflict with shared and exclusive reads in either commit order;
+- a transaction that only reads by id adds no guard, `get_exclusive` counts as a write, and a retry
+  starts without the guards of the attempt before;
+- a new holder and a delete of the record it names conflict in either order: the retried delete
+  refuses, or the retried save finds the record gone;
+- unique claims conflict at commit, and unique values differing only by case or spacing coexist.
+
+The in-memory engine fails a commit with `TitoError::Retryable` when another transaction committed
+one of its keys after it started, as TiKV does, so the library cases cover these conflicts too; the
+native cases prove them on TiKV. Examples are compiled but not run against a live database.
 
 Application-level primary-commit response loss, provider effects, backup and restore remain the
 application's complete-suite responsibility against the exact released Tito revision. The native

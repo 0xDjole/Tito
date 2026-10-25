@@ -20,8 +20,6 @@ pub mod query;
 mod key_encoder;
 pub use key_encoder::{encode_index_integer, encode_index_string};
 
-mod reference;
-
 mod fence;
 
 mod error;
@@ -39,8 +37,7 @@ mod tito_tests;
 
 pub use error::TitoError;
 pub use types::{
-    PartitionConfig, TitoEngine, TitoIncomingReference, TitoModelOptions, TitoModelTrait,
-    TitoReference, PARTITION_DIGITS,
+    PartitionConfig, TitoEngine, TitoGuard, TitoModelOptions, TitoModelTrait, PARTITION_DIGITS,
 };
 
 pub use queue::{

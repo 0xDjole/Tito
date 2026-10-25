@@ -631,16 +631,52 @@ async fn set_propagates_index_state_read_failures_without_writing() {
 }
 
 #[tokio::test]
-async fn secondary_index_wire_value_remains_the_complete_primary_json() {
+async fn index_entries_store_no_record_data_and_a_unique_entry_stores_its_owner_id() {
     let engine = engine();
-    save_author(&engine, author("a1", "a1@example.com", 36, "org-a")).await;
+    let mut first = author("a1", "a1@example.com", 36, "org-a");
+    first.optional = Some("present".to_string());
+    save_author(&engine, first).await;
+    save_unique_account(
+        &engine,
+        unique_account("u:1\\x", "store-1", "Ada@Example.com", true),
+    )
+    .await;
 
+    for primary in ["table:authors:a1", "table:unique-accounts:u:1\\x"] {
+        let manifest = engine
+            .raw_json(&format!("reverse-index:{primary}"))
+            .await
+            .unwrap()["value"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|key| key.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert!(manifest.iter().any(|key| key.starts_with("index:")));
+        for key in manifest {
+            let stored = engine.raw_bytes(&key).await.unwrap();
+            if key.starts_with("unique-index:") {
+                assert_eq!(stored, b"u:1\\x".to_vec());
+            } else {
+                assert!(key.ends_with(&format!(":{primary}")));
+                assert!(stored.is_empty());
+            }
+        }
+    }
     assert_eq!(
         engine
-            .raw_json("index:author-by-email:email:a1@example.com:table:authors:a1")
-            .await,
-        engine.raw_json("table:authors:a1").await
+            .raw_bytes(
+                "unique-index:unique-accounts:verified-account-by-tenant-email:tenant_id:store-1:email:Ada@Example.com"
+            )
+            .await
+            .unwrap(),
+        b"u:1\\x".to_vec()
     );
+    assert!(engine
+        .raw_bytes("index:author-by-optional:optional:present:table:authors:a1")
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
@@ -798,8 +834,11 @@ async fn index_queries_fail_on_malformed_and_schema_incompatible_rows() {
     engine
         .put_raw(
             "index:author-by-age:age:09223372036854775815:table:authors:malformed",
-            b"{".to_vec(),
+            Vec::new(),
         )
+        .await;
+    engine
+        .put_raw("table:authors:malformed", b"{".to_vec())
         .await;
 
     let mut malformed_query = model.query_by_index("author-by-age");
@@ -811,10 +850,13 @@ async fn index_queries_fail_on_malformed_and_schema_incompatible_rows() {
     let engine = MemoryEngine::default();
     let model = engine.clone().model::<Author>(TitoModelOptions::default());
     engine
-        .put_json(
+        .put_raw(
             "index:author-by-age:age:09223372036854775815:table:authors:incompatible",
-            &json!({"id": "incompatible"}),
+            Vec::new(),
         )
+        .await;
+    engine
+        .put_json("table:authors:incompatible", &json!({"id": "incompatible"}))
         .await;
 
     let mut incompatible_query = model.query_by_index("author-by-age");
@@ -1018,4 +1060,58 @@ async fn identical_index_keys_of_one_record_are_written_once_and_case_variants_a
     let tx = engine.begin_transaction().await.unwrap();
     model.rebuild_indexes_for_restore("p1", &tx).await.unwrap();
     crate::types::TitoTransaction::commit(tx).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_manifest_over_the_key_or_byte_limit_fails_the_save() {
+    let engine = engine();
+    let model = engine.clone().model::<Post>(TitoModelOptions::default());
+
+    for item in [
+        post(
+            "p1",
+            "a1",
+            (0..10_001).map(|position| format!("t{position}")).collect(),
+        ),
+        post(
+            "p1",
+            "a1",
+            (0..600)
+                .map(|position| format!("{position:04}{}", "t".repeat(1_996)))
+                .collect(),
+        ),
+    ] {
+        let saved = engine
+            .transaction(|tx| {
+                let model = model.clone();
+                let item = item.clone();
+                async move { model.set(item).timestamps(false).execute(&tx).await }
+            })
+            .await;
+        assert!(matches!(saved, Err(TitoError::InvalidInput(_))));
+    }
+
+    assert!(!engine.contains_key("table:posts:p1").await);
+    assert!(!engine.contains_key("reverse-index:table:posts:p1").await);
+    assert!(engine.keys_with_prefix("index:").await.is_empty());
+    assert!(engine.keys_with_prefix("fence:").await.is_empty());
+
+    let fits = post(
+        "p1",
+        "a1",
+        (0..9_996).map(|position| format!("t{position}")).collect(),
+    );
+    engine
+        .transaction(|tx| {
+            let model = model.clone();
+            let fits = fits.clone();
+            async move { model.set(fits).timestamps(false).execute(&tx).await }
+        })
+        .await
+        .unwrap();
+    assert_eq!(engine.keys_with_prefix("index:").await.len(), 10_000);
+    assert_eq!(
+        engine.keys_with_prefix("index:post-by-tag:").await.len(),
+        9_996
+    );
 }

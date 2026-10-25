@@ -11,7 +11,7 @@ use tito::types::{TitoIndexConfig, TitoTransaction};
 use tito::{
     run_cluster_worker, ClusterWorkerConfig, Queue, QueueConfig, QueueEvent, QueueEventStatus,
     QueueHandlerOutcome, QueueHandlerResult, QueueOwner, TitoEngine, TitoError, TitoModel,
-    TitoModelOptions, TitoModelTrait, TitoReference, WorkerConfig,
+    TitoModelOptions, TitoModelTrait, WorkerConfig,
 };
 use tokio::sync::{broadcast, Mutex, Notify};
 use uuid::Uuid;
@@ -25,14 +25,6 @@ struct NativeTally {
 impl TitoModelTrait for NativeTally {
     fn indexes(&self) -> Vec<TitoIndexConfig> {
         Vec::new()
-    }
-
-    fn references(&self) -> Vec<TitoReference> {
-        Vec::new()
-    }
-
-    fn is_deleting(&self) -> bool {
-        false
     }
 
     fn table() -> String {

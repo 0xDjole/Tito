@@ -3,11 +3,11 @@ use crate::queue::{
     run_worker, Queue, QueueConfig, QueueEvent, QueueEventStatus, QueueHandlerOutcome, WorkerConfig,
 };
 use crate::test_support::{MemoryEngine, MemoryTransaction, RecordedWrite};
+use crate::types::TitoIndexValue;
 use crate::types::{
     PartitionConfig, TitoCursor, TitoEngine, TitoFindByIndexPayload, TitoFindOneByIndexPayload,
-    TitoFindPayload, TitoId, TitoIncomingReference, TitoIndexConfig, TitoIndexField,
-    TitoIndexFieldType, TitoModelOptions, TitoModelTrait, TitoPaginated, TitoReference,
-    TitoScanPayload, TitoTransaction,
+    TitoFindPayload, TitoId, TitoIndexConfig, TitoIndexField, TitoIndexFieldType, TitoModelOptions,
+    TitoModelTrait, TitoPaginated, TitoScanPayload, TitoTransaction,
 };
 use crate::utils::{key_after, key_after_bytes, prefix_end, prefix_end_bytes};
 use crate::{ClusterCoordinatorLease, ClusterWorkerConfig, TitoError};
@@ -41,6 +41,7 @@ impl TitoModelTrait for Author {
     fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![
             TitoIndexConfig {
+                value: TitoIndexValue::RecordReference,
                 condition: true,
                 name: "author-by-email".to_string(),
                 fields: vec![TitoIndexField {
@@ -49,6 +50,7 @@ impl TitoModelTrait for Author {
                 }],
             },
             TitoIndexConfig {
+                value: TitoIndexValue::RecordReference,
                 condition: true,
                 name: "author-by-age".to_string(),
                 fields: vec![TitoIndexField {
@@ -57,6 +59,7 @@ impl TitoModelTrait for Author {
                 }],
             },
             TitoIndexConfig {
+                value: TitoIndexValue::RecordReference,
                 condition: true,
                 name: "author-by-org-email".to_string(),
                 fields: vec![
@@ -71,6 +74,7 @@ impl TitoModelTrait for Author {
                 ],
             },
             TitoIndexConfig {
+                value: TitoIndexValue::RecordReference,
                 condition: true,
                 name: "author-by-kind-org".to_string(),
                 fields: vec![
@@ -85,6 +89,7 @@ impl TitoModelTrait for Author {
                 ],
             },
             TitoIndexConfig {
+                value: TitoIndexValue::RecordReference,
                 condition: true,
                 name: "author-by-optional".to_string(),
                 fields: vec![TitoIndexField {
@@ -93,6 +98,7 @@ impl TitoModelTrait for Author {
                 }],
             },
             TitoIndexConfig {
+                value: TitoIndexValue::RecordReference,
                 condition: true,
                 name: "author-by-org-optional".to_string(),
                 fields: vec![
@@ -107,6 +113,7 @@ impl TitoModelTrait for Author {
                 ],
             },
             TitoIndexConfig {
+                value: TitoIndexValue::RecordReference,
                 condition: false,
                 name: "author-disabled".to_string(),
                 fields: vec![TitoIndexField {
@@ -115,14 +122,6 @@ impl TitoModelTrait for Author {
                 }],
             },
         ]
-    }
-
-    fn references(&self) -> Vec<TitoReference> {
-        Vec::new()
-    }
-
-    fn is_deleting(&self) -> bool {
-        false
     }
 
     fn table() -> String {
@@ -152,6 +151,7 @@ struct UniqueAccount {
 impl TitoModelTrait for UniqueAccount {
     fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![TitoIndexConfig {
+            value: TitoIndexValue::RecordReference,
             condition: true,
             name: "account-by-email".to_string(),
             fields: vec![TitoIndexField {
@@ -163,6 +163,7 @@ impl TitoModelTrait for UniqueAccount {
 
     fn unique_indexes(&self) -> Vec<TitoIndexConfig> {
         vec![TitoIndexConfig {
+            value: TitoIndexValue::RecordReference,
             condition: self.verified,
             name: "verified-account-by-tenant-email".to_string(),
             fields: vec![
@@ -176,14 +177,6 @@ impl TitoModelTrait for UniqueAccount {
                 },
             ],
         }]
-    }
-
-    fn references(&self) -> Vec<TitoReference> {
-        Vec::new()
-    }
-
-    fn is_deleting(&self) -> bool {
-        false
     }
 
     fn table() -> String {
@@ -222,6 +215,7 @@ async fn save_unique_account(engine: &MemoryEngine, value: UniqueAccount) -> Uni
 impl TitoModelTrait for Tag {
     fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![TitoIndexConfig {
+            value: TitoIndexValue::RecordReference,
             condition: true,
             name: "tag-by-name".to_string(),
             fields: vec![TitoIndexField {
@@ -229,14 +223,6 @@ impl TitoModelTrait for Tag {
                 r#type: TitoIndexFieldType::String,
             }],
         }]
-    }
-
-    fn references(&self) -> Vec<TitoReference> {
-        Vec::new()
-    }
-
-    fn is_deleting(&self) -> bool {
-        false
     }
 
     fn table() -> String {
@@ -252,12 +238,12 @@ impl TitoModelTrait for Tag {
 struct Shop {
     id: String,
     name: String,
-    deleting: bool,
 }
 
 impl TitoModelTrait for Shop {
     fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![TitoIndexConfig {
+            value: TitoIndexValue::RecordReference,
             condition: true,
             name: "shop-by-name".to_string(),
             fields: vec![TitoIndexField {
@@ -267,14 +253,6 @@ impl TitoModelTrait for Shop {
         }]
     }
 
-    fn references(&self) -> Vec<TitoReference> {
-        Vec::new()
-    }
-
-    fn is_deleting(&self) -> bool {
-        self.deleting
-    }
-
     fn table() -> String {
         "shops".to_string()
     }
@@ -282,17 +260,12 @@ impl TitoModelTrait for Shop {
     fn id(&self) -> String {
         self.id.clone()
     }
-
-    fn fence_stripes() -> u16 {
-        16
-    }
 }
 
 fn shop(id: &str) -> Shop {
     Shop {
         id: id.to_string(),
         name: format!("Shop {id}"),
-        deleting: false,
     }
 }
 
@@ -302,69 +275,6 @@ fn shops(engine: &MemoryEngine) -> crate::TitoModel<MemoryEngine, Shop> {
 
 async fn save_shop(engine: &MemoryEngine, value: Shop) -> Result<Shop, TitoError> {
     let model = shops(engine);
-    engine
-        .transaction(|tx| {
-            let model = model.clone();
-            let value = value.clone();
-            async move { model.set(value).timestamps(false).execute(&tx).await }
-        })
-        .await
-}
-
-#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct Stand<const STRIPES: u16> {
-    id: String,
-    name: String,
-    deleting: bool,
-}
-
-impl<const STRIPES: u16> TitoModelTrait for Stand<STRIPES> {
-    fn indexes(&self) -> Vec<TitoIndexConfig> {
-        Vec::new()
-    }
-
-    fn references(&self) -> Vec<TitoReference> {
-        Vec::new()
-    }
-
-    fn is_deleting(&self) -> bool {
-        self.deleting
-    }
-
-    fn table() -> String {
-        format!("stands-{STRIPES}")
-    }
-
-    fn id(&self) -> String {
-        self.id.clone()
-    }
-
-    fn fence_stripes() -> u16 {
-        STRIPES
-    }
-}
-
-fn stand<const STRIPES: u16>(id: &str) -> Stand<STRIPES> {
-    Stand {
-        id: id.to_string(),
-        name: format!("Stand {id}"),
-        deleting: false,
-    }
-}
-
-fn stands<const STRIPES: u16>(
-    engine: &MemoryEngine,
-) -> crate::TitoModel<MemoryEngine, Stand<STRIPES>> {
-    engine
-        .clone()
-        .model::<Stand<STRIPES>>(TitoModelOptions::default())
-}
-
-async fn save_stand<const STRIPES: u16>(
-    engine: &MemoryEngine,
-    value: Stand<STRIPES>,
-) -> Result<Stand<STRIPES>, TitoError> {
-    let model = stands::<STRIPES>(engine);
     engine
         .transaction(|tx| {
             let model = model.clone();
@@ -407,6 +317,7 @@ impl TitoModelTrait for Post {
     fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![
             TitoIndexConfig {
+                value: TitoIndexValue::RecordReference,
                 condition: true,
                 name: "post-by-author".to_string(),
                 fields: vec![TitoIndexField {
@@ -415,6 +326,7 @@ impl TitoModelTrait for Post {
                 }],
             },
             TitoIndexConfig {
+                value: TitoIndexValue::RecordReference,
                 condition: true,
                 name: "post-by-tag".to_string(),
                 fields: vec![TitoIndexField {
@@ -423,6 +335,7 @@ impl TitoModelTrait for Post {
                 }],
             },
             TitoIndexConfig {
+                value: TitoIndexValue::RecordReference,
                 condition: true,
                 name: "post-by-comment-author".to_string(),
                 fields: vec![TitoIndexField {
@@ -431,6 +344,7 @@ impl TitoModelTrait for Post {
                 }],
             },
             TitoIndexConfig {
+                value: TitoIndexValue::RecordReference,
                 condition: true,
                 name: "post-by-metadata".to_string(),
                 fields: vec![TitoIndexField {
@@ -439,14 +353,6 @@ impl TitoModelTrait for Post {
                 }],
             },
         ]
-    }
-
-    fn references(&self) -> Vec<TitoReference> {
-        Vec::new()
-    }
-
-    fn is_deleting(&self) -> bool {
-        false
     }
 
     fn table() -> String {
@@ -472,22 +378,6 @@ fn fence_writes(writes: &[RecordedWrite]) -> Vec<String> {
             RecordedWrite::Delete(key) if key.starts_with("fence:") => Some(key.clone()),
             _ => None,
         })
-        .collect()
-}
-
-fn deleting_writes(writes: &[RecordedWrite]) -> Vec<RecordedWrite> {
-    writes
-        .iter()
-        .filter(|write| match write {
-            RecordedWrite::Put(key) | RecordedWrite::Delete(key) => key.starts_with("deleting:"),
-        })
-        .cloned()
-        .collect()
-}
-
-fn stripe_keys(table: &str, id: &str, stripes: u16) -> Vec<String> {
-    (0..stripes)
-        .map(|stripe| crate::fence::fence_stripe_key(table, id, stripe))
         .collect()
 }
 
@@ -525,23 +415,6 @@ async fn remove_writes<T: crate::types::TitoModelConstraints>(
     engine.take_recorded_writes().await
 }
 
-async fn erase_writes<T: crate::types::TitoModelConstraints>(
-    engine: &MemoryEngine,
-    model: &crate::TitoModel<MemoryEngine, T>,
-    id: &str,
-) -> Vec<RecordedWrite> {
-    engine.start_recording_writes().await;
-    assert!(engine
-        .transaction(|tx| {
-            let model = model.clone();
-            let id = id.to_string();
-            async move { model.erase(id, &tx).await }
-        })
-        .await
-        .unwrap());
-    engine.take_recorded_writes().await
-}
-
 async fn repair_writes<T: crate::types::TitoModelConstraints>(
     engine: &MemoryEngine,
     model: &crate::TitoModel<MemoryEngine, T>,
@@ -554,84 +427,39 @@ async fn repair_writes<T: crate::types::TitoModelConstraints>(
     engine.take_recorded_writes().await
 }
 
-fn picked_stripe(writes: &[RecordedWrite], table: &str, id: &str, stripes: u16) -> u16 {
-    let [RecordedWrite::Delete(key)] = writes else {
-        panic!("A shared check on a striped record writes one stripe key, not {writes:?}");
-    };
-    (0..stripes)
-        .find(|stripe| *key == crate::fence::fence_stripe_key(table, id, *stripe))
-        .unwrap_or_else(|| panic!("'{key}' is not a stripe key of {table} {id}"))
+fn sorted(mut keys: Vec<String>) -> Vec<String> {
+    keys.sort();
+    keys
 }
 
-async fn staged_shared_check<T: crate::types::TitoModelConstraints>(
-    engine: &MemoryEngine,
-    model: &crate::TitoModel<MemoryEngine, T>,
-    id: &str,
-) -> (MemoryTransaction, u16) {
-    let tx = engine.begin_transaction().await.unwrap();
+fn picked_number(tx: &MemoryTransaction) -> u16 {
+    (tx.shared_fence_pick() % 16) as u16
+}
+
+async fn write_scratch(tx: &MemoryTransaction) {
+    tx.delete(format!("scratch:{}", tx.start_version()))
+        .await
+        .unwrap();
+}
+
+async fn commit_writes(engine: &MemoryEngine, tx: MemoryTransaction) -> Vec<RecordedWrite> {
     engine.start_recording_writes().await;
-    model.assert_current_shared(id, &tx).await.unwrap();
-    let writes = engine.take_recorded_writes().await;
-    let stripe = picked_stripe(&writes, &T::table(), id, T::fence_stripes());
-    assert_eq!(
-        stripe,
-        crate::fence::shared_fence_stripe(tx.shared_fence_pick(), T::fence_stripes())
-    );
-    (tx, stripe)
+    tx.commit().await.unwrap();
+    engine.take_recorded_writes().await
 }
 
-async fn transaction_in_stripe(
+async fn transaction_with_shared_key(
     engine: &MemoryEngine,
-    stripes: u16,
     wanted: impl Fn(u16) -> bool,
 ) -> MemoryTransaction {
     for _ in 0..1_000 {
         let tx = engine.begin_transaction().await.unwrap();
-        let picked = crate::fence::shared_fence_stripe(tx.shared_fence_pick(), stripes);
-        if wanted(picked) {
+        if wanted(picked_number(&tx)) {
             return tx;
         }
         tx.rollback().await.unwrap();
     }
-    panic!("No transaction within 1000 begins picked a wanted stripe of {stripes}");
-}
-
-async fn shared_check_in_stripe<T: crate::types::TitoModelConstraints>(
-    engine: &MemoryEngine,
-    model: &crate::TitoModel<MemoryEngine, T>,
-    id: &str,
-    stripe: u16,
-) -> MemoryTransaction {
-    let tx = transaction_in_stripe(engine, T::fence_stripes(), |picked| picked == stripe).await;
-    engine.start_recording_writes().await;
-    model.assert_current_shared(id, &tx).await.unwrap();
-    let writes = engine.take_recorded_writes().await;
-    assert_eq!(
-        picked_stripe(&writes, &T::table(), id, T::fence_stripes()),
-        stripe
-    );
-    tx
-}
-
-async fn assert_shared_checks_take_turns_only_within_one_stripe<
-    T: crate::types::TitoModelConstraints,
->(
-    engine: &MemoryEngine,
-    model: &crate::TitoModel<MemoryEngine, T>,
-    id: &str,
-) {
-    let mut first = Vec::new();
-    let mut second = Vec::new();
-    for stripe in 0..T::fence_stripes() {
-        first.push(shared_check_in_stripe(engine, model, id, stripe).await);
-        second.push(shared_check_in_stripe(engine, model, id, stripe).await);
-    }
-    for tx in first {
-        tx.commit().await.unwrap();
-    }
-    for tx in second {
-        assert!(matches!(tx.commit().await, Err(TitoError::Retryable(_))));
-    }
+    panic!("No transaction within 1000 begins picked a wanted shared fence key");
 }
 
 fn cursor_for_key(key: &str) -> String {
@@ -783,10 +611,9 @@ fn cluster_config(node_id: &str) -> ClusterWorkerConfig {
 mod cluster;
 mod custom_index;
 mod index;
-mod index_assertion;
+mod index_entries;
 mod index_restore;
 mod model;
 mod model_batch;
 mod numeric_index;
 mod queue;
-mod reference;
