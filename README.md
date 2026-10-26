@@ -281,7 +281,7 @@ none is listed in a manifest, and a manifest that lists one is an integrity erro
 | `get_exclusive` | the record's exclusive key, at commit |
 | `set`, `replace_many`, `remove`, `remove_by_index`, `rebuild_indexes_for_restore` | all 17 keys of each record written or removed |
 | a shared read in a transaction that writes nothing, and any read without a transaction | nothing |
-| index reads (`find_by_index`, `find_by_index_reverse`, `query_by_index` with `execute`, `execute_reverse` and `execute_ids`, `find_one_by_index`) and the batched record read behind them, `scan`, `scan_reverse`, `find`, and a read that finds nothing | nothing |
+| index reads (`find_by_index`, `find_by_index_reverse`, `query_by_index` with `execute`, `execute_reverse` and `execute_ids`, `find_one_by_index`) and any batched read of referenced records behind them, `scan`, `scan_reverse`, `find`, and a read that finds nothing | nothing |
 
 So:
 
@@ -308,9 +308,9 @@ read without a transaction: there is no write to protect. Each attempt of a retr
 starts with nothing noted.
 
 **Lists.** A guard covers records read one by one, not a list: an index can gain a row while no
-record read changes. A list reads its records by id in one batched read that notes no guard, so a
-save of a listed record never makes the list's transaction retry. A rule over a list, such as "a
-company keeps at least one manager", takes `get_exclusive` on the list's parent in every
+record read changes. A list reads copies directly or fetches referenced records by id in one batched
+read; neither notes a guard, so a save of a listed record never makes the list's transaction retry.
+A rule over a list, such as "a company keeps at least one manager", takes `get_exclusive` on the list's parent in every
 transaction that changes the list.
 
 **Engines.** `TitoTransaction::guard(table, id, guard)` notes a record as `TitoGuard::Shared`,
@@ -357,7 +357,8 @@ application's explicit pre-production reset and backup-format cutover.
 
 For offline repair of lost or stale secondary indexes under an unchanged model,
 `model.rebuild_indexes_for_restore(id, &tx)` validates the retained primary and reverse manifest,
-then rewrites only their declared index values, and deletes the record's 17 fence keys, as a save
+then rewrites only their declared index values, using the primary's exact bytes for every record copy,
+and deletes the record's 17 fence keys, as a save
 does. The primary bytes, manifest bytes and original record version are preserved and fenced in the
 same transaction.
 Missing secondary keys are allowed; a unique key owned by another record is not. Ordinary writes
@@ -368,7 +369,8 @@ The caller owns offline operation, bounded primary enumeration and domain relati
 Tito does not read related records.
 
 Scans fail on malformed JSON, non-UTF-8 keys, and values that do not deserialize into the requested
-model. A scanned index entry follows its declared value mode. A reference whose record is missing
+model. A scanned index entry follows its declared value mode. An ordinary reference entry with a
+non-empty value fails with `IndexError`. A reference whose record is missing
 or a copied record that disagrees with its key fails with `IndexError` naming the entry's key. Scans never silently shorten a page by
 dropping corrupt rows. Forward cursors continue from
 the exact key plus a NUL byte; reverse cursors use the exact key as the exclusive upper bound. Both
@@ -388,6 +390,13 @@ advancing the final character can skip keys such as `a20` after `a2`. Use `key_a
 Secondary index values follow their explicit `TitoIndexValue` declaration (see the index
 paragraphs at the top). Record copies are maintained atomically with their primary; references
 resolve the primary on a record read.
+
+### 0.18.6 index integrity
+
+Same-schema index repair keeps copied entries byte-identical to their retained primary, including
+floating-point records. Ordinary reference record reads reject non-empty entry values; key-only ID
+reads remain value-free. The native scanner has exactly three operations: forward rows, reverse
+rows and forward keys. The stored schema and public API are unchanged from 0.18.5.
 
 ### 0.18.5 guards and index entries
 
@@ -756,7 +765,7 @@ prerequisites, source holds, native ownership, cleanup and retained evidence.
 
 The library cases use the in-memory engine and cover model/index writes, exact index values, index
 reference entries that hold no record data (an empty ordinary entry, an owner id in a unique entry), lists
-that read their records in one batched read in index order, `execute_ids` reading keys only,
+that read copies directly or fetch referenced records in one batched read in index order, `execute_ids` reading keys only,
 cursors and limits across pages, a missing record behind an entry, moved and removed entries, the
 fence keys each save, remove, batch and repair deletes and each guard a commit adds, queue
 transitions, fixed partitions, exact signed millisecond scheduling and completion, exact inclusive
@@ -774,7 +783,9 @@ the unique entry its owner's id, while lists and the unique lookup return the re
 stored bytes, ordinary and unique ranges, forward/reverse pages, copied reads without a primary
 fetch, key-only ID reads, validation of malformed copies, non-indexed updates and timestamps,
 rollback, changed and removed entries, unique claims and batch ownership swaps, shared guards,
-unguarded lists, and restore preserving record versions and refusing another unique owner.
+unguarded lists, and restore preserving record versions and exact primary bytes, including floating-point
+records, and refusing another unique owner. Ordinary reference record reads reject non-empty entry
+values, while key-only ID reads retain their value-free behavior.
 `tikv_native_queue_test`
 proves that cluster-worker and standalone-worker handlers complete their own pending row inside
 their transaction, that a duplicate delivery

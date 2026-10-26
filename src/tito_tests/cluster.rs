@@ -523,7 +523,11 @@ async fn cluster_partition_worker_pulls_the_next_page_without_waiting_for_its_po
         .unwrap());
     queue.rebalance_cluster_partitions(&config).await.unwrap();
     assert_eq!(
-        queue.sync_cluster_partition_leases(&config).await.unwrap().len(),
+        queue
+            .sync_cluster_partition_leases(&config)
+            .await
+            .unwrap()
+            .len(),
         1
     );
 

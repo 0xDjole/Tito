@@ -11,7 +11,7 @@ use tito::types::{
 use tito::{TitoEngine, TitoError, TitoModel, TitoModelOptions, TitoModelTrait};
 use uuid::Uuid;
 
-#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct IndexValueRecord {
     id: String,
@@ -21,6 +21,7 @@ struct IndexValueRecord {
     tags: Vec<String>,
     enabled: bool,
     body: String,
+    measurement: f64,
     created_at: i64,
     updated_at: i64,
 }
@@ -141,6 +142,7 @@ fn record(scope: &str, rank: i64) -> IndexValueRecord {
         tags: vec!["common".into(), format!("tag:{rank}")],
         enabled: true,
         body: format!("body {rank}"),
+        measurement: 0.0,
         created_at: 1,
         updated_at: 1,
     }
@@ -700,4 +702,140 @@ async fn native_index_value_restore_rebuilds_both_modes_and_preserves_versions()
     })
     .await
     .expect("Native index value restore must finish within its owned run");
+}
+
+#[tokio::test]
+async fn native_restore_copies_preserve_primary_bytes_with_non_roundtripping_floats() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let (engine, model, scope) = fixture().await;
+        let record = IndexValueRecord {
+            measurement: 51.248178375505404,
+            ..record(&scope, 1)
+        };
+        save(&engine, &model, record.clone()).await.unwrap();
+        let before = model.get_versioned(&record.id, None).await.unwrap();
+        let keys = model
+            .get_index_keys(
+                primary(&record),
+                &record,
+                &serde_json::to_value(&record).unwrap(),
+            )
+            .unwrap();
+        let manifest_key = format!("reverse-index:{}", primary(&record));
+        let tx = engine.begin_transaction().await.unwrap();
+        let primary_bytes = tx.get(primary(&record)).await.unwrap().unwrap();
+        let manifest_bytes = tx.get(&manifest_key).await.unwrap().unwrap();
+        for (key, _) in &keys {
+            tx.delete(key).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+        for _ in 0..2 {
+            let tx = engine.begin_transaction().await.unwrap();
+            model
+                .rebuild_indexes_for_restore(&record.id, &tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            let after = model.get_versioned(&record.id, None).await.unwrap();
+            assert_eq!(after.version, before.version);
+            let retained = model.get(&record.id).execute(None).await.unwrap();
+            assert_record_reads(&model, &retained).await;
+            let tx = engine.begin_transaction().await.unwrap();
+            assert_eq!(
+                tx.get(primary(&record)).await.unwrap().unwrap(),
+                primary_bytes
+            );
+            assert_eq!(
+                tx.get(&manifest_key).await.unwrap().unwrap(),
+                manifest_bytes
+            );
+            for (key, _) in &keys {
+                let bytes = tx.get(key).await.unwrap().unwrap();
+                if key.contains("-copy:") {
+                    assert_eq!(bytes, primary_bytes, "{key}");
+                } else if key.starts_with("unique-index:") {
+                    assert_eq!(bytes, record.id.as_bytes(), "{key}");
+                } else {
+                    assert!(bytes.is_empty(), "{key}");
+                }
+            }
+            tx.rollback().await.unwrap();
+        }
+        assert!(remove(&engine, &model, &record.id).await.unwrap());
+    })
+    .await
+    .expect("Native float restore must finish within its owned run");
+}
+
+#[tokio::test]
+async fn native_reference_record_reads_reject_nonempty_values_while_ids_remain_key_only() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let (engine, model, scope) = fixture().await;
+        let record = record(&scope, 1);
+        save(&engine, &model, record.clone()).await.unwrap();
+        let keys = model
+            .get_index_keys(
+                primary(&record),
+                &record,
+                &serde_json::to_value(&record).unwrap(),
+            )
+            .unwrap();
+        let key = &keys
+            .iter()
+            .find(|(key, _)| key.starts_with("index:native-value-rank-reference:"))
+            .unwrap()
+            .0;
+        let mut query = model.query_by_index("native-value-rank-reference");
+        query.value(&scope);
+        for invalid in [
+            b"not JSON".to_vec(),
+            b"{}".to_vec(),
+            serde_json::to_vec(&record).unwrap(),
+        ] {
+            let tx = engine.begin_transaction().await.unwrap();
+            tx.put(key, invalid).await.unwrap();
+            tx.commit().await.unwrap();
+            assert_eq!(
+                query.execute_ids(None).await.unwrap().items,
+                vec![record.id.clone()]
+            );
+            let tx = engine.begin_transaction().await.unwrap();
+            let payload = || TitoScanPayload {
+                start: key.clone(),
+                end: Some(tito::key_after(key.clone())),
+                limit: Some(1),
+                cursor: None,
+            };
+            let errors = [
+                query.execute(None).await.unwrap_err(),
+                query.execute_reverse(None).await.unwrap_err(),
+                model
+                    .find_one_by_index(
+                        TitoFindOneByIndexPayload {
+                            index: "native-value-rank-reference".into(),
+                            values: vec![scope.clone(), record.rank.to_string()],
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap_err(),
+                model.scan(payload(), &tx).await.unwrap_err(),
+                model.scan_reverse(payload(), &tx).await.unwrap_err(),
+            ];
+            for error in errors {
+                assert!(
+                    matches!(error, TitoError::IndexError(ref message) if message.contains(key)),
+                    "{error:?}"
+                );
+            }
+            tx.rollback().await.unwrap();
+        }
+        let tx = engine.begin_transaction().await.unwrap();
+        tx.put(key, Vec::<u8>::new()).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_record_reads(&model, &record).await;
+        assert!(remove(&engine, &model, &record.id).await.unwrap());
+    })
+    .await
+    .expect("Native reference validation must finish within its owned run");
 }

@@ -39,6 +39,8 @@ TITO_NATIVE_CASES = {
     "native_index_value_modes_preserve_unique_claims_and_batch_swaps",
     "native_copied_unique_hits_guard_the_owner_while_lists_remain_unguarded",
     "native_index_value_restore_rebuilds_both_modes_and_preserves_versions",
+    "native_restore_copies_preserve_primary_bytes_with_non_roundtripping_floats",
+    "native_reference_record_reads_reject_nonempty_values_while_ids_remain_key_only",
     "native_batch_swap_fences_every_source_and_commits_only_final_owners",
     "expired_secondary_without_a_primary_heals_through_normal_tito_reads",
     "native_reads_forty_one_mib_records_through_byte_bounded_requests",

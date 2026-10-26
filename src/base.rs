@@ -434,7 +434,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                 "Restore primary identity differs from its key".into(),
             ));
         }
-        let owned = self.get_index_keys(primary_key.clone(), &stored, &value)?;
+        let owned = self.build_index_entries(&primary_key, &stored, &value, Some(&primary))?;
         let declared: HashSet<_> = metadata.value.iter().collect();
         let computed: HashSet<_> = owned.iter().map(|(key, _)| key).collect();
         if declared.len() != metadata.value.len()

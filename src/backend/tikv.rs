@@ -419,15 +419,16 @@ pub struct TiKVTransaction {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ScanDirection {
+enum ScanType {
     Forward,
     Reverse,
+    Keys,
 }
 
-impl ScanDirection {
+impl ScanType {
     fn failure(self) -> &'static str {
         match self {
-            Self::Forward => "Scan operation failed",
+            Self::Forward | Self::Keys => "Scan operation failed",
             Self::Reverse => "Reverse scan operation failed",
         }
     }
@@ -439,32 +440,22 @@ impl TiKVTransaction {
         start: &[u8],
         end: &[u8],
         limit: u32,
-        direction: ScanDirection,
-        keys_only: bool,
+        r#type: ScanType,
     ) -> Result<Vec<TitoKvPair>, tikv_client::Error> {
         let range: tikv_client::BoundRange = (start.to_vec()..end.to_vec()).into();
         let mut transaction = self.inner.lock().await;
-        if keys_only {
-            return match direction {
-                ScanDirection::Forward => Ok(transaction
-                    .scan_keys(range, limit)
-                    .await?
-                    .map(|key| (key.into(), Vec::new()))
-                    .collect()),
-                ScanDirection::Reverse => Ok(transaction
-                    .scan_keys_reverse(range, limit)
-                    .await?
-                    .map(|key| (key.into(), Vec::new()))
-                    .collect()),
-            };
-        }
-        match direction {
-            ScanDirection::Forward => Ok(transaction
+        match r#type {
+            ScanType::Keys => Ok(transaction
+                .scan_keys(range, limit)
+                .await?
+                .map(|key| (key.into(), Vec::new()))
+                .collect()),
+            ScanType::Forward => Ok(transaction
                 .scan(range, limit)
                 .await?
                 .map(|kv| (kv.0.into(), kv.1))
                 .collect()),
-            ScanDirection::Reverse => Ok(transaction
+            ScanType::Reverse => Ok(transaction
                 .scan_reverse(range, limit)
                 .await?
                 .map(|kv| (kv.0.into(), kv.1))
@@ -477,8 +468,7 @@ impl TiKVTransaction {
         mut start: Vec<u8>,
         mut end: Vec<u8>,
         limit: u32,
-        direction: ScanDirection,
-        keys_only: bool,
+        r#type: ScanType,
     ) -> Result<Vec<TitoKvPair>, TitoError> {
         let mut rows: Vec<TitoKvPair> = Vec::new();
         let mut rpc_rows = SCAN_RPC_FIRST_ROWS;
@@ -488,10 +478,7 @@ impl TiKVTransaction {
                 break;
             }
             let requested = remaining.min(rpc_rows);
-            let page = match self
-                .scan_rpc(&start, &end, requested, direction, keys_only)
-                .await
-            {
+            let page = match self.scan_rpc(&start, &end, requested, r#type).await {
                 Ok(page) => page,
                 Err(error) if requested > 1 && exceeds_message_limit(&error) => {
                     rpc_rows = requested / 2;
@@ -500,7 +487,7 @@ impl TiKVTransaction {
                 Err(error) => {
                     return Err(classify_tikv_error(
                         error,
-                        direction.failure(),
+                        r#type.failure(),
                         &self.had_retryable_error,
                     ))
                 }
@@ -509,9 +496,9 @@ impl TiKVTransaction {
             let Some((last, _)) = page.last() else {
                 break;
             };
-            match direction {
-                ScanDirection::Forward => start = key_after_bytes(last),
-                ScanDirection::Reverse => end = last.clone(),
+            match r#type {
+                ScanType::Forward | ScanType::Keys => start = key_after_bytes(last),
+                ScanType::Reverse => end = last.clone(),
             }
             rpc_rows = scan_rows_for(
                 page.iter()
@@ -607,8 +594,7 @@ impl TitoTransaction for TiKVTransaction {
             range.start.as_ref().to_vec(),
             range.end.as_ref().to_vec(),
             limit,
-            ScanDirection::Forward,
-            false,
+            ScanType::Forward,
         )
         .await
     }
@@ -623,8 +609,7 @@ impl TitoTransaction for TiKVTransaction {
                 range.start.as_ref().to_vec(),
                 range.end.as_ref().to_vec(),
                 limit,
-                ScanDirection::Forward,
-                true,
+                ScanType::Keys,
             )
             .await?
             .into_iter()
@@ -641,8 +626,7 @@ impl TitoTransaction for TiKVTransaction {
             range.start.as_ref().to_vec(),
             range.end.as_ref().to_vec(),
             limit,
-            ScanDirection::Reverse,
-            false,
+            ScanType::Reverse,
         )
         .await
     }

@@ -38,10 +38,12 @@ to the complete `cargo test --locked --all-targets` phase. Every native case is 
   unique entry, where get, scan and batch get return an empty value for every ordinary entry and
   get returns the owner's id for the unique entry, while an index list and the unique lookup
   return the record, `execute_ids` returns its id, and its remove deletes every entry;
-- six mixed-mode cases verify exact copied-record and reference bytes, forward and reverse pages,
+- eight mixed-mode cases verify exact copied-record and reference bytes, forward and reverse pages,
   cursors and key-only IDs, copy reads without primary records, malformed or mismatched copies,
   refresh after non-indexed edits, timestamps, conditional keys, rollback, removal, concurrent unique
-  claims, batch ownership swaps, guards and same-schema restore with preserved versions;
+  claims, batch ownership swaps, guards and same-schema restore with preserved versions and exact
+  primary bytes for floating-point records. Record reads reject non-empty ordinary reference values,
+  while key-only ID reads still return their keys without reading those values;
 - a cluster-worker and a standalone-worker handler each complete their own pending queue row inside
   the transaction that applies their change, and the later acknowledgement changes nothing; two
   deliveries of one row conflict at commit and the retry skips, so the change applies once; a

@@ -208,10 +208,12 @@ async fn a_worker_handler_completes_its_own_pending_row_inside_its_transaction(
                     .await?
                     .events
                     .len();
-                observed
-                    .lock()
-                    .await
-                    .push((event.pending_key.clone(), applied, pending, completed));
+                observed.lock().await.push((
+                    event.pending_key.clone(),
+                    applied,
+                    pending,
+                    completed,
+                ));
                 handled.notify_one();
                 Ok(QueueHandlerOutcome::Acknowledge)
             })
@@ -258,10 +260,8 @@ async fn native_a_queue_handler_completes_its_own_pending_row_inside_its_transac
 
 #[tokio::test]
 async fn native_a_standalone_worker_handler_completes_its_own_pending_row() {
-    a_worker_handler_completes_its_own_pending_row_inside_its_transaction(
-        NativeWorker::Standalone,
-    )
-    .await;
+    a_worker_handler_completes_its_own_pending_row_inside_its_transaction(NativeWorker::Standalone)
+        .await;
 }
 
 #[tokio::test]
@@ -472,5 +472,7 @@ async fn native_ack_in_tx_refuses_an_undelivered_event_and_a_row_of_another_even
         queue.clear().await.unwrap();
     })
     .await
-    .expect("The native in-transaction acknowledgement refusals must finish within their owned run");
+    .expect(
+        "The native in-transaction acknowledgement refusals must finish within their owned run",
+    );
 }
