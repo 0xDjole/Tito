@@ -40,17 +40,21 @@ pub(crate) fn note_guard(guards: &mut Guards, table: &str, id: &str, guard: Tito
 }
 
 pub(crate) fn guard_keys(guards: &Guards, wrote: bool, pick: u64) -> Vec<String> {
-    let exclusive = guards.values().any(|guard| *guard == TitoGuard::Exclusive);
-    if !wrote && !exclusive {
+    let protecting = guards
+        .values()
+        .any(|guard| matches!(guard, TitoGuard::Exclusive | TitoGuard::ForUpdate));
+    if !wrote && !protecting {
         return Vec::new();
     }
     let number = (pick % u64::from(SHARED_FENCE_KEYS)) as u16;
-    guards
-        .iter()
-        .filter_map(|((table, id), guard)| match guard {
-            TitoGuard::Shared => Some(shared_fence_key(table, id, number)),
-            TitoGuard::Exclusive => Some(exclusive_fence_key(table, id)),
-            TitoGuard::Written => None,
-        })
-        .collect()
+    let mut keys = Vec::new();
+    for ((table, id), guard) in guards {
+        match guard {
+            TitoGuard::Shared => keys.push(shared_fence_key(table, id, number)),
+            TitoGuard::Exclusive => keys.push(exclusive_fence_key(table, id)),
+            TitoGuard::ForUpdate => keys.extend(record_fence_keys(table, id)),
+            TitoGuard::Written => {}
+        }
+    }
+    keys
 }

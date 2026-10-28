@@ -187,6 +187,7 @@ enum NativeRead {
     GetVersioned,
     UniqueHit,
     Exclusive,
+    ForUpdate,
 }
 
 async fn read_by_id(
@@ -232,6 +233,13 @@ async fn read_by_id(
         NativeRead::Exclusive => {
             assert_eq!(
                 records.get_exclusive(&record.id, tx).await.unwrap(),
+                *record
+            );
+            None
+        }
+        NativeRead::ForUpdate => {
+            assert_eq!(
+                records.get_for_update(&record.id, tx).await.unwrap(),
                 *record
             );
             None
@@ -306,6 +314,7 @@ async fn native_every_read_by_id_in_a_writing_transaction_conflicts_with_a_save_
             NativeRead::GetVersioned,
             NativeRead::UniqueHit,
             NativeRead::Exclusive,
+            NativeRead::ForUpdate,
         ] {
             let record = save(&engine, &records, new_record(&run_id, &scope))
                 .await
@@ -586,13 +595,86 @@ async fn native_a_shared_and_an_exclusive_read_of_one_record_commit_together_in_
 }
 
 #[tokio::test]
+async fn native_get_for_update_conflicts_with_every_guard_in_both_orders_without_changing_the_record(
+) {
+    let (endpoint, run_id) = native_endpoint();
+    tokio::time::timeout(Duration::from_secs(60), async move {
+        let engine = native_engine(endpoint).await;
+        let records = records_of(&engine);
+        let record = save(&engine, &records, new_record(&run_id, &record_id(&run_id)))
+            .await
+            .unwrap();
+        let before = records.get_versioned(&record.id, None).await.unwrap();
+        for read in [
+            NativeRead::Get,
+            NativeRead::GetMany,
+            NativeRead::GetVersioned,
+            NativeRead::UniqueHit,
+            NativeRead::Exclusive,
+            NativeRead::ForUpdate,
+        ] {
+            for updater_first in [false, true] {
+                let reading = engine.begin_transaction().await.unwrap();
+                read_by_id(&records, read, &record, &reading).await;
+                write_scratch(&reading, &run_id).await;
+                let updating = engine.begin_transaction().await.unwrap();
+                records.get_for_update(&record.id, &updating).await.unwrap();
+                records.get_exclusive(&record.id, &updating).await.unwrap();
+                records
+                    .get(&record.id)
+                    .execute(Some(&updating))
+                    .await
+                    .unwrap();
+                let (first, second) = if updater_first {
+                    (updating, reading)
+                } else {
+                    (reading, updating)
+                };
+                assert!(committed(first).await);
+                assert!(
+                    !committed(second).await,
+                    "get_for_update must conflict with {read:?}; updater first: {updater_first}"
+                );
+            }
+        }
+        let readonly = engine.begin_transaction().await.unwrap();
+        records
+            .get(&record.id)
+            .execute(Some(&readonly))
+            .await
+            .unwrap();
+        let updating = engine.begin_transaction().await.unwrap();
+        records.get_for_update(&record.id, &updating).await.unwrap();
+        assert!(committed(updating).await);
+        assert!(committed(readonly).await);
+        let after = records.get_versioned(&record.id, None).await.unwrap();
+        assert_eq!(after.value, before.value);
+        assert_eq!(after.version, before.version);
+        assert_eq!(
+            records
+                .find_one_by_unique_index(by_value(&record), None)
+                .await
+                .unwrap(),
+            record
+        );
+        assert!(remove(&engine, &records, &record.id).await.unwrap());
+    })
+    .await
+    .expect("The native update guard cases must finish within their owned run");
+}
+
+#[tokio::test]
 async fn native_a_save_and_a_remove_conflict_with_shared_and_exclusive_reads_in_either_order() {
     let (endpoint, run_id) = native_endpoint();
     tokio::time::timeout(Duration::from_secs(60), async move {
         let engine = native_engine(endpoint).await;
         let records = records_of(&engine);
         let scope = record_id(&run_id);
-        for read in [NativeRead::Get, NativeRead::Exclusive] {
+        for read in [
+            NativeRead::Get,
+            NativeRead::Exclusive,
+            NativeRead::ForUpdate,
+        ] {
             for writer in [NativeWriter::Rename, NativeWriter::Remove] {
                 let record = save(&engine, &records, new_record(&run_id, &scope))
                     .await
@@ -610,6 +692,7 @@ async fn native_a_save_and_a_remove_conflict_with_shared_and_exclusive_reads_in_
                 let retried = engine.begin_transaction().await.unwrap();
                 let reread = match read {
                     NativeRead::Exclusive => records.get_exclusive(&record.id, &retried).await,
+                    NativeRead::ForUpdate => records.get_for_update(&record.id, &retried).await,
                     _ => records.get(&record.id).execute(Some(&retried)).await,
                 };
                 retried.rollback().await.unwrap();

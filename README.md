@@ -203,10 +203,11 @@ domain and API boundaries determine when an additional read is required.
 
 In a transaction that writes, every read by id guards the record it returns: `get`, `get_many`,
 `get_versioned` and a hit of `find_one_by_unique_index` take a shared guard, and
-`model.get_exclusive(id, &tx)` reads the record and takes the exclusive guard. A save or remove of a
+`model.get_exclusive(id, &tx)` reads the record and takes the exclusive guard.
+`model.get_for_update(id, &tx)` protects all the record's fence keys. A save or remove of a
 guarded record by another transaction then makes one of the two retry (see [Guards](#guards)). A
 read without a transaction adds no guard, and neither does a shared read in a transaction that
-writes nothing. `get_exclusive` counts as a write, so its guard is taken even when its transaction
+writes nothing. `get_exclusive` and `get_for_update` count as writes, so their guards are taken even when the transaction
 writes nothing else.
 
 `model.get_versioned(id, transaction)` returns `TitoVersioned<T>` with the model in `value` and
@@ -279,6 +280,7 @@ none is listed in a manifest, and a manifest that lists one is an integrity erro
 | --- | --- |
 | `get`, `get_many`, `get_versioned`, a hit of `find_one_by_unique_index`, in a transaction that writes | one shared key of each record read, at commit |
 | `get_exclusive` | the record's exclusive key, at commit |
+| `get_for_update` | all 17 keys of the record, at commit, without changing its bytes, indexes or version |
 | `set`, `replace_many`, `remove`, `remove_by_index`, `rebuild_indexes_for_restore` | all 17 keys of each record written or removed |
 | a shared read in a transaction that writes nothing, and any read without a transaction | nothing |
 | index reads (`find_by_index`, `find_by_index_reverse`, `query_by_index` with `execute`, `execute_reverse` and `execute_ids`, `find_one_by_index`) and any batched read of referenced records behind them, `scan`, `scan_reverse`, `find`, and a read that finds nothing | nothing |
@@ -289,7 +291,15 @@ So:
   key, about one pair in 16;
 - two exclusive guards of one record always conflict;
 - a shared and an exclusive guard of one record don't conflict;
+- `get_for_update` conflicts with every guard of the record, including another `get_for_update`;
 - a save or remove of a record conflicts with every guard of it that it overlaps.
+
+Use `get_for_update(id, &tx)` when changing a relationship owned by another record must invalidate
+decisions based on this record. For example, changing an offering's group list protects each added or
+removed group this way, while joins read groups normally. This includes a join whose snapshot has no
+offering for its group. The relationship stays on the offering; no backlink or dummy record update is
+needed. The guard requires an existing record and counts as a write even without another mutation.
+It does not conflict with a transaction that only reads normally and writes nothing.
 
 **The shared key.** A transaction draws one random number when it begins, and every shared guard
 it adds uses key `number % 16`. Two transactions that read the same twenty records conflict about
@@ -297,9 +307,9 @@ one time in 16, the same as two that read one: either they drew one key or they 
 a new transaction and draws again.
 
 **When guards are added.** A transaction notes each record it reads by id. At commit, if it wrote
-anything or took an exclusive guard, Tito deletes one key per noted record: the exclusive key for a
-record read with `get_exclusive`, a shared key otherwise. A record read both ways holds only the
-exclusive key. Any write counts: a save or remove, a queue publication or acknowledgement, a raw put
+anything or took an exclusive or for-update guard, Tito deletes the noted fence keys: all 17 for
+`get_for_update`, the exclusive key for `get_exclusive`, a shared key otherwise. The strongest guard
+on a record wins. Any write counts: a save or remove, a queue publication or acknowledgement, a raw put
 or delete. `get_exclusive` counts as a write itself: its key is deleted even when the transaction
 writes nothing else, and the transaction's shared guards then apply too. A record the transaction
 saved or removed itself gets nothing more, since its save already deleted all 17. A transaction that
@@ -314,9 +324,9 @@ A rule over a list, such as "a company keeps at least one manager", takes `get_e
 transaction that changes the list.
 
 **Engines.** `TitoTransaction::guard(table, id, guard)` notes a record as `TitoGuard::Shared`,
-`Exclusive` or `Written`, and the strongest note wins. An engine draws a new number for every
+`Exclusive`, `ForUpdate` or `Written`, in that order, and the strongest note wins. An engine draws a new number for every
 transaction it begins, and its `commit` deletes the noted keys before committing when the
-transaction wrote or holds an exclusive guard. The TiKV engine and the in-memory test engine do
+transaction wrote or holds an exclusive or for-update guard. The TiKV engine and the in-memory test engine do
 both.
 
 ## Storage integrity and pagination

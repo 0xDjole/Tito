@@ -68,6 +68,64 @@ async fn get_exclusive_requires_an_existing_record_and_changes_no_stored_byte() 
 }
 
 #[tokio::test]
+async fn get_for_update_preserves_record_bytes_and_version_and_protects_all_readers() {
+    let engine = engine();
+    let model = shops(&engine);
+    save_shop(&engine, shop("s1")).await.unwrap();
+    let primary = engine.raw_bytes("table:shops:s1").await.unwrap();
+    let manifest = engine
+        .raw_bytes("reverse-index:table:shops:s1")
+        .await
+        .unwrap();
+    let version = model.get_versioned("s1", None).await.unwrap().version;
+
+    let tx = engine.begin_transaction().await.unwrap();
+    assert!(matches!(
+        model.get_for_update("missing", &tx).await,
+        Err(TitoError::NotFound(_))
+    ));
+    model.get_exclusive("s1", &tx).await.unwrap();
+    assert_eq!(model.get_for_update("s1", &tx).await.unwrap(), shop("s1"));
+    model.get_exclusive("s1", &tx).await.unwrap();
+    model.get("s1").execute(Some(&tx)).await.unwrap();
+    assert_eq!(
+        commit_writes(&engine, tx).await,
+        record_fence_keys("shops", "s1")
+            .into_iter()
+            .map(RecordedWrite::Delete)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(engine.raw_bytes("table:shops:s1").await.unwrap(), primary);
+    assert_eq!(
+        engine
+            .raw_bytes("reverse-index:table:shops:s1")
+            .await
+            .unwrap(),
+        manifest
+    );
+    assert_eq!(
+        model.get_versioned("s1", None).await.unwrap().version,
+        version
+    );
+
+    save_shop(&engine, shop("s2")).await.unwrap();
+    let tx = engine.begin_transaction().await.unwrap();
+    model.get_for_update("s1", &tx).await.unwrap();
+    model.get("s2").execute(Some(&tx)).await.unwrap();
+    save_shop(
+        &engine,
+        Shop {
+            name: "Changed".into(),
+            ..shop("s2")
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(tx.commit().await, Err(TitoError::Retryable(_))));
+    assert!(engine.keys_with_prefix("fence:").await.is_empty());
+}
+
+#[tokio::test]
 async fn a_read_by_id_in_a_writing_transaction_deletes_one_shared_key_of_its_pick_at_commit() {
     let engine = engine();
     let model = shops(&engine);

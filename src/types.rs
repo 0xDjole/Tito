@@ -98,6 +98,7 @@ pub trait TitoEngine: Send + Sync + Clone {
 pub enum TitoGuard {
     Shared,
     Exclusive,
+    ForUpdate,
     Written,
 }
 

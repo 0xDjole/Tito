@@ -655,6 +655,12 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         Ok(record)
     }
 
+    pub async fn get_for_update(&self, id: &str, tx: &E::Transaction) -> Result<T, TitoError> {
+        let record = self.get_one_with_tx(id, tx).await?;
+        tx.guard(&T::table(), id, TitoGuard::ForUpdate).await;
+        Ok(record)
+    }
+
     pub async fn get_versioned(
         &self,
         id: &str,

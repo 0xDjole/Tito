@@ -56,6 +56,7 @@ TITO_NATIVE_CASES = {
     "native_two_transactions_reading_the_same_twenty_records_conflict_about_one_time_in_sixteen",
     "native_two_exclusive_reads_of_one_record_always_conflict_and_the_retry_passes",
     "native_a_shared_and_an_exclusive_read_of_one_record_commit_together_in_either_order",
+    "native_get_for_update_conflicts_with_every_guard_in_both_orders_without_changing_the_record",
     "native_a_save_and_a_remove_conflict_with_shared_and_exclusive_reads_in_either_order",
     "native_a_transaction_that_writes_nothing_adds_no_guard_and_get_exclusive_counts_as_a_write",
     "native_a_retry_starts_without_the_guards_of_the_attempt_before",
