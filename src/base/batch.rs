@@ -1,5 +1,5 @@
 use super::*;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 pub const MAX_REPLACE_MANY_RECORDS: usize = 100;
 pub const MAX_REPLACE_MANY_KEYS: usize = 10_000;

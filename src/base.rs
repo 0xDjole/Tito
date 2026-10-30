@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::future::Future;
 
 use std::marker::PhantomData;
@@ -8,9 +7,8 @@ use crate::{
     fence::record_fence_keys,
     query::IndexQueryBuilder,
     types::{
-        FieldValue, ReverseIndex, TitoCursor, TitoEngine, TitoFindPayload, TitoGuard, TitoKvPair,
-        TitoModelOptions, TitoPaginated, TitoRecordVersion, TitoScanPayload, TitoTransaction,
-        TitoVersioned,
+        FieldValue, ReverseIndex, TitoCursor, TitoEngine, TitoGuard, TitoKvPair, TitoModelOptions,
+        TitoPaginated, TitoRecordVersion, TitoScanPayload, TitoTransaction, TitoVersioned,
     },
     utils::{key_after_bytes, prefix_end_bytes},
 };
@@ -87,14 +85,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
 
     pub fn get_table(&self) -> String {
         T::key_prefix()
-    }
-
-    pub fn get_id_from_table(&self, key: String) -> String {
-        let parts: Vec<&str> = key.split(':').collect();
-        parts
-            .last()
-            .map(|last| last.to_string())
-            .unwrap_or_else(|| key)
     }
 
     pub fn query_by_index(&self, index: impl Into<String>) -> IndexQueryBuilder<E, T> {
@@ -258,28 +248,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         Ok(true)
     }
 
-    pub fn to_paginated_items_with_cursor(
-        &self,
-        items: Vec<(String, Value)>,
-        cursor: String,
-    ) -> Result<TitoPaginated<T>, TitoError> {
-        let mut results = vec![];
-
-        for (key, value) in items {
-            let item = serde_json::from_value::<T>(value).map_err(|error| {
-                TitoError::DeserializationFailed(format!(
-                    "Failed to deserialize record for scanned key '{}': {}",
-                    key, error
-                ))
-            })?;
-            results.push(item);
-        }
-
-        let results = TitoPaginated::new(results, Some(cursor));
-
-        Ok(results)
-    }
-
     pub(crate) fn next_cursor(
         &self,
         has_more: bool,
@@ -395,78 +363,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             return Ok(false);
         };
         Ok(Self::unique_owner_id(key, bytes)? == expected_id)
-    }
-
-    pub async fn rebuild_indexes_for_restore(
-        &self,
-        id: &str,
-        tx: &E::Transaction,
-    ) -> Result<T, TitoError> {
-        if id.is_empty() || id.len() > 512 {
-            return Err(TitoError::InvalidInput("Invalid restore record ID".into()));
-        }
-        let primary_key = format!("{}:{id}", self.get_table());
-        let reverse_key = format!("reverse-index:{primary_key}");
-        let primary = tx.get(&primary_key).await?.ok_or_else(|| {
-            TitoError::NotFound(format!("Record '{primary_key}' not found in database"))
-        })?;
-        let reverse = tx.get(&reverse_key).await?.ok_or_else(|| {
-            TitoError::IndexError(format!("Record '{primary_key}' has no restore metadata"))
-        })?;
-        if reverse.len() > MAX_MANIFEST_BYTES {
-            return Err(TitoError::IndexError(
-                "Restore metadata exceeds one MiB".into(),
-            ));
-        }
-        let metadata = self.deserialize_reverse_index(&reverse_key, &reverse)?;
-        if metadata.value.len() > MAX_MANIFEST_KEYS {
-            return Err(TitoError::IndexError(
-                "Restore metadata exceeds 10000 keys".into(),
-            ));
-        }
-        self.validate_reverse_index_keys(&primary_key, &metadata)?;
-        let value: Value = serde_json::from_slice(&primary)
-            .map_err(|error| TitoError::DeserializationFailed(error.to_string()))?;
-        let stored: T = serde_json::from_value(value.clone())
-            .map_err(|error| TitoError::DeserializationFailed(error.to_string()))?;
-        if stored.id() != id {
-            return Err(TitoError::IndexError(
-                "Restore primary identity differs from its key".into(),
-            ));
-        }
-        let owned = self.build_index_entries(&primary_key, &stored, &value, Some(&primary))?;
-        let declared: HashSet<_> = metadata.value.iter().collect();
-        let computed: HashSet<_> = owned.iter().map(|(key, _)| key).collect();
-        if declared.len() != metadata.value.len()
-            || computed.len() != owned.len()
-            || declared != computed
-        {
-            return Err(TitoError::IndexError(
-                "Restore metadata differs from current model indexes".into(),
-            ));
-        }
-        for (key, _) in &owned {
-            if let Some(index) = Self::unique_index_name(key) {
-                if let Some(bytes) = tx.get(key).await? {
-                    if Self::unique_owner_id(key, bytes)? != id {
-                        return Err(TitoError::UniqueViolation {
-                            model: T::table(),
-                            index: index.to_string(),
-                        });
-                    }
-                }
-            }
-        }
-        tx.put(primary_key, primary).await?;
-        tx.put(reverse_key, reverse).await?;
-        for (key, value) in owned {
-            tx.put(key, value).await?;
-        }
-        for fence in record_fence_keys(&T::table(), id) {
-            self.delete(fence, tx).await?;
-        }
-        tx.guard(&T::table(), id, TitoGuard::Written).await;
-        Ok(stored)
     }
 
     async fn load_index_state(
@@ -652,12 +548,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
     pub async fn get_exclusive(&self, id: &str, tx: &E::Transaction) -> Result<T, TitoError> {
         let record = self.get_one_with_tx(id, tx).await?;
         tx.guard(&T::table(), id, TitoGuard::Exclusive).await;
-        Ok(record)
-    }
-
-    pub async fn get_for_update(&self, id: &str, tx: &E::Transaction) -> Result<T, TitoError> {
-        let record = self.get_one_with_tx(id, tx).await?;
-        tx.guard(&T::table(), id, TitoGuard::ForUpdate).await;
         Ok(record)
     }
 
@@ -1007,39 +897,5 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         }
 
         Ok(true)
-    }
-
-    pub async fn find(&self, payload: TitoFindPayload) -> Result<TitoPaginated<T>, TitoError>
-    where
-        T: DeserializeOwned,
-    {
-        let table_prefix = format!("{}:", self.get_table());
-        let start_bound = format!("{}{}", table_prefix, payload.start);
-        let end_bound = payload
-            .end
-            .as_ref()
-            .map(|end| format!("{}{}", table_prefix, end));
-
-        self.tx(|tx| {
-            let start_bound = start_bound.clone();
-            let end_bound = end_bound.clone();
-            let payload = payload.clone();
-            async move {
-                let (scan_stream, has_more) = self
-                    .scan(
-                        TitoScanPayload {
-                            start: start_bound,
-                            end: end_bound,
-                            limit: payload.limit,
-                            cursor: payload.cursor.clone(),
-                        },
-                        &tx,
-                    )
-                    .await?;
-
-                self.to_paginated_items(scan_stream, has_more)
-            }
-        })
-        .await
     }
 }

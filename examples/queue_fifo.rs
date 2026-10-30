@@ -4,9 +4,12 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tito::{
-    queue::{run_worker, QueueConfig, QueueEvent, QueueHandlerOutcome, QueueHandlerResult},
+    queue::{
+        run_cluster_worker, ClusterWorkerConfig, QueueConfig, QueueEvent, QueueHandlerOutcome,
+        QueueHandlerResult,
+    },
     types::DBUuid,
-    Queue, TiKV, TitoError, WorkerConfig,
+    Queue, TiKV, TitoError,
 };
 use tokio::sync::broadcast;
 
@@ -68,8 +71,13 @@ async fn main() -> Result<(), TitoError> {
         }) as BoxFuture<'static, QueueHandlerResult<UserEvent>>
     };
 
-    let worker_handle =
-        run_worker(queue.clone(), WorkerConfig::new(0..1), handler, shutdown_rx).await;
+    let worker_handle = run_cluster_worker(
+        queue.clone(),
+        ClusterWorkerConfig::new("fifo-example"),
+        handler,
+        shutdown_rx,
+    )
+    .await;
 
     tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 

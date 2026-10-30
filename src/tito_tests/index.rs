@@ -1058,8 +1058,9 @@ async fn identical_index_keys_of_one_record_are_written_once_and_case_variants_a
         1
     );
     let tx = engine.begin_transaction().await.unwrap();
-    model.rebuild_indexes_for_restore("p1", &tx).await.unwrap();
+    assert!(model.remove("p1", &tx).await.unwrap());
     crate::types::TitoTransaction::commit(tx).await.unwrap();
+    assert!(engine.keys_with_prefix("index:post-by-").await.is_empty());
 }
 
 #[tokio::test]

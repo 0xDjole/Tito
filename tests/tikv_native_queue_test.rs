@@ -6,12 +6,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use tito::backend::tikv::{TiKVBackend, TiKVTransaction};
-use tito::queue::run_worker;
 use tito::types::{TitoIndexConfig, TitoTransaction};
 use tito::{
     run_cluster_worker, ClusterWorkerConfig, Queue, QueueConfig, QueueEvent, QueueEventStatus,
     QueueHandlerOutcome, QueueHandlerResult, QueueOwner, TitoEngine, TitoError, TitoModel,
-    TitoModelOptions, TitoModelTrait, WorkerConfig,
+    TitoModelOptions, TitoModelTrait,
 };
 use tokio::sync::{broadcast, Mutex, Notify};
 use uuid::Uuid;
@@ -39,12 +38,6 @@ impl TitoModelTrait for NativeTally {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct NativeChange {
     value: i64,
-}
-
-#[derive(Clone, Copy)]
-enum NativeWorker {
-    Cluster,
-    Standalone,
 }
 
 type NativeHandlerFuture = BoxFuture<'static, QueueHandlerResult<NativeChange>>;
@@ -160,9 +153,8 @@ async fn assert_completed_once(
     );
 }
 
-async fn a_worker_handler_completes_its_own_pending_row_inside_its_transaction(
-    worker: NativeWorker,
-) {
+#[tokio::test]
+async fn native_a_queue_handler_completes_its_own_pending_row_inside_its_transaction() {
     let (endpoint, run_id) = native_endpoint();
     tokio::time::timeout(Duration::from_secs(60), async move {
         let engine = native_engine(endpoint).await;
@@ -219,19 +211,10 @@ async fn a_worker_handler_completes_its_own_pending_row_inside_its_transaction(
             })
         };
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-        let handle = match worker {
-            NativeWorker::Cluster => {
-                let mut config = ClusterWorkerConfig::new(record_id(&run_id));
-                config.heartbeat_interval = Duration::from_millis(20);
-                config.poll_interval = Duration::from_millis(20);
-                run_cluster_worker(queue.clone(), config, handler, shutdown_rx).await
-            }
-            NativeWorker::Standalone => {
-                let mut config = WorkerConfig::new(0..1);
-                config.poll_interval = Duration::from_millis(20);
-                run_worker(queue.clone(), config, handler, shutdown_rx).await
-            }
-        };
+        let mut config = ClusterWorkerConfig::new(record_id(&run_id));
+        config.heartbeat_interval = Duration::from_millis(20);
+        config.poll_interval = Duration::from_millis(20);
+        let handle = run_cluster_worker(queue.clone(), config, handler, shutdown_rx).await;
 
         handled.notified().await;
         let _ = shutdown_tx.send(());
@@ -250,18 +233,6 @@ async fn a_worker_handler_completes_its_own_pending_row_inside_its_transaction(
     })
     .await
     .expect("The native in-transaction acknowledgement must finish within its owned run");
-}
-
-#[tokio::test]
-async fn native_a_queue_handler_completes_its_own_pending_row_inside_its_transaction() {
-    a_worker_handler_completes_its_own_pending_row_inside_its_transaction(NativeWorker::Cluster)
-        .await;
-}
-
-#[tokio::test]
-async fn native_a_standalone_worker_handler_completes_its_own_pending_row() {
-    a_worker_handler_completes_its_own_pending_row_inside_its_transaction(NativeWorker::Standalone)
-        .await;
 }
 
 #[tokio::test]

@@ -937,65 +937,6 @@ async fn queue_completed_retention_uses_the_terminal_time_index_not_value_decodi
 }
 
 #[tokio::test]
-async fn standalone_worker_enforces_configured_completed_history_retention() {
-    const RETENTION_SECONDS: i64 = 60 * 60;
-    let engine = engine();
-    let queue = Arc::new(Queue::new(
-        engine.clone(),
-        QueueConfig::new(1, Duration::from_secs(RETENTION_SECONDS as u64)),
-    ));
-    let now = Utc::now().timestamp_millis();
-    let expired_count = crate::queue::COMPLETED_EVENT_MAINTENANCE_BATCH_SIZE as usize
-        * crate::queue::COMPLETED_EVENT_MAINTENANCE_MAX_BATCHES
-        + 1;
-    let mut last_expired_key = String::new();
-    for index in 0..expired_count {
-        last_expired_key = put_completed_queue_event(
-            &engine,
-            &format!("expired-{index:05}"),
-            now - RETENTION_SECONDS * 1_000 - 1,
-        )
-        .await;
-    }
-    let retained_key = put_completed_queue_event(
-        &engine,
-        "retained",
-        now - RETENTION_SECONDS * 1_000 + 60_000,
-    )
-    .await;
-    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-
-    let handle = run_worker(
-        queue,
-        WorkerConfig::new(0..1),
-        |_event: QueueEvent<QueuePayload>| {
-            Box::pin(async move { Ok(QueueHandlerOutcome::Acknowledge) })
-        },
-        shutdown_rx,
-    )
-    .await;
-
-    timeout(Duration::from_secs(5), async {
-        while engine.contains_key(&last_expired_key).await {
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(
-        engine.keys_with_prefix("queue:completed:").await,
-        vec![retained_key.clone()]
-    );
-    assert!(engine.contains_key(&retained_key).await);
-
-    let _ = shutdown_tx.send(());
-    timeout(Duration::from_secs(2), handle)
-        .await
-        .unwrap()
-        .unwrap();
-}
-
-#[tokio::test]
 async fn queue_scan_cursor_continues_after_previous_page() {
     let engine = engine();
     let queue = queue(engine, 1);
@@ -1022,55 +963,6 @@ async fn queue_scan_cursor_continues_after_previous_page() {
 }
 
 #[tokio::test]
-async fn queue_worker_acknowledges_successful_jobs() {
-    let engine = engine();
-    let queue = Arc::new(queue(engine, 1));
-    queue
-        .publish(queue_event(
-            "worker-success",
-            "entry:worker-success",
-            Utc::now().timestamp_millis() - 10_000,
-        ))
-        .await
-        .unwrap();
-    let processed = Arc::new(Notify::new());
-    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-    let handler_processed = processed.clone();
-
-    let handle = run_worker::<_, QueuePayload, _>(
-        queue.clone(),
-        WorkerConfig::new(0..1),
-        move |event| {
-            let handler_processed = handler_processed.clone();
-            Box::pin(async move {
-                assert_eq!(event.id, "worker-success");
-                handler_processed.notify_one();
-                Ok(QueueHandlerOutcome::Acknowledge)
-            })
-        },
-        shutdown_rx,
-    )
-    .await;
-
-    timeout(Duration::from_secs(2), processed.notified())
-        .await
-        .unwrap();
-    wait_for_completed(&queue, "worker-success").await;
-
-    let _ = shutdown_tx.send(());
-    timeout(Duration::from_secs(2), handle)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(queue
-        .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 10)
-        .await
-        .unwrap()
-        .events
-        .is_empty());
-}
-
-#[tokio::test]
 async fn queue_worker_applies_an_advance_outcome() {
     let engine = engine();
     let queue = Arc::new(queue(engine, 1));
@@ -1085,9 +977,9 @@ async fn queue_worker_applies_an_advance_outcome() {
         .unwrap();
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
-    let handle = run_worker::<_, QueuePayload, _>(
+    let handle = crate::run_cluster_worker::<_, QueuePayload, _>(
         queue.clone(),
-        WorkerConfig::new(0..1),
+        cluster_config("advance-node"),
         move |event| {
             Box::pin(async move {
                 let mut next = event.rescheduled(now + 3_600_000);
@@ -1147,9 +1039,9 @@ async fn queue_worker_handler_error_leaves_exact_pending_invocation_unchanged() 
     let mut handler_event = event.clone();
     handler_event.pending_key = Some(storage_key.clone());
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-    let handle = run_worker::<_, QueuePayload, _>(
+    let handle = crate::run_cluster_worker::<_, QueuePayload, _>(
         queue.clone(),
-        WorkerConfig::new(0..1),
+        cluster_config("error-node"),
         move |handled_event| {
             let handler_started = handler_started.clone();
             let handler_release = handler_release.clone();
@@ -1189,86 +1081,6 @@ async fn queue_worker_handler_error_leaves_exact_pending_invocation_unchanged() 
 }
 
 #[tokio::test]
-async fn standalone_worker_shutdown_drains_started_handler_before_join() {
-    let engine = engine();
-    let queue = Arc::new(queue(engine, 1));
-    let now = Utc::now().timestamp_millis() - 10_000;
-    queue
-        .publish(queue_event(
-            "standalone-drain",
-            "entry:standalone-drain",
-            now,
-        ))
-        .await
-        .unwrap();
-    queue
-        .publish(queue_event(
-            "standalone-second",
-            "entry:standalone-second",
-            now,
-        ))
-        .await
-        .unwrap();
-
-    let started = Arc::new(Notify::new());
-    let release = Arc::new(Notify::new());
-    let attempts = Arc::new(AtomicUsize::new(0));
-    let handler_started = started.clone();
-    let handler_release = release.clone();
-    let handler_attempts = attempts.clone();
-    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-    let mut handle = run_worker::<_, QueuePayload, _>(
-        queue.clone(),
-        WorkerConfig::new(0..1),
-        move |event| {
-            let handler_started = handler_started.clone();
-            let handler_release = handler_release.clone();
-            let handler_attempts = handler_attempts.clone();
-            Box::pin(async move {
-                handler_attempts.fetch_add(1, Ordering::SeqCst);
-                assert_eq!(event.id, "standalone-drain");
-                handler_started.notify_one();
-                handler_release.notified().await;
-                Ok(QueueHandlerOutcome::Acknowledge)
-            })
-        },
-        shutdown_rx,
-    )
-    .await;
-
-    timeout(Duration::from_secs(2), started.notified())
-        .await
-        .unwrap();
-    let _ = shutdown_tx.send(());
-    for _ in 0..10 {
-        tokio::task::yield_now().await;
-    }
-    assert!(
-        !handle.is_finished(),
-        "worker joined before its started handler drained"
-    );
-
-    release.notify_one();
-    timeout(Duration::from_secs(2), &mut handle)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(attempts.load(Ordering::SeqCst), 1);
-    let completed = queue
-        .scan_by_status::<QueuePayload>(QueueEventStatus::Completed, None, 10)
-        .await
-        .unwrap();
-    assert_eq!(completed.events.len(), 1);
-    assert_eq!(completed.events[0].1.id, "standalone-drain");
-    let pending = queue
-        .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 10)
-        .await
-        .unwrap();
-    assert_eq!(pending.events.len(), 1);
-    assert_eq!(pending.events[0].1.id, "standalone-second");
-}
-
-#[tokio::test]
 async fn queue_worker_does_not_let_unacknowledged_first_page_starve_later_rows() {
     let engine = engine();
     let queue = Arc::new(queue(engine, 1));
@@ -1288,9 +1100,9 @@ async fn queue_worker_does_not_let_unacknowledged_first_page_starve_later_rows()
     let target_processed = Arc::new(Notify::new());
     let handler_target_processed = target_processed.clone();
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-    let handle = run_worker::<_, QueuePayload, _>(
+    let handle = crate::run_cluster_worker::<_, QueuePayload, _>(
         queue.clone(),
-        WorkerConfig::new(0..1),
+        cluster_config("starvation-node"),
         move |event| {
             let handler_target_processed = handler_target_processed.clone();
             Box::pin(async move {
@@ -1319,56 +1131,6 @@ async fn queue_worker_does_not_let_unacknowledged_first_page_starve_later_rows()
 }
 
 #[tokio::test]
-async fn queue_worker_contains_panic_and_redelivers_the_pending_invocation() {
-    let engine = engine();
-    let queue = Arc::new(queue(engine, 1));
-    queue
-        .publish(queue_event(
-            "worker-panic",
-            "entry:worker-panic",
-            Utc::now().timestamp_millis() - 10_000,
-        ))
-        .await
-        .unwrap();
-    let attempts = Arc::new(AtomicUsize::new(0));
-    let processed = Arc::new(Notify::new());
-    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-    let handler_attempts = attempts.clone();
-    let handler_processed = processed.clone();
-
-    let handle = run_worker::<_, QueuePayload, _>(
-        queue.clone(),
-        WorkerConfig::new(0..1),
-        move |event| {
-            let handler_attempts = handler_attempts.clone();
-            let handler_processed = handler_processed.clone();
-            Box::pin(async move {
-                assert_eq!(event.id, "worker-panic");
-                if handler_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                    panic!("simulated handler panic");
-                }
-                handler_processed.notify_one();
-                Ok(QueueHandlerOutcome::Acknowledge)
-            })
-        },
-        shutdown_rx,
-    )
-    .await;
-
-    timeout(Duration::from_secs(3), processed.notified())
-        .await
-        .unwrap();
-    wait_for_completed(&queue, "worker-panic").await;
-    assert_eq!(attempts.load(Ordering::SeqCst), 2);
-
-    let _ = shutdown_tx.send(());
-    timeout(Duration::from_secs(2), handle)
-        .await
-        .unwrap()
-        .unwrap();
-}
-
-#[tokio::test]
 async fn queue_worker_contains_synchronous_handler_panic_and_redelivers() {
     let engine = engine();
     let queue = Arc::new(queue(engine, 1));
@@ -1386,9 +1148,9 @@ async fn queue_worker_contains_synchronous_handler_panic_and_redelivers() {
     let handler_attempts = attempts.clone();
     let handler_processed = processed.clone();
 
-    let handle = run_worker::<_, QueuePayload, _>(
+    let handle = crate::run_cluster_worker::<_, QueuePayload, _>(
         queue.clone(),
-        WorkerConfig::new(0..1),
+        cluster_config("sync-panic-node"),
         move |event| {
             assert_eq!(event.id, "worker-sync-panic");
             if handler_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -1434,10 +1196,10 @@ async fn queue_worker_times_out_handler_and_redelivers_pending_invocation() {
     let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
     let handler_attempts = attempts.clone();
     let handler_processed = processed.clone();
-    let mut config = WorkerConfig::new(0..1);
+    let mut config = cluster_config("timeout-node");
     config.handler_timeout = Duration::from_millis(20);
 
-    let handle = run_worker::<_, QueuePayload, _>(
+    let handle = crate::run_cluster_worker::<_, QueuePayload, _>(
         queue.clone(),
         config,
         move |event| {
@@ -1525,70 +1287,6 @@ async fn published_and_rescheduled_rows_sit_in_the_partition_of_their_key_hash()
             && event.timestamp == 1
             && storage_key.starts_with("queue:pending:0008:")
     }));
-}
-
-#[tokio::test]
-async fn standalone_worker_pulls_the_next_page_without_waiting_for_its_poll_interval() {
-    let engine = engine();
-    let queue = Arc::new(queue(engine, 1));
-    let due = Utc::now().timestamp_millis() - 10_000;
-    for index in 0..120 {
-        let id = format!("paged-{index:03}");
-        queue
-            .publish(queue_event(&id, &format!("entry:{id}"), due))
-            .await
-            .unwrap();
-    }
-
-    let handled = Arc::new(AtomicUsize::new(0));
-    let all_handled = Arc::new(Notify::new());
-    let handler_handled = handled.clone();
-    let handler_all_handled = all_handled.clone();
-    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-    let mut config = WorkerConfig::new(0..1);
-    config.poll_interval = Duration::from_secs(60 * 60);
-    let handle = run_worker::<_, QueuePayload, _>(
-        queue.clone(),
-        config,
-        move |_event| {
-            let handled = handler_handled.clone();
-            let all_handled = handler_all_handled.clone();
-            Box::pin(async move {
-                if handled.fetch_add(1, Ordering::SeqCst) + 1 == 120 {
-                    all_handled.notify_one();
-                }
-                Ok(QueueHandlerOutcome::Acknowledge)
-            })
-        },
-        shutdown_rx,
-    )
-    .await;
-
-    timeout(Duration::from_secs(10), all_handled.notified())
-        .await
-        .unwrap();
-    let _ = shutdown_tx.send(());
-    timeout(Duration::from_secs(2), handle)
-        .await
-        .unwrap()
-        .unwrap();
-
-    assert_eq!(handled.load(Ordering::SeqCst), 120);
-    assert!(queue
-        .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 10)
-        .await
-        .unwrap()
-        .events
-        .is_empty());
-    assert_eq!(
-        queue
-            .scan_by_status::<QueuePayload>(QueueEventStatus::Completed, None, 200)
-            .await
-            .unwrap()
-            .events
-            .len(),
-        120
-    );
 }
 
 async fn wait_for_completed(queue: &Arc<Queue<MemoryEngine>>, event_id: &str) {

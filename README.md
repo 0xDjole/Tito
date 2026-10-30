@@ -29,8 +29,7 @@ zero, fractional or exponent notation, whitespace, or out-of-range values.
 `encode_index_integer(i64)` encodes the full signed range by flipping the sign bit and writing the
 result as exactly 20 decimal digits. Byte ordering therefore matches signed integer ordering,
 including negative values, zero, and decimal-width boundaries. Use this exported encoder for
-manual numeric range endpoints; never pad the original integer directly. Half-open scans and exact
-cursor continuation retain their existing semantics.
+manual numeric range endpoints; never pad the original integer directly.
 
 String index values are stored exactly. `encode_index_string(&str)` escapes `\` as `\\` and `:` as
 `\:` and keeps every other character as it is: no case folding, trimming or word splitting. Values
@@ -40,10 +39,11 @@ encoded as `{key}.{value}` and a numeric map entry's key goes through the same e
 exported encoder for manual string range endpoints. Opaque record IDs are unchanged.
 
 Ordinary indexes are declared by `indexes`; their keys include the primary record identity and may
-have many owners. Exclusive value ownership is declared separately by `unique_indexes`; its key
-includes the model, index name, and complete indexed value but not the claimant ID. A competing
-claim therefore conflicts on one real ownership key and returns `TitoError::UniqueViolation`
-without exposing the indexed value. `find_one_by_unique_index` performs an exact key read and
+have many owners. Identical keys of one record, such as a list that holds the same value twice, are
+written and listed in its manifest once. Exclusive value ownership is declared separately by
+`unique_indexes`; its key includes the model, index name, and complete indexed value but not the
+claimant ID. A competing claim therefore conflicts on one real ownership key and returns
+`TitoError::UniqueViolation` without exposing the indexed value. `find_one_by_unique_index` performs an exact key read and
 resolves the record according to the index's value mode; in a transaction that writes, a hit guards that record like
 `get` (see [Guards](#guards)). Conditional unique indexes are omitted when their model instance sets
 `condition` to false.
@@ -70,8 +70,9 @@ chosen by its declaration.
 
 The mode belongs to the index schema and must be the same for every record declaring that index.
 This schema is installed on a fresh database. There is no migration or old-format compatibility
-path: Tito reads exactly the declared format. Restore rebuilds indexes from backups of this same
-schema. Writers with different declarations must not run together.
+path: Tito reads exactly the declared format, so a restore brings back primary records, index
+entries and manifests of this same schema together. Writers with different declarations must not
+run together.
 
 - An index list (`find_by_index`, `find_by_index_reverse`, `find_one_by_index`,
   `query_by_index(..).execute` and `.execute_reverse`, and their `_raw` forms) uses copied records
@@ -86,7 +87,7 @@ schema. Writers with different declarations must not run together.
   with `IndexError` when a referenced owner is missing or the returned record no longer declares
   that unique value. Both modes take the same owner guard.
 - `scan` and `scan_reverse` over an index range return each entry's key with its record's JSON,
-  read the same way; a primary range returns the stored records as before.
+  read the same way; a primary range returns the stored records.
 
 ## TiKV client dependency
 
@@ -198,16 +199,19 @@ let ids = query.execute_ids(None).await?;
 `execute` reads copied records directly or fetches referenced records in one batch; `execute_ids`
 reads the keys only and returns the record ids in either mode.
 
+A save sets `created_at` on create and `updated_at` on every write to the current signed UTC epoch
+milliseconds, but only when the model's serialized shape has those fields; `.timestamps(false)`
+keeps the values the application set. Tito adds no field the model doesn't declare.
+
 Tito reads and writes one model at a time. Applications load related records explicitly so their
 domain and API boundaries determine when an additional read is required.
 
 In a transaction that writes, every read by id guards the record it returns: `get`, `get_many`,
 `get_versioned` and a hit of `find_one_by_unique_index` take a shared guard, and
-`model.get_exclusive(id, &tx)` reads the record and takes the exclusive guard.
-`model.get_for_update(id, &tx)` protects all the record's fence keys. A save or remove of a
+`model.get_exclusive(id, &tx)` reads the record and takes the exclusive guard. A save or remove of a
 guarded record by another transaction then makes one of the two retry (see [Guards](#guards)). A
 read without a transaction adds no guard, and neither does a shared read in a transaction that
-writes nothing. `get_exclusive` and `get_for_update` count as writes, so their guards are taken even when the transaction
+writes nothing. `get_exclusive` counts as a write, so its guard is taken even when its transaction
 writes nothing else.
 
 `model.get_versioned(id, transaction)` returns `TitoVersioned<T>` with the model in `value` and
@@ -280,10 +284,9 @@ none is listed in a manifest, and a manifest that lists one is an integrity erro
 | --- | --- |
 | `get`, `get_many`, `get_versioned`, a hit of `find_one_by_unique_index`, in a transaction that writes | one shared key of each record read, at commit |
 | `get_exclusive` | the record's exclusive key, at commit |
-| `get_for_update` | all 17 keys of the record, at commit, without changing its bytes, indexes or version |
-| `set`, `replace_many`, `remove`, `remove_by_index`, `rebuild_indexes_for_restore` | all 17 keys of each record written or removed |
+| `set`, `replace_many`, `remove`, `remove_by_index` | all 17 keys of each record written or removed |
 | a shared read in a transaction that writes nothing, and any read without a transaction | nothing |
-| index reads (`find_by_index`, `find_by_index_reverse`, `query_by_index` with `execute`, `execute_reverse` and `execute_ids`, `find_one_by_index`) and any batched read of referenced records behind them, `scan`, `scan_reverse`, `find`, and a read that finds nothing | nothing |
+| index reads (`find_by_index`, `find_by_index_reverse`, `query_by_index` with `execute`, `execute_reverse` and `execute_ids`, `find_one_by_index`) and any batched read of referenced records behind them, `scan`, `scan_reverse`, and a read that finds nothing | nothing |
 
 So:
 
@@ -291,15 +294,7 @@ So:
   key, about one pair in 16;
 - two exclusive guards of one record always conflict;
 - a shared and an exclusive guard of one record don't conflict;
-- `get_for_update` conflicts with every guard of the record, including another `get_for_update`;
 - a save or remove of a record conflicts with every guard of it that it overlaps.
-
-Use `get_for_update(id, &tx)` when changing a relationship owned by another record must invalidate
-decisions based on this record. For example, changing an offering's group list protects each added or
-removed group this way, while joins read groups normally. This includes a join whose snapshot has no
-offering for its group. The relationship stays on the offering; no backlink or dummy record update is
-needed. The guard requires an existing record and counts as a write even without another mutation.
-It does not conflict with a transaction that only reads normally and writes nothing.
 
 **The shared key.** A transaction draws one random number when it begins, and every shared guard
 it adds uses key `number % 16`. Two transactions that read the same twenty records conflict about
@@ -307,9 +302,9 @@ one time in 16, the same as two that read one: either they drew one key or they 
 a new transaction and draws again.
 
 **When guards are added.** A transaction notes each record it reads by id. At commit, if it wrote
-anything or took an exclusive or for-update guard, Tito deletes the noted fence keys: all 17 for
-`get_for_update`, the exclusive key for `get_exclusive`, a shared key otherwise. The strongest guard
-on a record wins. Any write counts: a save or remove, a queue publication or acknowledgement, a raw put
+anything or took an exclusive guard, Tito deletes one key per noted record: the exclusive key for a
+record read with `get_exclusive`, a shared key otherwise. A record read both ways holds only the
+exclusive key. Any write counts: a save or remove, a queue publication or acknowledgement, a raw put
 or delete. `get_exclusive` counts as a write itself: its key is deleted even when the transaction
 writes nothing else, and the transaction's shared guards then apply too. A record the transaction
 saved or removed itself gets nothing more, since its save already deleted all 17. A transaction that
@@ -324,9 +319,9 @@ A rule over a list, such as "a company keeps at least one manager", takes `get_e
 transaction that changes the list.
 
 **Engines.** `TitoTransaction::guard(table, id, guard)` notes a record as `TitoGuard::Shared`,
-`Exclusive`, `ForUpdate` or `Written`, in that order, and the strongest note wins. An engine draws a new number for every
+`Exclusive` or `Written`, and the strongest note wins. An engine draws a new number for every
 transaction it begins, and its `commit` deletes the noted keys before committing when the
-transaction wrote or holds an exclusive or for-update guard. The TiKV engine and the in-memory test engine do
+transaction wrote or holds an exclusive guard. The TiKV engine and the in-memory test engine do
 both.
 
 ## Storage integrity and pagination
@@ -352,31 +347,14 @@ required record `version` and index-key `value` array, including models with no 
 Primary, metadata and secondary indexes commit atomically. The manifest may name ordinary `index:`
 keys ending in that exact primary key and model-scoped `unique-index:` keys whose stored owner
 matches that primary record. It never names a `fence:` key. A save fails with `InvalidInput` when
-its manifest would hold more than 10,000 keys or more than one MiB, and index repair refuses
-metadata over the same limits. Updates and removals validate the pair and every unique owner before
-mutating either side. A missing, orphaned, malformed, or syntactically cross-record manifest is an
-integrity error; Tito does not reinterpret it as a missing entity or follow it to an unrelated key.
+its manifest would hold more than 10,000 keys or more than one MiB. Updates and removals validate
+the pair and every unique owner before mutating either side. A missing, orphaned, malformed, or
+syntactically cross-record manifest is an integrity error; Tito does not reinterpret it as a missing
+entity or follow it to an unrelated key.
 
-The record version is not an index-schema version, so Tito cannot prove that
-a syntactically valid manifest still enumerates every index created by an older application schema.
-Recomputing against the current model would incorrectly reject legitimate index additions,
-removals, and condition changes. Detecting or repairing a valid-shaped but semantically incomplete
-historical manifest therefore requires an application-owned audited rebuild. Missing record versions
-are not backfilled from the current read, clock or model timestamp; older metadata requires the
-application's explicit pre-production reset and backup-format cutover.
-
-For offline repair of lost or stale secondary indexes under an unchanged model,
-`model.rebuild_indexes_for_restore(id, &tx)` validates the retained primary and reverse manifest,
-then rewrites only their declared index values, using the primary's exact bytes for every record copy,
-and deletes the record's 17 fence keys, as a save
-does. The primary bytes, manifest bytes and original record version are preserved and fenced in the
-same transaction.
-Missing secondary keys are allowed; a unique key owned by another record is not. Ordinary writes
-still reject missing unique keys. Missing versions, duplicate or foreign manifest keys, a
-primary/key mismatch, or a manifest that differs from the current model's indexes reject. This is
-not schema migration, a new record write or permission to invent missing authoritative metadata.
-The caller owns offline operation, bounded primary enumeration and domain relationship validation;
-Tito does not read related records.
+The record version is not an index-schema version: Tito cannot tell whether a valid manifest lists
+every index of an older schema, and it never fills a missing record version from the current read,
+clock or model timestamp. A changed index schema needs a reset and reseed.
 
 Scans fail on malformed JSON, non-UTF-8 keys, and values that do not deserialize into the requested
 model. A scanned index entry follows its declared value mode. An ordinary reference entry with a
@@ -384,8 +362,8 @@ non-empty value fails with `IndexError`. A reference whose record is missing
 or a copied record that disagrees with its key fails with `IndexError` naming the entry's key. Scans never silently shorten a page by
 dropping corrupt rows. Forward cursors continue from
 the exact key plus a NUL byte; reverse cursors use the exact key as the exclusive upper bound. Both
-directions reject a cursor outside the requested half-open range. `find` applies its optional `end`
-as an exclusive model-key suffix, and a scan limit of zero is invalid.
+directions reject a cursor outside the requested half-open range, and a scan limit of zero is
+invalid.
 
 Prefix endpoints and exact-key continuation are separate operations:
 
@@ -400,175 +378,6 @@ advancing the final character can skip keys such as `a20` after `a2`. Use `key_a
 Secondary index values follow their explicit `TitoIndexValue` declaration (see the index
 paragraphs at the top). Record copies are maintained atomically with their primary; references
 resolve the primary on a record read.
-
-### 0.18.6 index integrity
-
-Same-schema index repair keeps copied entries byte-identical to their retained primary, including
-floating-point records. Ordinary reference record reads reject non-empty entry values; key-only ID
-reads remain value-free. The native scanner has exactly three operations: forward rows, reverse
-rows and forward keys. The stored schema and public API are unchanged from 0.18.5.
-
-### 0.18.5 guards and index entries
-
-Against 0.18.3, the last pinned release (0.18.4's fence stripes were never released):
-
-- Every record has 16 shared fence keys and one exclusive key, `fence:{table}:{id}:0` to `:15` and
-  `fence:{table}:{id}:exclusive`, which Tito only deletes. A save, `replace_many`, `remove` and
-  index repair delete all 17. A delete is a TiKV write: it leaves a Delete entry in the key's
-  history until garbage collection, and reads never see it.
-- Reads guard by themselves. In a transaction that writes, `get`, `get_many`, `get_versioned` and a
-  hit of `find_one_by_unique_index` delete one shared key of each record read at commit, and the
-  new `get_exclusive(id, &tx)` deletes the exclusive key. `get_exclusive` counts as a write, so its
-  key is deleted even when the transaction writes nothing else.
-- `assert_current`, `assert_version` and `assert_index_match` are removed. They fenced by rewriting
-  a record or its manifest. `get_exclusive` replaces `assert_current`; `get_versioned` in the
-  acting transaction and a comparison replace `assert_version`.
-- `TitoTransaction` gains `guard(table, id, guard)`, and `TitoGuard` is new. An engine notes guards
-  and deletes their keys at commit when the transaction wrote or holds an exclusive guard.
-- References are removed: `TitoModelTrait::references` and `is_deleting`, `TitoReference`,
-  `TitoIncomingReference`, the `ref:` keys and the `deleting:` marker, `TitoError::Referenced`,
-  `ReferenceMissing` and `ReferenceDeleting`, `referenced_by`, `referenced_by_except` and `erase`.
-  `remove` no longer checks who holds a record's id. Applications read the ids a save holds and
-  check the holders' indexes before a delete (see
-  [Ids held by other records](#ids-held-by-other-records)).
-- `get_key`, `batch_get` and `get_many_raw` on `TitoModel` are no longer public, so every public
-  read by id guards.
-- Every index requires `value: TitoIndexValue::RecordCopy` or `RecordReference`, with no default.
-  A copy stores the full record and reads it directly; a reference stores an empty ordinary value
-  or a unique owner id and fetches the primary. Every index list
-  (`find_by_index`, `find_by_index_reverse`, their `_raw` forms, `find_one_by_index`,
-  `query_by_index(..).execute` and `.execute_reverse`, and `scan` or `scan_reverse` over an index
-  range) reads copies directly and referenced records by id in one batch, without adding a guard.
-  Order, limits, cursors and has-more are unchanged. `query_by_index(..).execute_ids` is new: it
-  reads the keys only and returns `TitoPaginated<String>` of ids. `remove_by_index` reads ids only.
-  `get_index_keys` returns each key with the bytes it stores, `Vec<(String, Vec<u8>)>`.
-- A reference entry whose record is missing, a copied record that disagrees with its key, or a key
-  under an index prefix that is not an entry of the model is a `TitoError::IndexError` naming the key. `find_one_by_unique_index` also answers
-  `IndexError` when the owner no longer declares the unique value.
-- Manifests list only index and unique keys. A record written by 0.18.3 that holds a pointer or is
-  deleting lists `ref:` or `deleting:` keys and fails every update, remove, repair and
-  `get_versioned`: reset and reseed. Primary, index and queue key formats are unchanged, but index
-  values must match the explicitly chosen mode: a unique entry written by 0.18.3 holds a record
-  copy and cannot be read as an owner id. Reset and reseed with the reviewed declarations.
-- Don't run 0.18.3 writers beside 0.18.5 writers: a 0.18.3 save deletes none of the fence keys a
-  0.18.5 guard deletes, and its index values may differ from the explicitly selected modes.
-- The in-memory test engine detects write-write conflicts at commit, applies only the keys a
-  transaction wrote, retries a conflicting commit like `TiKVBackend::transaction`, and runs the same
-  guard path as the TiKV engine.
-
-### 0.18.3 exact index values, fixed partitions and bounded reads
-
-- String index values are encoded exactly by `encode_index_string`: only `\` and `:` are escaped.
-  Before, values were lowercased, trimmed and split at camel-case humps, so `ABC` and `abc` shared
-  one unique value and a lookup of one returned the other. Index keys of values with capitals,
-  surrounding whitespace or camel-case humps change, and so do keys of queue cluster nodes; reset
-  and reseed, or save those records again. Numeric map-entry keys are now escaped too.
-- Queue partitions come from `queue_partition_for_key`, a fixed FNV-1a hash, instead of the Rust
-  standard library's hasher, which may change between Rust releases. Pending rows published by
-  0.18.2 can sit in another partition than their key's new events; drain or reset the queue before
-  upgrading.
-- `next_string_lexicographically` is removed; call `prefix_end`.
-- TiKV scans and batch gets are bounded by bytes as well as rows (see Queue Processing).
-- Workers pull the next page at once while a pass has more rows. `WorkerConfig` gains
-  `poll_interval`.
-
-### 0.18.2 references
-
-`TitoModelTrait` gains two required methods, `references` and `is_deleting`. Every model must
-implement both before it compiles. There are three new errors: `TitoError::Referenced`,
-`ReferenceMissing` and `ReferenceDeleting`. `TitoModel` gains `referenced_by`,
-`referenced_by_except` and `erase`.
-
-A map field's index entry is now encoded whole, as `{field}:{key}.{value}` passed through the same
-encoding a lookup applies to its value. Before, the map key was written as it was, so a lookup for a
-key with capitals, such as `en-US.spring-menu`, never matched. Index keys of maps whose keys have
-capitals change; reset and reseed, or save those records again. Identical index keys of one record,
-such as a list that holds the same value twice, are written and listed in the manifest once, so
-index repair accepts the record.
-
-Manifests now list the record's `ref:` keys and `deleting:` marker. Records written by 0.18.1 have
-neither: `remove` doesn't see their pointers, and index repair rejects the manifest of any record
-that holds a pointer or is deleting. Reset and reseed, or save every such record again, before
-relying on the guard. Key formats for primaries, indexes and the queue are unchanged.
-
-### 0.18.0 development cutover
-
-Version 0.18.0 changes every Tito-owned wall-clock instant to signed UTC Unix epoch milliseconds:
-automatic model `created_at` and `updated_at`, queue `timestamp` and `processedAt`, cluster
-heartbeats, lease deadlines, and assignment timestamps. Timestamp-bearing models receive automatic
-millisecond stamps unless a write explicitly uses `.timestamps(false)` to preserve application-owned
-values. No undeclared timestamp fields are added.
-
-Queue scheduling accepts the full signed `i64` instant range, including negative, zero, and early-epoch
-millisecond values. The requested due time is stored exactly, including its millisecond component;
-Tito never guesses units, scales caller values, or rounds them to whole seconds. Completed-retention
-cutoffs and cluster leases convert their configured `Duration` to milliseconds. Oversized durations
-saturate rather than wrapping into an earlier deadline. Fractional milliseconds round up so a
-configured positive span never becomes zero or expires early. Runtime sleeps, handler budgets, and monotonic measurements remain
-`Duration`/`Instant` values.
-
-TiKV transaction versions and native physical/logical timestamps do not change. Queue IDs keep their
-opaque microsecond prefix and UUID suffix; `created_at_millis()` converts that prefix to milliseconds
-and otherwise returns the exact millisecond queue timestamp without another scale conversion.
-
-The same candidate applies the canonical queue lifecycle vocabulary: `QueueEvent.status` uses
-`QueueEventStatus`, serialized as `{"type":"pending"}` or `{"type":"completed"}`. The field is
-required; neither the old `state` field nor a string-valued status is accepted. `QueueOwner.r#type`
-serializes as `type`, never `kind`. Owner records and queue envelopes reject unknown fields.
-Query methods are `scan_by_status` and `delete_by_status_before`; derived owner index segments use
-the scalar status type while the event itself retains its tagged status object. There are no old
-API aliases or dual readers.
-
-The same candidate replaces the old minimum-width decimal numeric-index keys with the signed-sortable
-encoding above. Ordinary, unique, array, and map numeric index writes and numeric queries use the
-same integer encoding. The previous implementation silently omitted floating-point and oversized
-unsigned values; these unsupported numbers now fail explicitly before any model/index mutation.
-Numeric secondary index keys and queue timestamp key segments use the same signed-sortable encoder
-and must be rebuilt through the authorized reset/reseed. Pending queue keys encode the due time;
-completed keys encode both the completion time and original due time. Due and completed-retention
-scans include their exact cutoff bucket across the full signed range, without adding one to the
-timestamp or overflowing at `i64::MAX`. Queue partition and unsigned transaction-version segments,
-opaque microsecond queue IDs, and handler dispatch/claim/redelivery policy are unchanged.
-
-This is an incompatible data and worker contract: instant units, numeric index keys, and queue JSON
-fields change. Do not mix 0.17.x and 0.18.x publishers, workers, model data, queue rows,
-cluster records, or backup artifacts. The pre-production cutover stops traffic and workers, verifies
-the authorized reset, and reseeds the complete affected state. There is no mixed-unit decoder,
-magnitude heuristic, migration, or legacy compatibility mode in 0.18.0.
-
-The current 0.18.0 candidate is a development change, not a registry publication or release tag.
-Applications can verify it through a reviewed exact Git revision and lockfile; a sibling checkout or
-a moving branch name is not a reproducible dependency pin. Publication is a separate authorized step.
-
-### 0.17.0 rollout
-
-Version 0.17.0 adds conditional unique indexes, exact unique lookup, and `assert_current`. Existing
-ordinary index keys remain unchanged. Models adopting a unique index must rewrite or reset their
-records before relying on the new key because Tito never invents index entries for stored rows.
-The release also includes 0.16.4's queue `Advance` outcome without changing persisted queue rows.
-
-Tito updates `created_at` and `updated_at` only when those fields are present in the model's
-serialized shape. Timestamp-bearing models keep automatic create/update timestamps. Models that do
-not declare the fields no longer acquire invisible JSON metadata that their Rust type cannot read
-back. Applications resetting or migrating from 0.16.2 should rewrite affected rows so primary and
-index values exactly match the declared model shape.
-
-### 0.16.3 rollout
-
-Version 0.16.3 preserves timestamp behavior for models that declare `created_at` or `updated_at`
-and stops adding undeclared timestamp fields. The primary and index key formats are unchanged. An
-application enforcing exact typed payloads must reset, migrate, or rewrite older rows that contain
-timestamp fields absent from their model before enabling that enforcement.
-
-### 0.16.2 rollout
-
-Publish and tag Tito 0.16.2, update the application dependency and lockfile to exactly that patch,
-and replace application-side ambiguous helper calls with `prefix_end` for prefix ranges or
-`key_after` for exact-row continuation. The primary, reverse-manifest, index-value, and cursor wire
-formats are unchanged, so a rolling binary deployment needs no data migration. Existing missing,
-orphaned, malformed, or unsafe manifest pairs now fail closed and must be repaired by an audited
-rebuild or removed by the planned prelaunch reset before those records can be updated or deleted.
-A clean reset/reseed recreates every manifest from the current index schema.
 
 ## Storage Maintenance
 
@@ -649,8 +458,8 @@ in one round trip.
 use std::sync::Arc;
 use std::time::Duration;
 use futures::FutureExt;
-use tito::{Queue, QueueConfig, QueueEvent, QueueHandlerOutcome, WorkerConfig};
-use tito::queue::run_worker;
+use tito::{ClusterWorkerConfig, Queue, QueueConfig, QueueEvent, QueueHandlerOutcome};
+use tito::queue::run_cluster_worker;
 
 let queue = Arc::new(Queue::new(
     db.clone(),
@@ -665,9 +474,9 @@ queue
     ))
     .await?;
 
-run_worker(
+run_cluster_worker(
     queue,
-    WorkerConfig::new(0..4),
+    ClusterWorkerConfig::from_env(),
     |event: QueueEvent<UserCreated>| async move {
         handle_user_created(event).await?;
         Ok(QueueHandlerOutcome::Acknowledge)
@@ -676,24 +485,29 @@ run_worker(
 ).await;
 ```
 
-`completed_retention` is an application policy supplied at queue construction. Tito's standalone
-worker or elected cluster coordinator removes bounded batches of older completed rows during its
-normal maintenance tick. Tito does not hardcode the duration, publish cleanup events, or delegate
-queue cleanup to the application's backup process.
+Every node runs `run_cluster_worker`. Each node records a heartbeat, one node holds the coordinator
+lease and assigns the partitions to the live nodes, and a node works only the partitions whose
+lease it holds. `ClusterWorkerConfig::from_env()` names the node from `POD_NAME` and `POD_UID`, or
+from the host name and process id, followed by a boot id.
+
+`completed_retention` is an application policy supplied at queue construction. The elected cluster
+coordinator removes bounded batches of older completed rows during its normal maintenance tick.
+Tito does not hardcode the duration, publish cleanup events, or delegate queue cleanup to the
+application's backup process.
 
 `Reschedule` is not an automatic retry policy. The application decides whether another event exists and supplies the complete event, including its timestamp. `Advance` is likewise an explicit application decision to move one logical event to a different typed payload. Tito creates no successor on its own and never interprets provider or domain state.
 
 An optional `QueueOwner` gives an application a bounded ownership index without changing due-time
 ordering. Tito writes that secondary key in the same transaction as publication, moves it atomically
-on acknowledge/reschedule/advance, and removes it with the queue row. Applications that must erase one
-owner's work can call `delete_by_owner_matching_in_tx`; the scan touches only that owner's Pending
-or Completed keys and the predicate can preserve a currently executing lifecycle invocation. Owner
-type and ID are opaque, non-empty strings bounded to 512 bytes each. They are routing/erasure
-metadata, not provider identity or domain state.
+on acknowledge/reschedule/advance, and removes it with the queue row. `scan_by_owner` pages one
+owner's Pending or Completed rows through that index. `delete_matching_in_tx` deletes, in the
+caller's transaction, the rows of one status that its predicate selects, a bounded page at a time,
+together with their owner keys. Owner type and ID are opaque, non-empty strings bounded to 512
+bytes each. They are routing metadata, not provider identity or domain state.
 
-A worker keeps pulling while its pass has more rows: after a full page it pulls the next page at once.
-It waits its poll interval only after a pass ends or a pull fails. `WorkerConfig::new` polls every
-second and `ClusterWorkerConfig::new` every 500 ms; both expose `poll_interval`.
+A partition worker keeps pulling while its pass has more rows: after a full page it pulls the next
+page at once. It waits its poll interval only after a pass ends or a pull fails.
+`ClusterWorkerConfig::new` polls every 500 ms and exposes `poll_interval`.
 
 Workers supervise each handler with a ten-minute timeout by default. Configure `handler_timeout` when a workload has a different bounded execution contract; the timeout is executor protection and never changes queue state or provider policy.
 Worker shutdown stops new pulls and handler starts, then drains every handler that already started
@@ -719,12 +533,13 @@ After the pass is exhausted, polling wraps to the oldest runnable key and those 
 eligible. The cursor is executor state only: it is not persisted and does not encode retry policy.
 
 Completed invocation history uses the retention supplied by the application in `QueueConfig`.
-Standalone workers and the elected cluster coordinator delete older rows in bounded passes. A full
-pass yields and continues immediately until the expired range is caught up; the 30-second interval
-applies only after a short pass. Maintenance uses the completed-status/processed-time key range
-directly, never inspects pending work, and has no retry, recovery, or provider semantics. Malformed
-values inside an expired completed-row key are also removed so corrupt terminal history cannot pin
-newer cleanup work.
+Retention and cluster lease durations convert to milliseconds, rounding a fractional millisecond up
+and saturating instead of wrapping. The elected cluster coordinator deletes older rows in bounded
+passes. A full pass yields and continues immediately until the expired range is caught up; the
+30-second interval applies only after a short pass. Maintenance uses the
+completed-status/processed-time key range directly, never inspects pending work, and has no retry,
+recovery, or provider semantics. Malformed values inside an expired completed-row key are also
+removed so corrupt terminal history cannot pin newer cleanup work.
 
 ### Transaction retry safety
 
@@ -735,21 +550,6 @@ rolls back pending work. Once native commit has started, cancellation only relea
 handle so its heartbeat can stop; cleanup never replays the closure or rolls back an uncertain
 commit. Callers still reconcile any interrupted command against its authoritative identity.
 
-### Upgrade contract
-
-This queue protocol removes the former retry/DLQ metadata, changes Pending storage keys to include
-the fixed-width event timestamp and enqueue-version fields, and writes owner secondary keys for
-newly published invocations. It is not wire-compatible with workers using an older queue protocol.
-Do not run old and new queue protocols together. Owner indexes are not inferred from pre-upgrade
-rows; a deployment that intends to use owner-bounded erasure must reset/drain those rows or ship an
-explicit one-time bridge before enabling that operation.
-
-Tito 0.16.4 adds `Advance` without changing the persisted `QueueEvent` JSON, queue key formats,
-state values, or owner indexes used by 0.16.3. The handler outcome itself is not stored. Upgrading
-from 0.16.3 therefore requires no queue storage migration.
-
-For the prelaunch cutover, stop publishers and workers, use the source release to drain Pending and clear its Failed/DLQ keyspaces, verify Pending is empty, deploy the replacement environment, and then restart publication and processing. A future nonempty production environment requires an explicit, separately named bridge release before this queue contract is enabled.
-
 ## Event Key Format
 
 ```
@@ -757,6 +557,12 @@ queue:pending:{partition:04}:{encode_index_integer(timestamp)}:{enqueue_version:
 queue:completed:{encode_index_integer(processed_at)}:{encode_index_integer(event_timestamp)}:{event_id}
 queue:owner:{base64url(type)}:{base64url(id)}:{status_type}:{base64url(queue_storage_key)}
 ```
+
+A queue event is stored as JSON with camelCase field names. Its `status` is `{"type":"pending"}` or
+`{"type":"completed"}`, its optional owner is `{"type": …, "id": …}`, and events and owners reject
+unknown fields. `timestamp`, `processedAt`, cluster heartbeats and lease deadlines are signed UTC
+epoch milliseconds. An event id is its publication time in microseconds, zero-padded to 20 digits,
+then a hyphen and a UUID; `created_at_millis()` reads that prefix as milliseconds.
 
 ## Verification
 
@@ -777,7 +583,7 @@ The library cases use the in-memory engine and cover model/index writes, exact i
 reference entries that hold no record data (an empty ordinary entry, an owner id in a unique entry), lists
 that read copies directly or fetch referenced records in one batched read in index order, `execute_ids` reading keys only,
 cursors and limits across pages, a missing record behind an entry, moved and removed entries, the
-fence keys each save, remove, batch and repair deletes and each guard a commit adds, queue
+fence keys each save, remove and batch deletes and each guard a commit adds, queue
 transitions, fixed partitions, exact signed millisecond scheduling and completion, exact inclusive
 cutoff buckets and signed extrema, configured retention, cluster ownership and leases, worker paging
 and shutdown, and ambiguous transaction outcomes. `tikv_native_orphan_lock_test` creates a real secondary lock after a definite primary
@@ -792,15 +598,12 @@ the unique entry its owner's id, while lists and the unique lookup return the re
 `execute_ids` returns its id. `tikv_native_index_values_test` covers both explicit modes together:
 stored bytes, ordinary and unique ranges, forward/reverse pages, copied reads without a primary
 fetch, key-only ID reads, validation of malformed copies, non-indexed updates and timestamps,
-rollback, changed and removed entries, unique claims and batch ownership swaps, shared guards,
-unguarded lists, and restore preserving record versions and exact primary bytes, including floating-point
-records, and refusing another unique owner. Ordinary reference record reads reject non-empty entry
-values, while key-only ID reads retain their value-free behavior.
-`tikv_native_queue_test`
-proves that cluster-worker and standalone-worker handlers complete their own pending row inside
-their transaction, that a duplicate delivery
-conflicts on that row and its retry skips, that a rolled-back handler leaves the row pending, and
-that `ack_in_tx` refuses events and keys it does not own without writing. `tikv_native_fence_test`
+rollback, changed and removed entries, unique claims and batch ownership swaps, shared guards and
+unguarded lists. Ordinary reference record reads reject non-empty entry values, while key-only ID
+reads retain their value-free behavior. `tikv_native_queue_test` proves that a cluster-worker
+handler completes its own pending row inside its transaction, that a duplicate delivery conflicts
+on that row and its retry skips, that a rolled-back handler leaves the row pending, and that
+`ack_in_tx` refuses events and keys it does not own without writing. `tikv_native_fence_test`
 proves on real TiKV:
 
 - every read by id in a transaction that writes conflicts with a save of its record, while index
@@ -824,6 +627,12 @@ Application-level primary-commit response loss, provider effects, backup and res
 application's complete-suite responsibility against the exact released Tito revision. The native
 client proof must cover both connection loss and gRPC status loss after an actual primary
 acknowledgement, with an unknown outcome, no rollback, and all accepted domain writes intact.
+
+## Release notes
+
+0.18.8 removes `get_for_update`, `TitoGuard::ForUpdate`, `rebuild_indexes_for_restore`,
+`delete_by_owner_matching_in_tx`, the standalone worker (`run_worker`, `WorkerConfig`) and unused
+exports, and stops storing `updated_at` on queue cluster lease and partition records.
 
 ## License
 

@@ -44,20 +44,8 @@ pub enum TitoError {
     #[error("Unique index '{index}' on model '{model}' is already owned")]
     UniqueViolation { model: String, index: String },
 
-    #[error("Relationship error: {0}")]
-    RelationshipError(String),
-
-    #[error("Job queue error: {0}")]
-    JobQueueError(String),
-
     #[error("Lock acquisition failed: {0}")]
     LockError(String),
-
-    #[error("Timeout: {0}")]
-    Timeout(String),
-
-    #[error("Backup error: {0}")]
-    BackupFailed(String),
 
     #[error("Unexpected error: {0}")]
     Internal(String),

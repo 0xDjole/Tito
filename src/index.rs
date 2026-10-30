@@ -153,16 +153,6 @@ impl<
         value: &T,
         json: &Value,
     ) -> Result<Vec<(String, Vec<u8>)>, TitoError> {
-        self.build_index_entries(&id, value, json, None)
-    }
-
-    pub(crate) fn build_index_entries(
-        &self,
-        id: &str,
-        value: &T,
-        json: &Value,
-        copy_bytes: Option<&[u8]>,
-    ) -> Result<Vec<(String, Vec<u8>)>, TitoError> {
         let owner = value.id().into_bytes();
         let indexes = value.indexes();
         let unique_indexes = value.unique_indexes();
@@ -171,11 +161,8 @@ impl<
             .chain(&unique_indexes)
             .any(|index| index.condition && index.value == TitoIndexValue::RecordCopy)
         {
-            match copy_bytes {
-                Some(bytes) => bytes.to_vec(),
-                None => serde_json::to_vec(json)
-                    .map_err(|error| TitoError::SerializationFailed(error.to_string()))?,
-            }
+            serde_json::to_vec(json)
+                .map_err(|error| TitoError::SerializationFailed(error.to_string()))?
         } else {
             Vec::new()
         };
@@ -183,7 +170,7 @@ impl<
         let mut seen = HashMap::new();
         for (unique, indexes) in [(false, indexes), (true, unique_indexes)] {
             for index in indexes {
-                for key in self.build_index_keys(id, std::slice::from_ref(&index), json, unique)? {
+                for key in self.build_index_keys(&id, std::slice::from_ref(&index), json, unique)? {
                     if let Some(previous) = seen.insert(key.clone(), index.value) {
                         if previous != index.value {
                             return Err(TitoError::IndexError(format!(

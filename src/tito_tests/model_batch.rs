@@ -118,18 +118,28 @@ async fn batch_replacement_rotates_unique_ownership_and_preserves_current_metada
     assert!(versions
         .iter()
         .all(|value| *value == versions[0] && *value != version));
-    engine
-        .transaction(|tx| {
-            let model = model.clone();
-            async move {
-                let current = model.get_versioned("a", Some(&tx)).await?.version;
-                assert_ne!(current, version);
-                assert_eq!(current, versions[0]);
-                model.rebuild_indexes_for_restore("a", &tx).await
-            }
-        })
+    let mut manifest = engine
+        .raw_json("reverse-index:table:unique-accounts:a")
         .await
-        .unwrap();
+        .unwrap()["value"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|key| key.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    let mut declared = model
+        .get_index_keys(
+            "table:unique-accounts:a".to_string(),
+            &next[0],
+            &serde_json::to_value(&next[0]).unwrap(),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect::<Vec<_>>();
+    manifest.sort();
+    declared.sort();
+    assert_eq!(manifest, declared);
     assert_eq!(unique_owner(&engine, &b.email).await, next[0]);
 }
 

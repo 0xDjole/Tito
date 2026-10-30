@@ -30,7 +30,6 @@ impl<T> TitoModelConstraints for T where
 pub type TitoKey = Vec<u8>;
 pub type TitoValue = Vec<u8>;
 pub type TitoKvPair = (TitoKey, TitoValue);
-pub type TitoRange = Range<TitoKey>;
 
 pub(crate) fn validate_delete_range(start: &[u8], end: &[u8]) -> Result<(), TitoError> {
     if start.is_empty() || end.is_empty() {
@@ -98,7 +97,6 @@ pub trait TitoEngine: Send + Sync + Clone {
 pub enum TitoGuard {
     Shared,
     Exclusive,
-    ForUpdate,
     Written,
 }
 
@@ -142,19 +140,6 @@ pub trait TitoTransaction: Send + Sync {
     async fn rollback(self) -> Result<(), TitoError>;
 }
 
-pub struct TitoLockItem {
-    pub key: String,
-    pub value: String,
-}
-
-pub struct TitoUtilsConnectPayload {
-    pub uri: String,
-}
-
-pub struct TitoUtilsConnectInput {
-    pub payload: TitoUtilsConnectPayload,
-}
-
 #[derive(Debug, Clone)]
 pub enum TitoIndexFieldType {
     String,
@@ -177,13 +162,6 @@ pub struct TitoIndexField {
     pub r#type: TitoIndexFieldType,
 }
 
-#[derive(Debug, Clone)]
-pub struct TitoTemporalIndex {
-    pub from_field: String,
-    pub to_field: String,
-    pub range_field: String,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TitoIndexValue {
     RecordCopy,
@@ -195,12 +173,6 @@ pub struct TitoIndexConfig {
     pub fields: Vec<TitoIndexField>,
     pub name: String,
     pub value: TitoIndexValue,
-}
-
-#[derive(Debug, Clone)]
-pub struct TitoRelIndexConfig {
-    pub name: String,
-    pub field: String,
 }
 
 pub trait TitoModelTrait {
@@ -223,37 +195,8 @@ pub struct ReverseIndex {
     pub version: TitoRecordVersion,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TitoId {
-    id: String,
-    r#type: String,
-}
-
-impl TitoId {
-    pub fn new(id: &str, r#type: &str) -> TitoId {
-        TitoId {
-            id: id.to_string(),
-            r#type: r#type.to_string(),
-        }
-    }
-}
-
-impl std::fmt::Display for TitoId {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}:{}", self.r#type, self.id)
-    }
-}
-
 #[derive(Serialize, Deserialize, Debug)]
 pub struct TitoScanPayload {
-    pub start: String,
-    pub end: Option<String>,
-    pub limit: Option<u32>,
-    pub cursor: Option<String>,
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
-pub struct TitoFindPayload {
     pub start: String,
     pub end: Option<String>,
     pub limit: Option<u32>,
@@ -266,21 +209,6 @@ pub struct TitoFindByIndexPayload {
     pub values: Vec<String>,
     pub limit: Option<u32>,
     pub cursor: Option<String>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct TitoFindByMultipleIndexPayload {
-    pub queries: Vec<TitoFindByMultipleIndexQuery>,
-    pub limit: Option<u32>,
-    pub cursor: Option<String>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct TitoFindByMultipleIndexQuery {
-    pub index: String,
-    pub edge_name: Option<String>,
-    pub values: Vec<String>,
-    pub end: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -319,16 +247,5 @@ impl<T> TitoPaginated<T> {
 }
 
 pub type DBUuid = Uuid;
-
-#[derive(Debug, Clone)]
-pub struct PartitionConfig {
-    pub partition: u32,
-}
-
-impl PartitionConfig {
-    pub fn new(partition: u32) -> Self {
-        Self { partition }
-    }
-}
 
 pub const PARTITION_DIGITS: usize = 4;

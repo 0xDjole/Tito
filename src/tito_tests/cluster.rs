@@ -27,39 +27,42 @@ async fn cluster_clock_and_subsecond_lease_durations_use_epoch_milliseconds() {
             .unwrap(),
     )
     .unwrap();
-    assert!((before..=after).contains(&lease.updated_at));
-    assert_eq!(lease.lease_until - lease.updated_at, 60_501);
+    assert!((before + 60_501..=after + 60_501).contains(&lease.lease_until));
 
     engine
         .put_json(
-            "tito:queue:cluster:nodes:dormant",
-            &json!({"node_id": "dormant", "heartbeat_at": before - 70_000}),
+            "tito:queue:cluster:nodes:zz-dormant",
+            &json!({"node_id": "zz-dormant", "heartbeat_at": before - 70_000}),
         )
         .await;
     engine
         .put_json(
-            "tito:queue:cluster:nodes:expired",
-            &json!({"node_id": "expired", "heartbeat_at": before - 120_000}),
+            "tito:queue:cluster:nodes:zz-expired",
+            &json!({"node_id": "zz-expired", "heartbeat_at": before - 120_000}),
         )
         .await;
-    let active = queue.active_cluster_workers(&config).await.unwrap();
-    assert_eq!(active.len(), 1);
-    assert_eq!(active[0].node_id, config.node_id);
 
-    queue.rebalance_cluster_partitions(&config).await.unwrap();
+    let assignments = queue.rebalance_cluster_partitions(&config).await.unwrap();
+    assert_eq!(assignments.len(), 1);
+    assert_eq!(
+        assignments[0].desired_node_id.as_deref(),
+        Some(config.node_id.as_str())
+    );
     assert!(
         engine
-            .contains_key("tito:queue:cluster:nodes:dormant")
+            .contains_key("tito:queue:cluster:nodes:zz-dormant")
             .await
     );
     assert!(
         !engine
-            .contains_key("tito:queue:cluster:nodes:expired")
+            .contains_key("tito:queue:cluster:nodes:zz-expired")
             .await
     );
+    let before_sync = Utc::now().timestamp_millis();
     let owned = queue.sync_cluster_partition_leases(&config).await.unwrap();
+    let after_sync = Utc::now().timestamp_millis();
     assert_eq!(owned.len(), 1);
-    assert_eq!(owned[0].lease_until - owned[0].updated_at, 60_501);
+    assert!((before_sync + 60_501..=after_sync + 60_501).contains(&owned[0].lease_until));
     assert_eq!(
         queue.owned_cluster_partitions(&config).await.unwrap(),
         vec![0]
@@ -92,10 +95,12 @@ async fn cluster_lease_durations_round_fractional_milliseconds_up() {
         (Duration::from_nanos(1_501_000_001), 1_502),
     ] {
         config.lease_ttl = duration;
+        let before = Utc::now().timestamp_millis();
         assert!(queue
             .try_acquire_cluster_coordinator(&config)
             .await
             .unwrap());
+        let after = Utc::now().timestamp_millis();
         let lease: ClusterCoordinatorLease = serde_json::from_value(
             engine
                 .raw_json("tito:queue:cluster:coordinator")
@@ -103,7 +108,7 @@ async fn cluster_lease_durations_round_fractional_milliseconds_up() {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(lease.lease_until - lease.updated_at, expected_ms);
+        assert!((before + expected_ms..=after + expected_ms).contains(&lease.lease_until));
     }
 }
 
@@ -127,11 +132,12 @@ async fn cluster_oversized_durations_saturate_without_wrapping_clock_values() {
     )
     .unwrap();
     assert_eq!(lease.lease_until, i64::MAX);
+    let assignments = queue.rebalance_cluster_partitions(&config).await.unwrap();
+    assert_eq!(assignments.len(), 1);
     assert_eq!(
-        queue.active_cluster_workers(&config).await.unwrap().len(),
-        1
+        assignments[0].desired_node_id.as_deref(),
+        Some("large-duration-node")
     );
-    queue.rebalance_cluster_partitions(&config).await.unwrap();
     let owned = queue.sync_cluster_partition_leases(&config).await.unwrap();
     assert_eq!(owned[0].lease_until, i64::MAX);
 }
@@ -159,7 +165,6 @@ async fn cluster_coordinator_lease_blocks_other_nodes_until_expired() {
     let expired = ClusterCoordinatorLease {
         owner_node_id: "node-a".to_string(),
         lease_until: Utc::now().timestamp_millis() - 1,
-        updated_at: Utc::now().timestamp_millis() - 2,
     };
     engine
         .put_json("tito:queue:cluster:coordinator", &json!(expired))
@@ -180,15 +185,6 @@ async fn cluster_rebalance_assigns_and_syncs_partitions_to_active_nodes() {
 
     queue.heartbeat_cluster_worker(&node_b).await.unwrap();
     queue.heartbeat_cluster_worker(&node_a).await.unwrap();
-
-    let active = queue.active_cluster_workers(&node_a).await.unwrap();
-    assert_eq!(
-        active
-            .iter()
-            .map(|node| node.node_id.as_str())
-            .collect::<Vec<_>>(),
-        vec!["node-a", "node-b"]
-    );
 
     let assignments = queue.rebalance_cluster_partitions(&node_a).await.unwrap();
     assert_eq!(assignments.len(), 4);

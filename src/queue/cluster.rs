@@ -68,7 +68,6 @@ pub struct ClusterWorkerNode {
 pub struct ClusterCoordinatorLease {
     pub owner_node_id: String,
     pub lease_until: i64,
-    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -78,19 +77,16 @@ pub struct ClusterPartitionAssignment {
     pub owner_node_id: Option<String>,
     pub lease_until: i64,
     pub generation: u64,
-    pub updated_at: i64,
 }
 
 impl ClusterPartitionAssignment {
     fn new(partition: u32) -> Self {
-        let now = Utc::now().timestamp_millis();
         Self {
             partition,
             desired_node_id: None,
             owner_node_id: None,
             lease_until: 0,
             generation: 0,
-            updated_at: now,
         }
     }
 
@@ -205,47 +201,9 @@ impl<E: TitoEngine> Queue<E> {
                     let lease = ClusterCoordinatorLease {
                         owner_node_id: config.node_id.clone(),
                         lease_until: now.saturating_add(duration_millis(config.lease_ttl)),
-                        updated_at: now,
                     };
                     Self::put_json(&tx, &key, &lease).await?;
                     Ok(true)
-                }
-            })
-            .await
-    }
-
-    pub async fn active_cluster_workers(
-        &self,
-        config: &ClusterWorkerConfig,
-    ) -> Result<Vec<ClusterWorkerNode>, TitoError> {
-        let config = config.clone();
-        self.engine
-            .transaction(|tx| {
-                let config = config.clone();
-                async move {
-                    let now = Utc::now().timestamp_millis();
-                    let stale_before = now.saturating_sub(duration_millis(config.lease_ttl));
-                    let prefix = self.nodes_prefix();
-                    let entries = tx
-                        .scan(
-                            prefix.as_bytes()..Self::prefix_end(&prefix).as_slice(),
-                            u32::MAX,
-                        )
-                        .await
-                        .map_err(|e| {
-                            TitoError::QueryFailed(format!("Scan cluster queue nodes: {}", e))
-                        })?;
-
-                    let mut nodes = Vec::new();
-                    for (_, value) in entries {
-                        let node = serde_json::from_slice::<ClusterWorkerNode>(&value)
-                            .map_err(|e| TitoError::DeserializationFailed(e.to_string()))?;
-                        if node.heartbeat_at >= stale_before {
-                            nodes.push(node);
-                        }
-                    }
-                    nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
-                    Ok(nodes)
                 }
             })
             .await
@@ -327,7 +285,6 @@ impl<E: TitoEngine> Queue<E> {
                             assignment.generation = assignment.generation.saturating_add(1);
                         }
 
-                        assignment.updated_at = now;
                         Self::put_json(&tx, &key, &assignment).await?;
                         assignments.push(assignment);
                     }
@@ -380,7 +337,6 @@ impl<E: TitoEngine> Queue<E> {
                             assignment.owner_node_id = None;
                             assignment.lease_until = 0;
                             assignment.generation = assignment.generation.saturating_add(1);
-                            assignment.updated_at = now;
                             Self::put_json(&tx, &key, &assignment).await?;
                             continue;
                         }
@@ -394,7 +350,6 @@ impl<E: TitoEngine> Queue<E> {
                             assignment.owner_node_id = Some(config.node_id.clone());
                             assignment.lease_until =
                                 now.saturating_add(duration_millis(config.lease_ttl));
-                            assignment.updated_at = now;
                             Self::put_json(&tx, &key, &assignment).await?;
                             owned.push(assignment);
                         }

@@ -68,64 +68,6 @@ async fn get_exclusive_requires_an_existing_record_and_changes_no_stored_byte() 
 }
 
 #[tokio::test]
-async fn get_for_update_preserves_record_bytes_and_version_and_protects_all_readers() {
-    let engine = engine();
-    let model = shops(&engine);
-    save_shop(&engine, shop("s1")).await.unwrap();
-    let primary = engine.raw_bytes("table:shops:s1").await.unwrap();
-    let manifest = engine
-        .raw_bytes("reverse-index:table:shops:s1")
-        .await
-        .unwrap();
-    let version = model.get_versioned("s1", None).await.unwrap().version;
-
-    let tx = engine.begin_transaction().await.unwrap();
-    assert!(matches!(
-        model.get_for_update("missing", &tx).await,
-        Err(TitoError::NotFound(_))
-    ));
-    model.get_exclusive("s1", &tx).await.unwrap();
-    assert_eq!(model.get_for_update("s1", &tx).await.unwrap(), shop("s1"));
-    model.get_exclusive("s1", &tx).await.unwrap();
-    model.get("s1").execute(Some(&tx)).await.unwrap();
-    assert_eq!(
-        commit_writes(&engine, tx).await,
-        record_fence_keys("shops", "s1")
-            .into_iter()
-            .map(RecordedWrite::Delete)
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(engine.raw_bytes("table:shops:s1").await.unwrap(), primary);
-    assert_eq!(
-        engine
-            .raw_bytes("reverse-index:table:shops:s1")
-            .await
-            .unwrap(),
-        manifest
-    );
-    assert_eq!(
-        model.get_versioned("s1", None).await.unwrap().version,
-        version
-    );
-
-    save_shop(&engine, shop("s2")).await.unwrap();
-    let tx = engine.begin_transaction().await.unwrap();
-    model.get_for_update("s1", &tx).await.unwrap();
-    model.get("s2").execute(Some(&tx)).await.unwrap();
-    save_shop(
-        &engine,
-        Shop {
-            name: "Changed".into(),
-            ..shop("s2")
-        },
-    )
-    .await
-    .unwrap();
-    assert!(matches!(tx.commit().await, Err(TitoError::Retryable(_))));
-    assert!(engine.keys_with_prefix("fence:").await.is_empty());
-}
-
-#[tokio::test]
 async fn a_read_by_id_in_a_writing_transaction_deletes_one_shared_key_of_its_pick_at_commit() {
     let engine = engine();
     let model = shops(&engine);
@@ -579,7 +521,7 @@ async fn every_attempt_of_a_retried_transaction_guards_with_its_own_pick_and_sta
 }
 
 #[tokio::test]
-async fn every_save_replace_remove_and_repair_deletes_the_seventeen_escaped_fence_keys() {
+async fn every_save_replace_and_remove_deletes_the_seventeen_escaped_fence_keys() {
     let engine = engine();
     let model = shops(&engine);
     let tag_model = tags(&engine);
@@ -619,10 +561,6 @@ async fn every_save_replace_remove_and_repair_deletes_the_seventeen_escaped_fenc
         sorted(escaped.clone())
     );
     assert_eq!(
-        fence_writes(&repair_writes(&engine, &model, id).await),
-        escaped
-    );
-    assert_eq!(
         fence_writes(&remove_writes(&engine, &model, id).await),
         escaped
     );
@@ -634,10 +572,6 @@ async fn every_save_replace_remove_and_repair_deletes_the_seventeen_escaped_fenc
     );
     assert_eq!(
         fence_writes(&save_writes(&engine, &tag_model, tag("t1", "storage")).await),
-        tag_keys
-    );
-    assert_eq!(
-        fence_writes(&repair_writes(&engine, &tag_model, "t1").await),
         tag_keys
     );
     assert_eq!(
@@ -671,12 +605,6 @@ async fn a_manifest_may_not_list_a_fence_key() {
                 .await,
             Err(TitoError::IndexError(_))
         ));
-        let tx = engine.begin_transaction().await.unwrap();
-        assert!(matches!(
-            model.rebuild_indexes_for_restore("s1", &tx).await,
-            Err(TitoError::IndexError(_))
-        ));
-        tx.rollback().await.unwrap();
         assert_eq!(engine.raw_json(reverse_key).await.unwrap(), listed);
     }
 }
@@ -1012,34 +940,50 @@ async fn get_preserves_backend_read_error() {
 }
 
 #[tokio::test]
-async fn find_paginates_with_cursor() {
+async fn scan_cursor_does_not_skip_adjacent_prefix_keys() {
     let engine = engine();
     let model = engine.clone().model::<Author>(TitoModelOptions::default());
     for id in ["a1", "a2", "a20", "a3"] {
         save_author(&engine, author(id, &format!("{id}@example.com"), 1, "org")).await;
     }
 
-    let first = model
-        .find(TitoFindPayload {
-            start: "".to_string(),
-            end: None,
-            limit: Some(2),
-            cursor: None,
-        })
+    let tx = engine.begin_transaction().await.unwrap();
+    let (first_items, has_more) = model
+        .scan(
+            TitoScanPayload {
+                start: "table:authors:".to_string(),
+                end: None,
+                limit: Some(2),
+                cursor: None,
+            },
+            &tx,
+        )
         .await
         .unwrap();
-    assert_eq!(first.items.len(), 2);
+    let first = model.to_paginated_items(first_items, has_more).unwrap();
+    assert_eq!(
+        first
+            .items
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>(),
+        vec!["a1", "a2"]
+    );
     assert!(first.cursor.is_some());
 
-    let second = model
-        .find(TitoFindPayload {
-            start: "".to_string(),
-            end: None,
-            limit: Some(2),
-            cursor: first.cursor,
-        })
+    let (second_items, has_more) = model
+        .scan(
+            TitoScanPayload {
+                start: "table:authors:".to_string(),
+                end: None,
+                limit: Some(2),
+                cursor: first.cursor,
+            },
+            &tx,
+        )
         .await
         .unwrap();
+    let second = model.to_paginated_items(second_items, has_more).unwrap();
     assert_eq!(
         second
             .items
@@ -1206,22 +1150,27 @@ async fn scan_validates_bounds_and_nonzero_limit() {
 }
 
 #[tokio::test]
-async fn find_honors_explicit_exclusive_end_bound() {
+async fn scan_honors_explicit_exclusive_end_bound() {
     let engine = engine();
     let model = engine.clone().model::<Author>(TitoModelOptions::default());
     for id in ["a1", "a2", "a3"] {
         save_author(&engine, author(id, &format!("{id}@example.com"), 1, "org")).await;
     }
 
-    let page = model
-        .find(TitoFindPayload {
-            start: "a1".to_string(),
-            end: Some("a3".to_string()),
-            limit: None,
-            cursor: None,
-        })
+    let tx = engine.begin_transaction().await.unwrap();
+    let (items, has_more) = model
+        .scan(
+            TitoScanPayload {
+                start: "table:authors:a1".to_string(),
+                end: Some("table:authors:a3".to_string()),
+                limit: None,
+                cursor: None,
+            },
+            &tx,
+        )
         .await
         .unwrap();
+    let page = model.to_paginated_items(items, has_more).unwrap();
 
     assert_eq!(
         page.items
@@ -1350,23 +1299,28 @@ async fn scans_fail_on_malformed_json_and_non_utf8_storage_keys() {
 }
 
 #[tokio::test]
-async fn paginated_find_and_get_many_fail_on_schema_incompatible_rows() {
+async fn paginated_scan_and_get_many_fail_on_schema_incompatible_rows() {
     let engine = engine();
     let model = engine.clone().model::<Author>(TitoModelOptions::default());
     engine
         .put_json("table:authors:incompatible", &json!({"id": "incompatible"}))
         .await;
 
-    assert!(matches!(
-        model
-            .find(TitoFindPayload {
-                start: String::new(),
+    let tx = engine.begin_transaction().await.unwrap();
+    let (items, has_more) = model
+        .scan(
+            TitoScanPayload {
+                start: "table:authors:".to_string(),
                 end: None,
                 limit: None,
                 cursor: None,
-            })
-            .await
-            .unwrap_err(),
+            },
+            &tx,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        model.to_paginated_items(items, has_more).unwrap_err(),
         TitoError::DeserializationFailed(_)
     ));
     assert!(matches!(
@@ -1475,18 +1429,22 @@ async fn model_tx_runs_through_engine_transaction() {
 }
 
 #[tokio::test]
-async fn invalid_find_cursor_returns_deserialization_error() {
+async fn invalid_scan_cursor_returns_deserialization_error() {
     let engine = engine();
     let model = engine.clone().model::<Author>(TitoModelOptions::default());
     save_author(&engine, author("a1", "a1@example.com", 1, "org")).await;
 
+    let tx = engine.begin_transaction().await.unwrap();
     let error = model
-        .find(TitoFindPayload {
-            start: "".to_string(),
-            end: None,
-            limit: Some(1),
-            cursor: Some("not-base64".to_string()),
-        })
+        .scan(
+            TitoScanPayload {
+                start: "table:authors:".to_string(),
+                end: None,
+                limit: Some(1),
+                cursor: Some("not-base64".to_string()),
+            },
+            &tx,
+        )
         .await
         .unwrap_err();
 
@@ -1494,18 +1452,14 @@ async fn invalid_find_cursor_returns_deserialization_error() {
 }
 
 #[test]
-fn model_options_partition_config_cursor_and_id_helpers_are_stable() {
+fn model_options_paginated_and_cursor_helpers_are_stable() {
     let model = engine().model::<Author>(TitoModelOptions::with_partitions(12));
-    let partition = PartitionConfig::new(7);
     let paginated = TitoPaginated::new(vec!["a".to_string()], Some("cursor".to_string()));
-    let id = TitoId::new("a1", "author");
     let cursor = TitoCursor { ids: vec![None] };
 
     assert_eq!(model.partition_count, 12);
-    assert_eq!(partition.partition, 7);
     assert_eq!(paginated.items, vec!["a"]);
     assert_eq!(paginated.cursor.as_deref(), Some("cursor"));
-    assert_eq!(id.to_string(), "author:a1");
     assert!(cursor.first_id().is_err());
 }
 
@@ -1513,10 +1467,6 @@ fn model_options_partition_config_cursor_and_id_helpers_are_stable() {
 fn model_key_helpers_extract_last_key_segment() {
     let model = engine().model::<Author>(TitoModelOptions::default());
 
-    assert_eq!(
-        model.get_id_from_table("table:authors:a1".to_string()),
-        "a1"
-    );
     assert_eq!(
         model.get_last_id("index:author-by-email:email:x:table:authors:a1".to_string()),
         Some("a1".to_string())

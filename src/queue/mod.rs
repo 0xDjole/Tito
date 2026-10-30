@@ -16,7 +16,6 @@ pub use types::{
     QueueHandlerResult, QueueOwner, QueuePullCursor, QueuePullPage, QueueScanPage,
     MAX_QUEUE_OWNER_COMPONENT_BYTES,
 };
-pub use worker::{run_worker, WorkerConfig};
 
 use std::time::Duration;
 
@@ -1047,60 +1046,6 @@ impl<E: TitoEngine> Queue<E> {
         })
     }
 
-    pub async fn delete_by_owner_matching_in_tx<T, F>(
-        &self,
-        owner: &QueueOwner,
-        status: QueueEventStatus,
-        limit: u32,
-        tx: &E::Transaction,
-        matches: F,
-    ) -> Result<usize, TitoError>
-    where
-        T: DeserializeOwned + Clone + Send + Sync + 'static,
-        F: Fn(&QueueEvent<T>) -> Result<bool, TitoError> + Send + Sync,
-    {
-        let prefix = self.owner_status_prefix(owner, status)?;
-        let entries = Self::scan_queue_entries(
-            tx,
-            prefix.as_bytes().to_vec(),
-            Self::prefix_end(&prefix),
-            limit.max(1),
-        )
-        .await
-        .map_err(|error| TitoError::QueryFailed(format!("Scan queue owner index: {error}")))?;
-        let mut deleted = 0usize;
-
-        for (index_key, _) in entries {
-            let storage_key = Self::indexed_storage_key(&index_key, &prefix)?;
-            if !storage_key.starts_with(self.status_prefix(status).as_bytes()) {
-                return Err(TitoError::DeserializationFailed(
-                    "Queue owner index points outside its queue or status".into(),
-                ));
-            }
-            let Some(value) = tx.get(&storage_key).await.map_err(|error| {
-                TitoError::QueryFailed(format!("Get owner-indexed queue event: {error}"))
-            })?
-            else {
-                Self::delete_entry(tx, &index_key).await?;
-                deleted += 1;
-                continue;
-            };
-            let event = Self::read_event_from_value::<T>(&value)?;
-            if event.status != status || event.owner.as_ref() != Some(owner) {
-                return Err(TitoError::InvalidInput(
-                    "Queue owner index conflicts with its event".to_string(),
-                ));
-            }
-            if matches(&event)? {
-                Self::delete_entry(tx, &storage_key).await?;
-                Self::delete_entry(tx, &index_key).await?;
-                deleted += 1;
-            }
-        }
-
-        Ok(deleted)
-    }
-
     fn validate_scan_cursor(prefix: &str, cursor: Option<&[u8]>) -> Result<(), TitoError> {
         if cursor.is_some_and(|value| !value.starts_with(prefix.as_bytes())) {
             return Err(TitoError::InvalidInput(
@@ -1665,116 +1610,5 @@ mod tests {
             ));
             assert!(isolated_engine.contains_key(&dangling_index).await);
         }
-    }
-
-    #[tokio::test]
-    async fn owner_index_deletes_only_the_owned_invocations_across_queue_statuses() {
-        let engine = MemoryEngine::default();
-        let queue = queue(engine.clone());
-        let now = Utc::now().timestamp_millis();
-        let target = QueueOwner::new("store", "target:with/slashes").unwrap();
-        let foreign = QueueOwner::new("store", "foreign").unwrap();
-
-        for (name, owner) in [
-            ("acknowledged", target.clone()),
-            ("rescheduled", target.clone()),
-            ("kept", target.clone()),
-            ("foreign", foreign.clone()),
-        ] {
-            queue
-                .publish(
-                    QueueEvent::new(format!("entry:{name}"), payload(name), now).with_owner(owner),
-                )
-                .await
-                .unwrap();
-        }
-
-        let due = queue.pull::<Payload>(0, None, 10).await.unwrap().events;
-        let (ack_key, _) = due
-            .iter()
-            .find(|(_, event)| event.payload.name == "acknowledged")
-            .unwrap();
-        queue.ack(ack_key).await.unwrap();
-        let (reschedule_key, rescheduled) = due
-            .iter()
-            .find(|(_, event)| event.payload.name == "rescheduled")
-            .unwrap();
-        queue
-            .reschedule(reschedule_key, rescheduled.rescheduled(now + 60_000))
-            .await
-            .unwrap();
-
-        let deleted_pending = engine
-            .transaction(|tx| {
-                let queue = queue.clone();
-                let target = target.clone();
-                async move {
-                    queue
-                        .delete_by_owner_matching_in_tx::<Payload, _>(
-                            &target,
-                            QueueEventStatus::Pending,
-                            100,
-                            &tx,
-                            |event| Ok(event.payload.name != "kept"),
-                        )
-                        .await
-                }
-            })
-            .await
-            .unwrap();
-        assert_eq!(deleted_pending, 1);
-
-        let deleted_completed = engine
-            .transaction(|tx| {
-                let queue = queue.clone();
-                let target = target.clone();
-                async move {
-                    queue
-                        .delete_by_owner_matching_in_tx::<Payload, _>(
-                            &target,
-                            QueueEventStatus::Completed,
-                            100,
-                            &tx,
-                            |_| Ok(true),
-                        )
-                        .await
-                }
-            })
-            .await
-            .unwrap();
-        assert_eq!(deleted_completed, 2);
-
-        let pending = queue
-            .scan_by_status::<Payload>(QueueEventStatus::Pending, None, 10)
-            .await
-            .unwrap();
-        let mut names = pending
-            .events
-            .into_iter()
-            .map(|(_, event)| event.payload.name)
-            .collect::<Vec<_>>();
-        names.sort();
-        assert_eq!(names, vec!["foreign", "kept"]);
-        assert!(queue
-            .scan_by_status::<Payload>(QueueEventStatus::Completed, None, 10)
-            .await
-            .unwrap()
-            .events
-            .is_empty());
-
-        let target_pending_prefix = queue
-            .owner_status_prefix(&target, QueueEventStatus::Pending)
-            .unwrap();
-        let target_completed_prefix = queue
-            .owner_status_prefix(&target, QueueEventStatus::Completed)
-            .unwrap();
-        assert_eq!(
-            engine.keys_with_prefix(&target_pending_prefix).await.len(),
-            1
-        );
-        assert!(engine
-            .keys_with_prefix(&target_completed_prefix)
-            .await
-            .is_empty());
     }
 }

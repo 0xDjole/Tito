@@ -200,7 +200,7 @@ async fn named_queue_rejects_cross_queue_status_and_partition_cursors() {
 }
 
 #[tokio::test]
-async fn named_owner_deletion_cannot_follow_an_index_into_another_queue() {
+async fn named_owner_reads_cannot_follow_an_index_into_another_queue() {
     let engine = MemoryEngine::default();
     let a = named(&engine, "a");
     let b = named(&engine, "b");
@@ -221,23 +221,6 @@ async fn named_owner_deletion_cannot_follow_an_index_into_another_queue() {
     engine.put_raw(&corrupt_index, Vec::new()).await;
     assert!(a
         .scan_by_owner::<Value>(&owner, QueueEventStatus::Pending, None, 10)
-        .await
-        .is_err());
-    assert!(engine
-        .transaction(|tx| {
-            let a = a.clone();
-            let owner = owner.clone();
-            async move {
-                a.delete_by_owner_matching_in_tx::<Value, _>(
-                    &owner,
-                    QueueEventStatus::Pending,
-                    10,
-                    &tx,
-                    |_| Ok(true),
-                )
-                .await
-            }
-        })
         .await
         .is_err());
     assert!(engine.contains_key(&b_key).await);
@@ -288,14 +271,6 @@ async fn named_queue_cluster_coordination_is_independent() {
     assert!(b.try_acquire_cluster_coordinator(&second).await.unwrap());
     assert!(!a.try_acquire_cluster_coordinator(&second).await.unwrap());
     assert!(!b.try_acquire_cluster_coordinator(&first).await.unwrap());
-    assert_eq!(
-        a.active_cluster_workers(&first).await.unwrap()[0].node_id,
-        "first-node"
-    );
-    assert_eq!(
-        b.active_cluster_workers(&second).await.unwrap()[0].node_id,
-        "second-node"
-    );
     a.rebalance_cluster_partitions(&first).await.unwrap();
     b.rebalance_cluster_partitions(&second).await.unwrap();
     a.sync_cluster_partition_leases(&first).await.unwrap();

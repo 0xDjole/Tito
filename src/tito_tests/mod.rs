@@ -1,13 +1,11 @@
 use crate::encode_index_string;
-use crate::queue::{
-    run_worker, Queue, QueueConfig, QueueEvent, QueueEventStatus, QueueHandlerOutcome, WorkerConfig,
-};
+use crate::queue::{Queue, QueueConfig, QueueEvent, QueueEventStatus, QueueHandlerOutcome};
 use crate::test_support::{MemoryEngine, MemoryTransaction, RecordedWrite};
 use crate::types::TitoIndexValue;
 use crate::types::{
-    PartitionConfig, TitoCursor, TitoEngine, TitoFindByIndexPayload, TitoFindOneByIndexPayload,
-    TitoFindPayload, TitoId, TitoIndexConfig, TitoIndexField, TitoIndexFieldType, TitoModelOptions,
-    TitoModelTrait, TitoPaginated, TitoScanPayload, TitoTransaction,
+    TitoCursor, TitoEngine, TitoFindByIndexPayload, TitoFindOneByIndexPayload, TitoIndexConfig,
+    TitoIndexField, TitoIndexFieldType, TitoModelOptions, TitoModelTrait, TitoPaginated,
+    TitoScanPayload, TitoTransaction,
 };
 use crate::utils::{key_after, key_after_bytes, prefix_end, prefix_end_bytes};
 use crate::{ClusterCoordinatorLease, ClusterWorkerConfig, TitoError};
@@ -415,18 +413,6 @@ async fn remove_writes<T: crate::types::TitoModelConstraints>(
     engine.take_recorded_writes().await
 }
 
-async fn repair_writes<T: crate::types::TitoModelConstraints>(
-    engine: &MemoryEngine,
-    model: &crate::TitoModel<MemoryEngine, T>,
-    id: &str,
-) -> Vec<RecordedWrite> {
-    engine.start_recording_writes().await;
-    let tx = engine.begin_transaction().await.unwrap();
-    model.rebuild_indexes_for_restore(id, &tx).await.unwrap();
-    tx.commit().await.unwrap();
-    engine.take_recorded_writes().await
-}
-
 fn sorted(mut keys: Vec<String>) -> Vec<String> {
     keys.sort();
     keys
@@ -612,7 +598,6 @@ mod cluster;
 mod custom_index;
 mod index;
 mod index_entries;
-mod index_restore;
 mod model;
 mod model_batch;
 mod numeric_index;
