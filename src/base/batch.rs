@@ -237,10 +237,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         for (key, value) in writes {
             tx.put(key, value).await?;
         }
-        for replacement in &prepared {
-            tx.guard(&T::table(), &replacement.id, TitoGuard::Written)
-                .await;
-        }
         Ok(prepared
             .into_iter()
             .map(|replacement| replacement.stored)

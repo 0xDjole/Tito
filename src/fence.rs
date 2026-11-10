@@ -1,12 +1,16 @@
 use crate::key_encoder::encode_index_string;
 use crate::types::TitoGuard;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 pub(crate) const FENCE_KEY_PREFIX: &str = "fence:";
 
 pub(crate) const SHARED_FENCE_KEYS: u16 = 16;
 
-pub(crate) type Guards = BTreeMap<(String, String), TitoGuard>;
+#[derive(Default)]
+pub(crate) struct Guards {
+    records: BTreeMap<(String, String), TitoGuard>,
+    written_keys: HashSet<Vec<u8>>,
+}
 
 fn fence_key_base(table: &str, id: &str) -> String {
     format!(
@@ -34,23 +38,36 @@ pub(crate) fn record_fence_keys(table: &str, id: &str) -> Vec<String> {
 
 pub(crate) fn note_guard(guards: &mut Guards, table: &str, id: &str, guard: TitoGuard) {
     let held = guards
+        .records
         .entry((table.to_string(), id.to_string()))
         .or_insert(guard);
     *held = (*held).max(guard);
 }
 
+pub(crate) fn note_write(guards: &mut Guards, key: &[u8]) {
+    if key.starts_with(FENCE_KEY_PREFIX.as_bytes()) {
+        guards.written_keys.insert(key.to_vec());
+    }
+}
+
 pub(crate) fn guard_keys(guards: &Guards, wrote: bool, pick: u64) -> Vec<String> {
-    let exclusive = guards.values().any(|guard| *guard == TitoGuard::Exclusive);
+    let exclusive = guards
+        .records
+        .values()
+        .any(|guard| *guard == TitoGuard::Exclusive);
     if !wrote && !exclusive {
         return Vec::new();
     }
     let number = (pick % u64::from(SHARED_FENCE_KEYS)) as u16;
     guards
+        .records
         .iter()
-        .filter_map(|((table, id), guard)| match guard {
-            TitoGuard::Shared => Some(shared_fence_key(table, id, number)),
-            TitoGuard::Exclusive => Some(exclusive_fence_key(table, id)),
-            TitoGuard::Written => None,
+        .filter_map(|((table, id), guard)| {
+            let key = match guard {
+                TitoGuard::Shared => shared_fence_key(table, id, number),
+                TitoGuard::Exclusive => exclusive_fence_key(table, id),
+            };
+            (!guards.written_keys.contains(key.as_bytes())).then_some(key)
         })
         .collect()
 }

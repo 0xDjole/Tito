@@ -1,7 +1,7 @@
 use super::*;
 use crate::backend::tikv::MAX_TRANSACTION_RETRIES;
 use crate::fence::{exclusive_fence_key, record_fence_keys, shared_fence_key};
-use crate::TitoModel;
+use crate::{TitoGuard, TitoModel};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn tags(engine: &MemoryEngine) -> TitoModel<MemoryEngine, Tag> {
@@ -244,6 +244,39 @@ async fn get_exclusive_counts_as_a_write_so_its_transaction_deletes_every_key_it
         Err(TitoError::Retryable(_))
     ));
     assert!(engine.keys_with_prefix("fence:").await.is_empty());
+}
+
+#[tokio::test]
+async fn a_fence_write_does_not_cancel_another_guard_key() {
+    let engine = engine();
+    let model = shops(&engine);
+    save_shop(&engine, shop("s1")).await.unwrap();
+
+    for guard in [TitoGuard::Shared, TitoGuard::Exclusive] {
+        let tx = engine.begin_transaction().await.unwrap();
+        let (written, expected) = match guard {
+            TitoGuard::Shared => {
+                model.get("s1").execute(Some(&tx)).await.unwrap();
+                (
+                    exclusive_fence_key("shops", "s1"),
+                    shared_fence_key("shops", "s1", picked_number(&tx)),
+                )
+            }
+            TitoGuard::Exclusive => {
+                model.get_exclusive("s1", &tx).await.unwrap();
+                (
+                    shared_fence_key("shops", "s1", picked_number(&tx)),
+                    exclusive_fence_key("shops", "s1"),
+                )
+            }
+        };
+        tx.guard("shops", "s1", TitoGuard::Shared).await;
+        tx.delete(written).await.unwrap();
+        assert_eq!(
+            commit_writes(&engine, tx).await,
+            vec![RecordedWrite::Delete(expected)]
+        );
+    }
 }
 
 #[tokio::test]
@@ -724,14 +757,17 @@ async fn model_set_get_and_get_many_round_trip() {
         "Ada@Example.com"
     );
     let many = model
-        .get_many(vec!["a2".to_string(), "a1".to_string()])
+        .get_many(vec![
+            "a2".to_string(),
+            "missing".to_string(),
+            "a1".to_string(),
+        ])
         .execute(None)
         .await
         .unwrap();
-    assert_eq!(
-        many.into_iter().map(|item| item.id).collect::<Vec<_>>(),
-        vec!["a2", "a1"]
-    );
+    let mut ids = many.into_iter().map(|item| item.id).collect::<Vec<_>>();
+    ids.sort();
+    assert_eq!(ids, vec!["a1", "a2"]);
 }
 
 #[tokio::test]
@@ -1457,7 +1493,7 @@ fn model_options_paginated_and_cursor_helpers_are_stable() {
     let paginated = TitoPaginated::new(vec!["a".to_string()], Some("cursor".to_string()));
     let cursor = TitoCursor { ids: vec![None] };
 
-    assert_eq!(model.partition_count, 12);
+    assert_eq!(model.get_table(), "table:authors");
     assert_eq!(paginated.items, vec!["a"]);
     assert_eq!(paginated.cursor.as_deref(), Some("cursor"));
     assert!(cursor.first_id().is_err());

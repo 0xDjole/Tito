@@ -29,7 +29,6 @@ pub use batch::{
 #[derive(Clone)]
 pub struct TitoModel<E: TitoEngine, T> {
     pub engine: E,
-    pub partition_count: u32,
     _phantom: PhantomData<T>,
 }
 
@@ -75,10 +74,9 @@ impl<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> GetManyBuilder<'a
 }
 
 impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
-    pub fn new(engine: E, options: TitoModelOptions) -> Self {
+    pub fn new(engine: E, _options: TitoModelOptions) -> Self {
         Self {
             engine,
-            partition_count: options.partition_count,
             _phantom: PhantomData,
         }
     }
@@ -242,7 +240,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         tx.put(key, bytes).await
     }
 
-    pub async fn delete(&self, key: String, tx: &E::Transaction) -> Result<bool, TitoError> {
+    async fn delete(&self, key: String, tx: &E::Transaction) -> Result<bool, TitoError> {
         tx.delete(key).await?;
 
         Ok(true)
@@ -411,22 +409,15 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                 continue;
             }
 
-            match current_value.get(parts[depth]) {
-                Some(nested) => {
-                    if nested.is_array() {
-                        if let Some(array) = nested.as_array() {
-                            if array.is_empty() {
-                                return None;
-                            }
-                            for item in array {
-                                to_process.push((item.clone(), depth + 1));
-                            }
-                        }
-                    } else {
-                        to_process.push((nested.clone(), depth + 1));
-                    }
+            let Some(nested) = current_value.get(parts[depth]) else {
+                continue;
+            };
+            if let Some(array) = nested.as_array() {
+                for item in array {
+                    to_process.push((item.clone(), depth + 1));
                 }
-                None => return None,
+            } else {
+                to_process.push((nested.clone(), depth + 1));
             }
         }
 
@@ -491,16 +482,21 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             }
         }
 
-        if let Some(old_index_keys) = old_index_keys {
-            for key in old_index_keys.value {
-                if Self::unique_index_name(&key).is_some()
-                    && !self.validate_unique_owner(&key, &raw_id, tx).await?
+        if let Some(old_index_keys) = &old_index_keys {
+            for key in &old_index_keys.value {
+                if Self::unique_index_name(key).is_some()
+                    && !self.validate_unique_owner(key, &raw_id, tx).await?
                 {
                     return Err(TitoError::IndexError(format!(
                         "Unique index on model '{}' is missing or owned by another record",
                         T::table()
                     )));
                 }
+            }
+        }
+
+        if let Some(old_index_keys) = old_index_keys {
+            for key in old_index_keys.value {
                 self.delete(key, tx).await?;
             }
             self.delete(reverse_key.clone(), tx).await?;
@@ -509,7 +505,6 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         for fence in record_fence_keys(&T::table(), &raw_id) {
             self.delete(fence, tx).await?;
         }
-        tx.guard(&T::table(), &raw_id, TitoGuard::Written).await;
         self.put_value(id, &stored_value, tx).await?;
         for (key, value) in all_index_data {
             tx.put(key, value).await?;
@@ -866,9 +861,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         };
 
         keys.extend(record_fence_keys(&T::table(), raw_id));
-        let removed = self.remove_keys(&id, raw_id, keys, tx).await?;
-        tx.guard(&T::table(), raw_id, TitoGuard::Written).await;
-        Ok(removed)
+        self.remove_keys(&id, raw_id, keys, tx).await
     }
 
     async fn remove_keys(

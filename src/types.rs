@@ -97,7 +97,6 @@ pub trait TitoEngine: Send + Sync + Clone {
 pub enum TitoGuard {
     Shared,
     Exclusive,
-    Written,
 }
 
 #[async_trait]

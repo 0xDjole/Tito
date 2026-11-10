@@ -1,5 +1,5 @@
 use crate::backend::tikv::MAX_TRANSACTION_RETRIES;
-use crate::fence::{guard_keys, note_guard, Guards};
+use crate::fence::{guard_keys, note_guard, note_write, Guards};
 use crate::types::{
     validate_delete_range, TitoEngine, TitoGuard, TitoKvPair, TitoTransaction, TitoValue,
 };
@@ -184,7 +184,7 @@ impl TitoEngine for MemoryEngine {
             store: self.store.clone(),
             local: Arc::new(Mutex::new(local)),
             writes: Arc::new(Mutex::new(MemoryWrites::new())),
-            guards: Arc::new(Mutex::new(Guards::new())),
+            guards: Arc::new(Mutex::new(Guards::default())),
             snapshot,
             next_get_error: self.next_get_error.clone(),
             next_commit_unknown_after_apply: self.next_commit_unknown_after_apply.clone(),
@@ -286,6 +286,7 @@ impl TitoTransaction for MemoryTransaction {
             .lock()
             .await
             .insert(key.as_ref().to_vec(), Some(value.as_ref().to_vec()));
+        note_write(&mut *self.guards.lock().await, key.as_ref());
         Ok(())
     }
 
@@ -297,6 +298,7 @@ impl TitoTransaction for MemoryTransaction {
         }
         self.local.lock().await.remove(key.as_ref());
         self.writes.lock().await.insert(key.as_ref().to_vec(), None);
+        note_write(&mut *self.guards.lock().await, key.as_ref());
         Ok(())
     }
 

@@ -16,8 +16,11 @@ A database layer on TiKV with indexing, transactions, and a built-in partitioned
 
 Indexes are sparse. Tito writes an index key only when every configured field contains a value of
 the configured type. Missing fields, JSON `null`, empty strings, empty collections, and values of a
-different type produce no key for that index. A model can use `condition` to apply an additional
-domain-specific inclusion rule.
+different type contribute no value. Array paths retain valid values from other elements: both
+`[{"role_ids":["r1"]},{"role_ids":[]}]` and `[{"x":"a"},{}]` retain their populated value.
+An index gets no key when any configured field has no valid value. A model can use `condition`
+to apply an additional domain-specific inclusion rule. Existing indexes built with the earlier
+drop-all behavior need a rebuild from their primary records before relying on these sibling values.
 
 `Number` indexes accept signed 64-bit integers. JSON unsigned integers through `i64::MAX` have the
 same exact indexed identity; larger unsigned values and all floating-point numbers (including
@@ -39,8 +42,10 @@ encoded as `{key}.{value}` and a numeric map entry's key goes through the same e
 exported encoder for manual string range endpoints. Opaque record IDs are unchanged.
 
 Ordinary indexes are declared by `indexes`; their keys include the primary record identity and may
-have many owners. Identical keys of one record, such as a list that holds the same value twice, are
-written and listed in its manifest once. Exclusive value ownership is declared separately by
+have many owners. Their names must be unique across every model sharing the database: the ordinary
+index prefix contains the index name, without the model's table. Identical keys of one record,
+such as a list that holds the same value twice, are written and listed in its manifest once.
+Exclusive value ownership is declared separately by
 `unique_indexes`; its key includes the model, index name, and complete indexed value but not the
 claimant ID. A competing claim therefore conflicts on one real ownership key and returns
 `TitoError::UniqueViolation` without exposing the indexed value. `find_one_by_unique_index` performs an exact key read and
@@ -123,7 +128,9 @@ let db = TiKV::connect(vec!["127.0.0.1:2379"]).await?;
 ```
 
 Queue partitions are configured on the queue (`QueueConfig::new(partitions, retention)`), not on
-the connection.
+the connection. Model records are not partitioned by `TitoModelOptions`: its `partition_count` and
+`with_partitions` argument do not affect model storage or queries. Use `TitoModelOptions::default()`
+when constructing a model.
 
 ## Model Definition
 
@@ -197,7 +204,9 @@ let ids = query.execute_ids(None).await?;
 ```
 
 `execute` reads copied records directly or fetches referenced records in one batch; `execute_ids`
-reads the keys only and returns the record ids in either mode.
+reads the keys only and returns the record ids in either mode. Every ordinary index query requires
+at least one leading field value; an empty value list returns `TitoError::IndexError`, including
+reverse queries, id queries, raw queries and `find_one_by_index`.
 
 A save sets `created_at` on create and `updated_at` on every write to the current signed UTC epoch
 milliseconds, but only when the model's serialized shape has those fields; `.timestamps(false)`
@@ -205,6 +214,13 @@ keeps the values the application set. Tito adds no field the model doesn't decla
 
 Tito reads and writes one model at a time. Applications load related records explicitly so their
 domain and API boundaries determine when an additional read is required.
+
+Use `model.remove(id, &tx)` to delete a record with its index entries, manifest and fence writes.
+The model's raw key deletion helper is private.
+
+`get_many(ids)` returns an unordered subset of the requested records and omits missing ids.
+It does not preserve request order or return a placeholder for each requested id. Callers that
+need request order or a missing-record error must match the returned records by id.
 
 In a transaction that writes, every read by id guards the record it returns: `get`, `get_many`,
 `get_versioned` and a hit of `find_one_by_unique_index` take a shared guard, and
@@ -318,11 +334,12 @@ read; neither notes a guard, so a save of a listed record never makes the list's
 A rule over a list, such as "a company keeps at least one manager", takes `get_exclusive` on the list's parent in every
 transaction that changes the list.
 
-**Engines.** `TitoTransaction::guard(table, id, guard)` notes a record as `TitoGuard::Shared`,
-`Exclusive` or `Written`, and the strongest note wins. An engine draws a new number for every
-transaction it begins, and its `commit` deletes the noted keys before committing when the
-transaction wrote or holds an exclusive guard. The TiKV engine and the in-memory test engine do
-both.
+**Engines.** `TitoTransaction::guard(table, id, guard)` notes a record as `TitoGuard::Shared` or
+`Exclusive`, and the strongest note wins. The public API has no guard that clears an earlier read.
+An engine draws a new number for every transaction it begins, and its `commit` deletes the noted
+keys before committing when the transaction wrote or holds an exclusive guard. It may omit a
+guard delete only when that exact fence key was already written in the same transaction. The TiKV
+engine and the in-memory test engine track those writes internally.
 
 ## Storage integrity and pagination
 
@@ -448,8 +465,9 @@ alike. A scan is fetched as a sequence of datastore requests:
   `OUT_OF_RANGE`) is repeated with half the rows; a single row larger than the transport limit
   fails the read with the transport error.
 
-A batch get that is refused for its size is split in halves the same way. Callers still receive
-exactly the rows they asked for, in order. Tito's client decodes responses up to 32 MiB. A TiKV that
+A batch get that is refused for its size is split in halves the same way. Scans and index pages
+preserve key order; `get_many` still returns an unordered subset with missing ids omitted.
+Tito's client decodes responses up to 32 MiB. A TiKV that
 limits its responses below that (`server.max-grpc-send-msg-len`) only costs refused round trips
 before a request is halved; setting the limit to 32 MiB keeps a first request of 16 rows of 1 MiB
 in one round trip.

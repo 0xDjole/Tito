@@ -11,7 +11,7 @@ use tito::types::{
     TitoFindByIndexPayload, TitoFindOneByIndexPayload, TitoIndexConfig, TitoIndexField,
     TitoIndexFieldType, TitoRecordVersion, TitoScanPayload, TitoTransaction,
 };
-use tito::{TitoEngine, TitoError, TitoModel, TitoModelOptions, TitoModelTrait};
+use tito::{TitoEngine, TitoError, TitoGuard, TitoModel, TitoModelOptions, TitoModelTrait};
 use uuid::Uuid;
 
 #[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -291,6 +291,42 @@ async fn delete_unless_held(
         records.remove(id, tx).await?;
     }
     Ok(held)
+}
+
+#[tokio::test]
+async fn native_public_guard_modes_cannot_cancel_a_read_guard() {
+    let (endpoint, run_id) = native_endpoint();
+    let engine = native_engine(endpoint).await;
+    let model = records_of(&engine);
+
+    for guard in [TitoGuard::Shared, TitoGuard::Exclusive] {
+        let record = new_record(&run_id, &record_id(&run_id));
+        save(&engine, &model, record.clone()).await.unwrap();
+        let reader = engine.begin_transaction().await.unwrap();
+        let read = match guard {
+            TitoGuard::Shared => model.get(&record.id).execute(Some(&reader)).await,
+            TitoGuard::Exclusive => model.get_exclusive(&record.id, &reader).await,
+        }
+        .unwrap();
+        assert_eq!(read, record);
+        reader
+            .guard(&NativeRecord::table(), &record.id, guard)
+            .await;
+        reader
+            .guard(&NativeRecord::table(), &record.id, TitoGuard::Shared)
+            .await;
+        write_scratch(&reader, &run_id).await;
+
+        save(&engine, &model, with_name(&record, "changed"))
+            .await
+            .unwrap();
+        assert!(!committed(reader).await);
+        assert_eq!(
+            model.get(&record.id).execute(None).await.unwrap().name,
+            "changed"
+        );
+        remove(&engine, &model, &record.id).await.unwrap();
+    }
 }
 
 #[tokio::test]

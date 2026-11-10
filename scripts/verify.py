@@ -48,6 +48,7 @@ TITO_NATIVE_CASES = {
     "native_a_duplicate_delivery_conflicts_on_the_pending_row_and_its_retry_skips",
     "native_a_rolled_back_handler_transaction_leaves_its_row_pending_for_redelivery",
     "native_ack_in_tx_refuses_an_undelivered_event_and_a_row_of_another_event",
+    "native_public_guard_modes_cannot_cancel_a_read_guard",
     "native_every_read_by_id_in_a_writing_transaction_conflicts_with_a_save_of_its_record",
     "native_index_reads_scans_and_misses_add_no_guard",
     "native_two_transactions_reading_the_same_twenty_records_conflict_about_one_time_in_sixteen",

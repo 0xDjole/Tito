@@ -1,5 +1,5 @@
 use crate::error::TitoError;
-use crate::fence::{guard_keys, note_guard, Guards};
+use crate::fence::{guard_keys, note_guard, note_write, Guards};
 use crate::types::{
     validate_delete_range, DBUuid, TitoEngine, TitoGuard, TitoKvPair, TitoTransaction, TitoValue,
 };
@@ -182,7 +182,7 @@ impl TitoEngine for TiKVBackend {
             had_retryable_error: Arc::new(AtomicBool::new(false)),
             commit_started: Arc::new(AtomicBool::new(false)),
             wrote: Arc::new(AtomicBool::new(false)),
-            guards: Arc::new(tokio::sync::Mutex::new(Guards::new())),
+            guards: Arc::new(tokio::sync::Mutex::new(Guards::default())),
             start_version,
             shared_fence_pick: rand::random(),
         })
@@ -567,6 +567,7 @@ impl TitoTransaction for TiKVTransaction {
             .map_err(|e| {
                 classify_tikv_error(e, "Put operation failed", &self.had_retryable_error)
             })?;
+        note_write(&mut *self.guards.lock().await, key.as_ref());
         self.wrote.store(true, Ordering::Release);
         Ok(())
     }
@@ -581,6 +582,7 @@ impl TitoTransaction for TiKVTransaction {
             .map_err(|e| {
                 classify_tikv_error(e, "Delete operation failed", &self.had_retryable_error)
             })?;
+        note_write(&mut *self.guards.lock().await, key.as_ref());
         self.wrote.store(true, Ordering::Release);
         Ok(())
     }

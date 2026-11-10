@@ -509,6 +509,12 @@ impl<
         index: &TitoIndexConfig,
         payload: TitoFindByIndexPayload,
     ) -> Result<TitoScanPayload, TitoError> {
+        if payload.values.is_empty() {
+            return Err(TitoError::IndexError(format!(
+                "Index '{}' requires at least one value",
+                payload.index
+            )));
+        }
         let mut key_from_values = vec![];
         for (i, value) in payload.values.iter().enumerate() {
             let index_field = index.fields.get(i).ok_or_else(|| {

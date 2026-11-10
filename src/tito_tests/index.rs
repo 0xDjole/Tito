@@ -1,5 +1,233 @@
 use super::*;
 
+#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct SparseMembership {
+    id: String,
+    grants: Vec<serde_json::Value>,
+}
+
+impl TitoModelTrait for SparseMembership {
+    fn indexes(&self) -> Vec<TitoIndexConfig> {
+        vec![
+            TitoIndexConfig {
+                value: TitoIndexValue::RecordReference,
+                condition: true,
+                name: "sparse-membership-by-role".to_string(),
+                fields: vec![TitoIndexField {
+                    name: "grants.role_ids".to_string(),
+                    r#type: TitoIndexFieldType::String,
+                }],
+            },
+            TitoIndexConfig {
+                value: TitoIndexValue::RecordCopy,
+                condition: true,
+                name: "sparse-membership-by-x".to_string(),
+                fields: vec![TitoIndexField {
+                    name: "grants.x".to_string(),
+                    r#type: TitoIndexFieldType::String,
+                }],
+            },
+        ]
+    }
+
+    fn table() -> String {
+        "sparse-memberships".to_string()
+    }
+
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+}
+
+#[tokio::test]
+async fn nested_array_indexes_keep_values_next_to_empty_siblings() {
+    let engine = engine();
+    let model = engine
+        .clone()
+        .model::<SparseMembership>(TitoModelOptions::default());
+    let key = "index:sparse-membership-by-role:grants.role_ids:r1:table:sparse-memberships:m1";
+
+    for grants in [
+        vec![json!({"role_ids": ["r1"]}), json!({"role_ids": []})],
+        vec![json!({"role_ids": []}), json!({"role_ids": ["r1"]})],
+    ] {
+        let tx = engine.begin_transaction().await.unwrap();
+        model
+            .set(SparseMembership {
+                id: "m1".to_string(),
+                grants,
+            })
+            .execute(&tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        assert!(engine.contains_key(key).await);
+        let mut query = model.query_by_index("sparse-membership-by-role");
+        query.value("r1");
+        assert_eq!(query.execute_ids(None).await.unwrap().items, vec!["m1"]);
+        assert_eq!(query.execute(None).await.unwrap().items[0].id, "m1");
+    }
+
+    let tx = engine.begin_transaction().await.unwrap();
+    model
+        .set(SparseMembership {
+            id: "m1".to_string(),
+            grants: vec![json!({"role_ids": []}), json!({})],
+        })
+        .execute(&tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert!(!engine.contains_key(key).await);
+    assert!(model
+        .query_by_index("sparse-membership-by-role")
+        .value("r1")
+        .execute_ids(None)
+        .await
+        .unwrap()
+        .items
+        .is_empty());
+}
+
+#[tokio::test]
+async fn nested_array_indexes_keep_values_next_to_missing_or_non_object_siblings() {
+    let engine = engine();
+    let model = engine
+        .clone()
+        .model::<SparseMembership>(TitoModelOptions::default());
+
+    for grants in [
+        vec![json!({"x": "a"}), json!({})],
+        vec![json!({}), json!({"x": "a"})],
+        vec![json!({"x": "a"}), json!(null), json!(7)],
+    ] {
+        let tx = engine.begin_transaction().await.unwrap();
+        let saved = model
+            .set(SparseMembership {
+                id: "m1".to_string(),
+                grants,
+            })
+            .execute(&tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        assert!(
+            engine
+                .contains_key("index:sparse-membership-by-x:grants.x:a:table:sparse-memberships:m1")
+                .await
+        );
+        let mut query = model.query_by_index("sparse-membership-by-x");
+        query.value("a");
+        assert_eq!(query.execute_ids(None).await.unwrap().items, vec!["m1"]);
+        assert_eq!(query.execute(None).await.unwrap().items, vec![saved]);
+    }
+}
+
+#[tokio::test]
+async fn ordinary_index_queries_refuse_empty_values_before_reading_rows() {
+    let engine = engine();
+    let model = engine.clone().model::<Author>(TitoModelOptions::default());
+    save_author(&engine, author("a1", "ada@example.com", 36, "org-a")).await;
+    engine.start_recording_reads().await;
+
+    let mut query = model.query_by_index("author-by-email");
+    assert!(matches!(
+        query.execute(None).await,
+        Err(TitoError::IndexError(_))
+    ));
+    assert!(matches!(
+        query.execute_reverse(None).await,
+        Err(TitoError::IndexError(_))
+    ));
+    assert!(matches!(
+        query.execute_ids(None).await,
+        Err(TitoError::IndexError(_))
+    ));
+    assert!(matches!(
+        model
+            .find_one_by_index(
+                TitoFindOneByIndexPayload {
+                    index: "author-by-email".to_string(),
+                    values: Vec::new(),
+                },
+                None,
+            )
+            .await,
+        Err(TitoError::IndexError(_))
+    ));
+
+    let tx = engine.begin_transaction().await.unwrap();
+    let payload = TitoFindByIndexPayload {
+        index: "author-by-email".to_string(),
+        values: Vec::new(),
+        limit: Some(1),
+        cursor: None,
+    };
+    assert!(matches!(
+        model.find_by_index_raw(payload.clone(), &tx).await,
+        Err(TitoError::IndexError(_))
+    ));
+    assert!(matches!(
+        model.find_by_index_reverse_raw(payload, &tx).await,
+        Err(TitoError::IndexError(_))
+    ));
+    assert!(engine.take_recorded_reads().await.is_empty());
+    tx.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn set_refuses_a_corrupt_old_unique_owner_before_staging_any_write() {
+    let engine = engine();
+    let model = engine
+        .clone()
+        .model::<UniqueAccount>(TitoModelOptions::default());
+    let original = unique_account("a1", "tenant", "old@example.com", true);
+    save_unique_account(&engine, original.clone()).await;
+    let primary_key = "table:unique-accounts:a1";
+    let manifest_key = "reverse-index:table:unique-accounts:a1";
+    let ordinary_key = "index:account-by-email:email:old@example.com:table:unique-accounts:a1";
+    let unique_key = "unique-index:unique-accounts:verified-account-by-tenant-email:tenant_id:tenant:email:old@example.com";
+    let primary = engine.raw_bytes(primary_key).await.unwrap();
+    let manifest = engine.raw_bytes(manifest_key).await.unwrap();
+    engine.put_raw(unique_key, b"another-owner".to_vec()).await;
+
+    let tx = engine.begin_transaction().await.unwrap();
+    engine.start_recording_writes().await;
+    assert!(matches!(
+        model
+            .set(UniqueAccount {
+                email: "next@example.com".to_string(),
+                ..original
+            })
+            .timestamps(false)
+            .execute(&tx)
+            .await,
+        Err(TitoError::IndexError(_))
+    ));
+    assert!(engine.take_recorded_writes().await.is_empty());
+    tx.put("scratch:rejected-set", b"kept").await.unwrap();
+    tx.commit().await.unwrap();
+
+    assert_eq!(engine.raw_bytes(primary_key).await.unwrap(), primary);
+    assert_eq!(engine.raw_bytes(manifest_key).await.unwrap(), manifest);
+    assert!(engine.contains_key(ordinary_key).await);
+    assert_eq!(
+        engine.raw_bytes(unique_key).await.unwrap(),
+        b"another-owner"
+    );
+    assert_eq!(
+        engine.raw_bytes("scratch:rejected-set").await.unwrap(),
+        b"kept"
+    );
+    assert!(
+        !engine
+            .contains_key("index:account-by-email:email:next@example.com:table:unique-accounts:a1")
+            .await
+    );
+}
+
 #[tokio::test]
 async fn conditional_unique_index_owns_one_value_and_supports_exact_lookup() {
     let engine = engine();
