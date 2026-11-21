@@ -33,6 +33,9 @@ PROTOCOL_CASES = {
     "pd::retry::test::test_retry",
 }
 TITO_NATIVE_CASES = {
+    "native_batch_creation_commits_indexed_records_in_input_order_and_rolls_back_with_its_transaction",
+    "native_batch_creation_rejects_conflicts_corruption_and_limits_before_staging_any_record",
+    "native_batch_creation_competing_with_another_batch_or_set_leaves_only_the_committed_owner",
     "native_index_value_modes_store_selected_bytes_and_preserve_pages",
     "native_copied_index_reads_avoid_primaries_and_id_queries_skip_values",
     "native_index_value_modes_refresh_copies_on_every_write_and_remove_old_entries",

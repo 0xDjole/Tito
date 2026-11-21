@@ -22,8 +22,16 @@ const MAX_MANIFEST_KEYS: usize = 10_000;
 const MAX_MANIFEST_BYTES: usize = 1_048_576;
 
 mod batch;
-pub use batch::{
-    ReplaceManyBuilder, MAX_REPLACE_MANY_BYTES, MAX_REPLACE_MANY_KEYS, MAX_REPLACE_MANY_RECORDS,
+mod create;
+pub use batch::ReplaceManyBuilder;
+pub use create::CreateManyBuilder;
+
+pub const MAX_BATCH_RECORDS: usize = 100;
+pub const MAX_BATCH_KEYS: usize = 10_000;
+pub const MAX_BATCH_BYTES: usize = 8_388_608;
+pub use {
+    MAX_BATCH_BYTES as MAX_REPLACE_MANY_BYTES, MAX_BATCH_KEYS as MAX_REPLACE_MANY_KEYS,
+    MAX_BATCH_RECORDS as MAX_REPLACE_MANY_RECORDS,
 };
 
 #[derive(Clone)]
@@ -372,18 +380,33 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         let primary = tx.get(primary_key).await?;
         let reverse = tx.get(&reverse_key).await?;
 
-        match (primary, reverse) {
-            (None, None) => Ok(None),
-            (Some(_), Some(bytes)) => {
-                let reverse_index = self.deserialize_reverse_index(&reverse_key, &bytes)?;
+        self.index_state(
+            primary_key,
+            &reverse_key,
+            primary.is_some(),
+            reverse.as_deref(),
+        )
+    }
+
+    fn index_state(
+        &self,
+        primary_key: &str,
+        reverse_key: &str,
+        has_primary: bool,
+        reverse: Option<&[u8]>,
+    ) -> Result<Option<ReverseIndex>, TitoError> {
+        match (has_primary, reverse) {
+            (false, None) => Ok(None),
+            (true, Some(bytes)) => {
+                let reverse_index = self.deserialize_reverse_index(reverse_key, bytes)?;
                 self.validate_reverse_index_keys(primary_key, &reverse_index)?;
                 Ok(Some(reverse_index))
             }
-            (Some(_), None) => Err(TitoError::IndexError(format!(
+            (true, None) => Err(TitoError::IndexError(format!(
                 "Primary record '{}' exists without reverse index '{}'",
                 primary_key, reverse_key
             ))),
-            (None, Some(_)) => Err(TitoError::IndexError(format!(
+            (false, Some(_)) => Err(TitoError::IndexError(format!(
                 "Reverse index '{}' exists without primary record '{}'",
                 reverse_key, primary_key
             ))),

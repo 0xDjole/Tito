@@ -1,10 +1,6 @@
 use super::*;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-pub const MAX_REPLACE_MANY_RECORDS: usize = 100;
-pub const MAX_REPLACE_MANY_KEYS: usize = 10_000;
-pub const MAX_REPLACE_MANY_BYTES: usize = 8_388_608;
-
 pub struct ReplaceManyBuilder<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> {
     model: &'a TitoModel<E, T>,
     replacements: Vec<(T, T)>,

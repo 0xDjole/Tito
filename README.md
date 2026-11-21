@@ -300,7 +300,7 @@ none is listed in a manifest, and a manifest that lists one is an integrity erro
 | --- | --- |
 | `get`, `get_many`, `get_versioned`, a hit of `find_one_by_unique_index`, in a transaction that writes | one shared key of each record read, at commit |
 | `get_exclusive` | the record's exclusive key, at commit |
-| `set`, `replace_many`, `remove`, `remove_by_index` | all 17 keys of each record written or removed |
+| `set`, `create_many`, `replace_many`, `remove`, `remove_by_index` | all 17 keys of each record written or removed |
 | a shared read in a transaction that writes nothing, and any read without a transaction | nothing |
 | index reads (`find_by_index`, `find_by_index_reverse`, `query_by_index` with `execute`, `execute_reverse` and `execute_ids`, `find_one_by_index`) and any batched read of referenced records behind them, `scan`, `scan_reverse`, and a read that finds nothing | nothing |
 
@@ -342,6 +342,13 @@ guard delete only when that exact fence key was already written in the same tran
 engine and the in-memory test engine track those writes internally.
 
 ## Storage integrity and pagination
+
+`model.create_many(records).timestamps(false).execute(&tx)` creates 1–100 distinct new records
+in the caller's transaction. It checks primary keys, reverse-index manifests and unique keys in
+a batch read before writing. An existing identity or unique owner refuses the batch. The operation writes each record’s ordinary indexes and version and deletes its 17 fence keys, as
+`set` does. Results follow the input order.
+The operation accepts at most 10,000 storage keys and 8 MiB of keys and values combined. Leaving
+out `.timestamps(false)` applies the same creation timestamps as `set`.
 
 `model.replace_many(Vec<(expected, next)>).timestamps(false).execute(&tx)` replaces existing
 records of one model in the caller's transaction. Every source must still equal its complete

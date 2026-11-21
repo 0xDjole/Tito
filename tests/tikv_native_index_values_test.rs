@@ -692,3 +692,223 @@ async fn native_reference_record_reads_reject_nonempty_values_while_ids_remain_k
     .await
     .expect("Native reference validation must finish within its owned run");
 }
+
+#[tokio::test]
+async fn native_batch_creation_commits_indexed_records_in_input_order_and_rolls_back_with_its_transaction(
+) {
+    let (engine, model, scope) = fixture().await;
+    let records = vec![record(&scope, 2), record(&scope, 1)];
+    let fence_prefix = format!(
+        "fence:{}:{}",
+        tito::encode_index_string(&IndexValueRecord::table()),
+        tito::encode_index_string(&records[0].id)
+    );
+    let mut fences = (0..16)
+        .map(|index| format!("{fence_prefix}:{index}"))
+        .collect::<Vec<_>>();
+    fences.push(format!("{fence_prefix}:exclusive"));
+    let previous = engine.begin_transaction().await.unwrap();
+    for key in &fences {
+        previous.put(key, b"previous fence").await.unwrap();
+    }
+    previous.commit().await.unwrap();
+    let tx = engine.begin_transaction().await.unwrap();
+    let result = model
+        .create_many(records.clone())
+        .timestamps(false)
+        .execute(&tx)
+        .await
+        .unwrap();
+    assert_eq!(result, records);
+    for key in &fences {
+        assert!(tx.get(key).await.unwrap().is_none());
+    }
+    for value in &records {
+        assert_eq!(
+            model.get(&value.id).execute(Some(&tx)).await.unwrap(),
+            *value
+        );
+        assert!(matches!(
+            model.get(&value.id).execute(None).await,
+            Err(TitoError::NotFound(_))
+        ));
+    }
+    tx.rollback().await.unwrap();
+    let snapshot = engine.begin_transaction().await.unwrap();
+    for key in &fences {
+        assert_eq!(
+            snapshot.get(key).await.unwrap().as_deref(),
+            Some(b"previous fence".as_slice())
+        );
+    }
+    snapshot.rollback().await.unwrap();
+    for value in &records {
+        assert!(matches!(
+            model.get(&value.id).execute(None).await,
+            Err(TitoError::NotFound(_))
+        ));
+        assert!(matches!(
+            model
+                .find_one_by_unique_index(by_code(value, "native-value-code-copy"), None)
+                .await,
+            Err(TitoError::NotFound(_))
+        ));
+    }
+
+    let tx = engine.begin_transaction().await.unwrap();
+    let stamped = model
+        .create_many(records.clone())
+        .execute(&tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    for (value, original) in stamped.iter().zip(&records) {
+        assert_eq!(value.id, original.id);
+        assert!(value.created_at > original.created_at);
+        assert_eq!(value.created_at, value.updated_at);
+        assert_record_reads(&model, value).await;
+        assert_eq!(
+            model.get_versioned(&value.id, None).await.unwrap().value,
+            *value
+        );
+        remove(&engine, &model, &value.id).await.unwrap();
+        assert!(matches!(
+            model
+                .find_one_by_unique_index(by_code(value, "native-value-code-copy"), None)
+                .await,
+            Err(TitoError::NotFound(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn native_batch_creation_rejects_conflicts_corruption_and_limits_before_staging_any_record() {
+    let (engine, model, scope) = fixture().await;
+    let first = record(&scope, 1);
+    let existing = record(&scope, 2);
+    save(&engine, &model, existing.clone()).await.unwrap();
+    let mut rival = record(&scope, 3);
+    rival.code = existing.code.clone();
+    let mut twin = record(&scope, 4);
+    twin.code = first.code.clone();
+    let invalid = engine.begin_transaction().await.unwrap();
+    assert!(matches!(
+        model.create_many(vec![]).execute(&invalid).await,
+        Err(TitoError::InvalidInput(_))
+    ));
+    let too_many = (0..=tito::MAX_BATCH_RECORDS)
+        .map(|i| record(&scope, i as i64))
+        .collect();
+    assert!(matches!(
+        model.create_many(too_many).execute(&invalid).await,
+        Err(TitoError::InvalidInput(_))
+    ));
+    let mut large = record(&scope, 5);
+    large.body = "x".repeat(tito::MAX_BATCH_BYTES);
+    assert!(matches!(
+        model.create_many(vec![large]).execute(&invalid).await,
+        Err(TitoError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        model
+            .create_many(vec![first.clone(), first.clone()])
+            .execute(&invalid)
+            .await,
+        Err(TitoError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        model
+            .create_many(vec![first.clone(), existing.clone()])
+            .execute(&invalid)
+            .await,
+        Err(TitoError::CreateFailed(_))
+    ));
+    for conflict in [rival, twin] {
+        assert!(matches!(
+            model
+                .create_many(vec![first.clone(), conflict])
+                .execute(&invalid)
+                .await,
+            Err(TitoError::UniqueViolation { .. })
+        ));
+    }
+    let damaged = record(&scope, 6);
+    let reverse = format!("reverse-index:{}", primary(&damaged));
+    invalid.put(&reverse, b"orphan").await.unwrap();
+    assert!(matches!(
+        model
+            .create_many(vec![first.clone(), damaged])
+            .execute(&invalid)
+            .await,
+        Err(TitoError::IndexError(_))
+    ));
+    invalid.delete(reverse).await.unwrap();
+    invalid.commit().await.unwrap();
+    assert!(matches!(
+        model.get(&first.id).execute(None).await,
+        Err(TitoError::NotFound(_))
+    ));
+    assert_record_reads(&model, &existing).await;
+    remove(&engine, &model, &existing.id).await.unwrap();
+}
+
+#[tokio::test]
+async fn native_batch_creation_competing_with_another_batch_or_set_leaves_only_the_committed_owner()
+{
+    let (engine, model, scope) = fixture().await;
+    for same_id in [true, false] {
+        let rank = if same_id { 10 } else { 20 };
+        let winner = record(&scope, rank);
+        let mut rival = record(&scope, rank + 1);
+        if same_id {
+            rival.id = winner.id.clone();
+        } else {
+            rival.code = winner.code.clone();
+        }
+        let witness = record(&scope, rank + 2);
+        let first = engine.begin_transaction().await.unwrap();
+        let second = engine.begin_transaction().await.unwrap();
+        if same_id {
+            model
+                .set(winner.clone())
+                .timestamps(false)
+                .execute(&first)
+                .await
+                .unwrap();
+        } else {
+            model
+                .create_many(vec![winner.clone()])
+                .timestamps(false)
+                .execute(&first)
+                .await
+                .unwrap();
+        }
+        model
+            .create_many(vec![witness.clone(), rival.clone()])
+            .timestamps(false)
+            .execute(&second)
+            .await
+            .unwrap();
+        first.commit().await.unwrap();
+        assert_conflict(second).await;
+        let retry = engine.begin_transaction().await.unwrap();
+        let error = model
+            .create_many(vec![witness.clone(), rival])
+            .timestamps(false)
+            .execute(&retry)
+            .await
+            .unwrap_err();
+        if same_id {
+            assert!(matches!(error, TitoError::CreateFailed(_)));
+        } else {
+            assert!(matches!(error, TitoError::UniqueViolation { .. }));
+        }
+        retry.commit().await.unwrap();
+        assert!(matches!(
+            model.get(&witness.id).execute(None).await,
+            Err(TitoError::NotFound(_))
+        ));
+        assert_record_reads(&model, &winner).await;
+        remove(&engine, &model, &winner.id).await.unwrap();
+    }
+}
