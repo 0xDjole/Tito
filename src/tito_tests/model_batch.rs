@@ -28,7 +28,7 @@ async fn unique_owner(engine: &MemoryEngine, email: &str) -> UniqueAccount {
     engine
         .clone()
         .model::<UniqueAccount>(TitoModelOptions::default())
-        .find_one_by_unique_index(
+        .find_one_by_unique_index_for_share(
             TitoFindOneByIndexPayload {
                 index: "verified-account-by-tenant-email".into(),
                 values: vec!["tenant".into(), email.into()],
@@ -60,7 +60,11 @@ async fn batch_replacement_rotates_unique_ownership_and_preserves_current_metada
     let model = engine
         .clone()
         .model::<UniqueAccount>(TitoModelOptions::default());
-    let version = model.get_versioned("a", None).await.unwrap().version;
+    let version = model
+        .get_versioned_for_share("a", None)
+        .await
+        .unwrap()
+        .version;
     let next = vec![
         UniqueAccount {
             email: b.email.clone(),
@@ -98,22 +102,33 @@ async fn batch_replacement_rotates_unique_ownership_and_preserves_current_metada
             .collect::<Vec<_>>();
         assert!(manifest.iter().any(|key| key.starts_with("index:")));
         assert!(manifest.iter().any(|key| key.starts_with("unique-index:")));
+        let copy = engine
+            .raw_bytes(&format!("table:unique-accounts:{id}"))
+            .await
+            .unwrap();
         for key in manifest {
-            let expected = if key.starts_with("unique-index:") {
-                id.as_bytes().to_vec()
-            } else {
-                Vec::new()
-            };
-            assert_eq!(engine.raw_bytes(&key).await.unwrap(), expected, "{key}");
+            assert_eq!(engine.raw_bytes(&key).await.unwrap(), copy, "{key}");
         }
     }
     assert_eq!(unique_owner(&engine, &a.email).await.id, "c");
     assert_eq!(unique_owner(&engine, &b.email).await.id, "a");
     assert_eq!(unique_owner(&engine, &c.email).await.id, "b");
     let versions = [
-        model.get_versioned("a", None).await.unwrap().version,
-        model.get_versioned("b", None).await.unwrap().version,
-        model.get_versioned("c", None).await.unwrap().version,
+        model
+            .get_versioned_for_share("a", None)
+            .await
+            .unwrap()
+            .version,
+        model
+            .get_versioned_for_share("b", None)
+            .await
+            .unwrap()
+            .version,
+        model
+            .get_versioned_for_share("c", None)
+            .await
+            .unwrap()
+            .version,
     ];
     assert!(versions
         .iter()
@@ -345,7 +360,7 @@ async fn batch_replacement_deletes_the_seventeen_fence_keys_of_each_replaced_rec
         .clone()
         .model::<UniqueAccount>(TitoModelOptions::default());
     let reader = engine.begin_transaction().await.unwrap();
-    model.get("a").execute(Some(&reader)).await.unwrap();
+    model.get_for_share("a", Some(&reader)).await.unwrap();
     write_scratch(&reader).await;
 
     engine.start_recording_writes().await;

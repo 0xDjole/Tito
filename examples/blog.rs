@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use tito::types::TitoIndexValue;
 use tito::{
     types::{
         DBUuid, TitoEngine, TitoIndexConfig, TitoIndexField, TitoIndexFieldType, TitoModelTrait,
@@ -28,7 +27,6 @@ struct Post {
 impl TitoModelTrait for Tag {
     fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![TitoIndexConfig {
-            value: TitoIndexValue::RecordReference,
             condition: true,
             name: "tag-by-name".to_string(),
             fields: vec![TitoIndexField {
@@ -51,7 +49,6 @@ impl TitoModelTrait for Post {
     fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![
             TitoIndexConfig {
-                value: TitoIndexValue::RecordReference,
                 condition: true,
                 name: "post-by-author".to_string(),
                 fields: vec![TitoIndexField {
@@ -60,7 +57,6 @@ impl TitoModelTrait for Post {
                 }],
             },
             TitoIndexConfig {
-                value: TitoIndexValue::RecordReference,
                 condition: true,
                 name: "post-by-tag".to_string(),
                 fields: vec![TitoIndexField {
@@ -136,8 +132,7 @@ async fn main() -> Result<(), TitoError> {
             let post_clone = post.clone();
             async move {
                 let tags = tag_model
-                    .get_many(post_clone.tag_ids.clone())
-                    .execute(Some(&tx))
+                    .get_many_for_share(post_clone.tag_ids.clone(), Some(&tx))
                     .await?;
                 if tags.len() != post_clone.tag_ids.len() {
                     return Err(TitoError::NotFound(
@@ -181,10 +176,9 @@ async fn main() -> Result<(), TitoError> {
         );
     }
 
-    let mut post_with_tags = post_model.get(&post.id).execute(None).await?;
+    let mut post_with_tags = post_model.get(&post.id, None).await?;
     post_with_tags.tags = tag_model
-        .get_many(post_with_tags.tag_ids.clone())
-        .execute(None)
+        .get_many(post_with_tags.tag_ids.clone(), None)
         .await?;
 
     println!("Post: {}", post_with_tags.title);
@@ -198,7 +192,7 @@ async fn main() -> Result<(), TitoError> {
 
     println!("\nAlice's posts:");
     for mut p in results.items {
-        p.tags = tag_model.get_many(p.tag_ids.clone()).execute(None).await?;
+        p.tags = tag_model.get_many(p.tag_ids.clone(), None).await?;
         println!(
             "- {} (tags: {})",
             p.title,

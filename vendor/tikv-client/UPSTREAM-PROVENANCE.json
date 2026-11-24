@@ -1379,6 +1379,11 @@
       "path": "src/pd/retry.rs",
       "base_sha256": "0def8bf01e0e7355fc9b647fd20291db65d810cf4986f023ca0a3e7f2795d8e4",
       "final_sha256": "7bf75d28432509a9a3a75d53b77f303b70ece1e8dd0038c0b557669529110554"
+    },
+    {
+      "path": "src/transaction/buffer.rs",
+      "base_sha256": "18840071509e1743791e2df2714762430fd50d5786e5421d9e7c7388b71661f2",
+      "final_sha256": "c0b77bcac4104b5b905633c176a9a1e23ef654dba78fadc6c63a663e12d0ee08"
     }
   ],
   "added_source_files": [
@@ -1389,7 +1394,7 @@
     }
   ],
   "patch_sha256": "020a68a1ebda86adb3503a08f53c8ea4bd790dd026d734fff519cae11896f7c5",
-  "purpose": "Wait for a replaced PD connection generation after throttled failure; preserve existing request and connection budgets. No transaction or business callback retry change.",
+  "purpose": "Wait for a replaced PD connection generation after throttled failure; preserve existing request and connection budgets. No transaction or business callback retry change. A batch read remembers the keys it did not find, as a single read does, without touching a key the transaction wrote or locked.",
   "standalone_owner_lock": {
     "path": "Cargo.lock",
     "sha256": "8bc76169cb392378c2f7f418e9929945d6bcf15f3efd37ea8f5478e1c6e72050",

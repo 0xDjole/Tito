@@ -1,6 +1,5 @@
 use super::*;
 use crate::encode_index_integer;
-use crate::types::TitoIndexValue;
 
 #[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct Entry {
@@ -14,7 +13,6 @@ struct Entry {
 
 fn entry_index(name: &str, fields: &[(&str, TitoIndexFieldType)]) -> TitoIndexConfig {
     TitoIndexConfig {
-        value: TitoIndexValue::RecordReference,
         condition: true,
         name: name.to_string(),
         fields: fields
@@ -158,8 +156,17 @@ fn assert_index_error_naming<V: std::fmt::Debug>(result: Result<V, TitoError>, k
     }
 }
 
+fn assert_unreadable_copy_naming<V: std::fmt::Debug>(result: Result<V, TitoError>, key: &str) {
+    match result {
+        Err(TitoError::DeserializationFailed(message)) => {
+            assert!(message.contains(key), "{message}")
+        }
+        other => panic!("Expected a DeserializationFailed naming '{key}', got {other:?}"),
+    }
+}
+
 #[tokio::test]
-async fn a_list_reads_its_records_by_id_in_one_batch_and_keeps_index_order() {
+async fn a_list_reads_its_records_from_the_entries_in_one_scan_and_keeps_index_order() {
     let engine = engine();
     let model = entries(&engine);
     let third = save_entry(&engine, entry("e3", "t", 2)).await;
@@ -167,11 +174,6 @@ async fn a_list_reads_its_records_by_id_in_one_batch_and_keeps_index_order() {
     let second = save_entry(&engine, entry("e\\2", "t", 1)).await;
     save_entry(&engine, entry("other", "u", 1)).await;
     let expected = vec![first.clone(), second.clone(), third.clone()];
-    let primaries = vec![
-        "table:entries:e:1".to_string(),
-        "table:entries:e\\2".to_string(),
-        "table:entries:e3".to_string(),
-    ];
 
     engine.start_recording_reads().await;
     engine.start_recording_batch_gets().await;
@@ -180,14 +182,13 @@ async fn a_list_reads_its_records_by_id_in_one_batch_and_keeps_index_order() {
     let page = query.execute(None).await.unwrap();
     assert_eq!(page.items, expected);
     assert!(page.cursor.is_none());
-    let mut reads = vec![b"scan:index:entry-by-tenant-rank:tenant:t:".to_vec()];
-    reads.extend(primaries.iter().map(|key| key.as_bytes().to_vec()));
-    assert_eq!(engine.take_recorded_reads().await, reads);
     assert_eq!(
-        engine.take_recorded_batch_gets().await,
-        vec![primaries.clone()]
+        engine.take_recorded_reads().await,
+        vec![b"scan:index:entry-by-tenant-rank:tenant:t:".to_vec()]
     );
+    assert!(engine.take_recorded_batch_gets().await.is_empty());
 
+    engine.start_recording_reads().await;
     engine.start_recording_batch_gets().await;
     let reversed = query.execute_reverse(None).await.unwrap();
     assert_eq!(
@@ -195,9 +196,10 @@ async fn a_list_reads_its_records_by_id_in_one_batch_and_keeps_index_order() {
         expected.iter().rev().cloned().collect::<Vec<_>>()
     );
     assert_eq!(
-        engine.take_recorded_batch_gets().await,
-        vec![primaries.iter().rev().cloned().collect::<Vec<_>>()]
+        engine.take_recorded_reads().await,
+        vec![b"scan-reverse:index:entry-by-tenant-rank:tenant:t:".to_vec()]
     );
+    assert!(engine.take_recorded_batch_gets().await.is_empty());
 
     let tx = engine.begin_transaction().await.unwrap();
     let rows = vec![
@@ -378,7 +380,7 @@ async fn records_page_in_both_directions_and_ids_page_with_the_same_limits_and_c
 }
 
 #[tokio::test]
-async fn an_entry_whose_record_is_missing_is_an_index_error_naming_its_key() {
+async fn an_entry_whose_copy_is_unreadable_or_disagrees_with_its_key_is_an_error_naming_it() {
     let engine = engine();
     let model = entries(&engine);
     save_entry(&engine, entry("e1", "t", 1)).await;
@@ -387,16 +389,16 @@ async fn an_entry_whose_record_is_missing_is_an_index_error_naming_its_key() {
 
     let mut query = model.query_by_index("entry-by-tenant-rank");
     query.value("t");
-    assert_index_error_naming(query.execute(None).await, &ghost);
-    assert_index_error_naming(query.execute_reverse(None).await, &ghost);
-    assert_index_error_naming(model.find_by_index(by_rank("t"), None).await, &ghost);
-    assert_index_error_naming(
+    assert_unreadable_copy_naming(query.execute(None).await, &ghost);
+    assert_unreadable_copy_naming(query.execute_reverse(None).await, &ghost);
+    assert_unreadable_copy_naming(model.find_by_index(by_rank("t"), None).await, &ghost);
+    assert_unreadable_copy_naming(
         model.find_one_by_index(first_by_rank("t"), None).await,
         &ghost,
     );
     let tx = engine.begin_transaction().await.unwrap();
-    assert_index_error_naming(model.find_by_index_raw(by_rank("t"), &tx).await, &ghost);
-    assert_index_error_naming(
+    assert_unreadable_copy_naming(model.find_by_index_raw(by_rank("t"), &tx).await, &ghost);
+    assert_unreadable_copy_naming(
         model.scan(whole("index:entry-by-tenant-rank:"), &tx).await,
         &ghost,
     );
@@ -405,12 +407,23 @@ async fn an_entry_whose_record_is_missing_is_an_index_error_naming_its_key() {
         query.execute_ids(None).await.unwrap().items,
         vec!["ghost", "e1"]
     );
+    engine
+        .put_json(&ghost, &json!(entry("ghost", "t", 0)))
+        .await;
+    assert_eq!(
+        ids(&query.execute(None).await.unwrap().items),
+        vec!["ghost", "e1"]
+    );
+    engine
+        .put_json(&ghost, &json!(entry("ghost", "t", 5)))
+        .await;
+    assert_index_error_naming(query.execute(None).await, &ghost);
 
     let foreign = format!(
         "index:entry-by-tenant-rank:tenant:f:rank:{}:table:others:x",
         encode_index_integer(1)
     );
-    engine.put_raw(&foreign, Vec::new()).await;
+    engine.put_json(&foreign, &json!(entry("x", "f", 1))).await;
     let mut query = model.query_by_index("entry-by-tenant-rank");
     query.value("f");
     assert_index_error_naming(query.execute(None).await, &foreign);
@@ -423,22 +436,26 @@ async fn an_entry_whose_record_is_missing_is_an_index_error_naming_its_key() {
         )
         .await;
     engine
-        .put_raw(
+        .put_json(
             "unique-index:entries:entry-by-code:tenant:t:code:stale",
-            b"e1".to_vec(),
+            &json!(entry("e1", "t", 1)),
         )
         .await;
-    for code in ["lost", "stale"] {
-        assert!(matches!(
-            model
-                .find_one_by_unique_index(by_code("t", code), None)
-                .await,
-            Err(TitoError::IndexError(_))
-        ));
-    }
+    assert!(matches!(
+        model
+            .find_one_by_unique_index_for_share(by_code("t", "lost"), None)
+            .await,
+        Err(TitoError::DeserializationFailed(_))
+    ));
+    assert_index_error_naming(
+        model
+            .find_one_by_unique_index_for_share(by_code("t", "stale"), None)
+            .await,
+        "unique-index:entries:entry-by-code:tenant:t:code:stale",
+    );
     assert_eq!(
         model
-            .find_one_by_unique_index(by_code("t", "code-e1"), None)
+            .find_one_by_unique_index_for_share(by_code("t", "code-e1"), None)
             .await
             .unwrap(),
         entry("e1", "t", 1)
@@ -446,7 +463,7 @@ async fn an_entry_whose_record_is_missing_is_an_index_error_naming_its_key() {
 }
 
 #[tokio::test]
-async fn an_update_of_indexed_fields_moves_their_entries_and_keeps_them_free_of_data() {
+async fn an_update_of_indexed_fields_moves_their_entries_and_refreshes_every_copy() {
     let engine = engine();
     let model = entries(&engine);
     let before = save_entry(
@@ -475,19 +492,14 @@ async fn an_update_of_indexed_fields_moves_their_entries_and_keeps_them_free_of_
     ] {
         assert!(!engine.contains_key(&key).await, "{key}");
     }
+    let copy = engine.raw_bytes("table:entries:e:1").await.unwrap();
     for key in [
         rank_key("t", 2, "e:1"),
         "index:entry-by-tenant-tag:tenant:t:tags:y:table:entries:e:1".to_string(),
+        "unique-index:entries:entry-by-code:tenant:t:code:moved".to_string(),
     ] {
-        assert_eq!(engine.raw_bytes(&key).await.unwrap(), Vec::<u8>::new());
+        assert_eq!(engine.raw_bytes(&key).await.unwrap(), copy, "{key}");
     }
-    assert_eq!(
-        engine
-            .raw_bytes("unique-index:entries:entry-by-code:tenant:t:code:moved")
-            .await
-            .unwrap(),
-        b"e:1".to_vec()
-    );
     let manifest = engine
         .raw_json("reverse-index:table:entries:e:1")
         .await
@@ -522,14 +534,14 @@ async fn an_update_of_indexed_fields_moves_their_entries_and_keeps_them_free_of_
     assert_eq!(new_tag.execute_ids(None).await.unwrap().items, vec!["e:1"]);
     assert_eq!(
         model
-            .find_one_by_unique_index(by_code("t", "moved"), None)
+            .find_one_by_unique_index_for_share(by_code("t", "moved"), None)
             .await
             .unwrap(),
         after
     );
     assert!(matches!(
         model
-            .find_one_by_unique_index(by_code("t", "code-e:1"), None)
+            .find_one_by_unique_index_for_share(by_code("t", "code-e:1"), None)
             .await,
         Err(TitoError::NotFound(_))
     ));
@@ -564,7 +576,8 @@ async fn remove_and_remove_by_index_delete_every_entry_of_their_records() {
         assert!(!key.ends_with(":table:entries:e:1"), "{key}");
     }
     for key in engine.keys_with_prefix("unique-index:").await {
-        assert_ne!(engine.raw_bytes(&key).await.unwrap(), b"e:1".to_vec());
+        let copy: Entry = serde_json::from_slice(&engine.raw_bytes(&key).await.unwrap()).unwrap();
+        assert_ne!(copy.id, "e:1");
     }
     assert_eq!(engine.keys_with_prefix("index:").await.len(), 10);
     assert_eq!(engine.keys_with_prefix("unique-index:").await.len(), 2);
@@ -750,7 +763,7 @@ async fn a_scan_over_an_index_range_returns_the_records_of_ordinary_and_unique_e
     )
     .await;
     let tx = engine.begin_transaction().await.unwrap();
-    assert_index_error_naming(
+    assert_unreadable_copy_naming(
         model.scan(whole("unique-index:"), &tx).await,
         "unique-index:unique-accounts:verified-account-by-tenant-email:tenant_id:store-1:email:ada@example.com",
     );

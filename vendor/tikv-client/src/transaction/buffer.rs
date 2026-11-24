@@ -98,15 +98,23 @@ impl Buffer {
                 .into_iter()
                 .filter_map(|(k, v)| v.unwrap().map(|v| KvPair(k, v)));
 
-            let undetermined_keys = undetermined_keys.into_iter().map(|(k, _)| k);
+            let undetermined_keys = undetermined_keys
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect::<Vec<_>>();
             (cached_results, undetermined_keys)
         };
 
-        let fetched_results = f(Box::new(undetermined_keys)).await?;
+        let fetched_results = f(Box::new(undetermined_keys.clone().into_iter())).await?;
         for kvpair in &fetched_results {
             let key = kvpair.0.clone();
             let value = Some(kvpair.1.clone());
             self.update_cache(key, value);
+        }
+        for key in undetermined_keys {
+            if self.get_from_mutations(&key) == MutationValue::Undetermined {
+                self.update_cache(key, None);
+            }
         }
 
         let results = cached_results.chain(fetched_results);
@@ -550,6 +558,130 @@ mod tests {
             r3.unwrap().collect::<Vec<_>>(),
             vec![KvPair(k1, v1), KvPair(k2, v2)]
         );
+    }
+
+    #[test]
+    fn a_batch_read_remembers_the_keys_it_did_not_find() {
+        let found: Key = b"found".to_vec().into();
+        let missing: Key = b"missing".to_vec().into();
+        let value: Value = b"value".to_vec();
+        let mut buffer = Buffer::new(false);
+
+        let fetched_found = found.clone();
+        let fetched_value = value.clone();
+        let first = block_on(buffer.batch_get_or_else(
+            vec![found.clone(), missing.clone()].into_iter(),
+            move |keys| {
+                assert_eq!(keys.count(), 2);
+                ready(Ok(vec![KvPair(fetched_found, fetched_value)]))
+            },
+        ))
+        .unwrap()
+        .collect::<Vec<_>>();
+        assert_eq!(first, vec![KvPair(found.clone(), value.clone())]);
+        assert!(matches!(
+            buffer.entry_map.get(&missing),
+            Some(BufferEntry::Cached(None))
+        ));
+
+        let again = block_on(buffer.batch_get_or_else(
+            vec![missing.clone(), found.clone()].into_iter(),
+            move |keys| {
+                assert_eq!(keys.count(), 0);
+                ready(Ok(vec![]))
+            },
+        ))
+        .unwrap()
+        .collect::<Vec<_>>();
+        assert_eq!(again, vec![KvPair(found, value)]);
+        assert_eq!(
+            block_on(buffer.get_or_else(missing, move |_| ready(Err(internal_err!(""))))).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_batch_read_keeps_the_writes_and_locks_of_its_transaction() {
+        let written: Key = b"written".to_vec().into();
+        let deleted: Key = b"deleted".to_vec().into();
+        let inserted: Key = b"inserted".to_vec().into();
+        let locked: Key = b"locked".to_vec().into();
+        let missing: Key = b"missing".to_vec().into();
+        let mut buffer = Buffer::new(false);
+        buffer.put(written.clone(), b"put".to_vec());
+        buffer.delete(deleted.clone());
+        buffer.insert(inserted.clone(), b"insert".to_vec());
+        buffer.lock(locked.clone());
+
+        let results = block_on(
+            buffer.batch_get_or_else(
+                vec![
+                    written.clone(),
+                    deleted.clone(),
+                    inserted.clone(),
+                    locked.clone(),
+                    missing.clone(),
+                ]
+                .into_iter(),
+                move |keys| {
+                    assert_eq!(keys.collect::<Vec<_>>(), vec![locked_key(), missing_key()]);
+                    ready(Ok(vec![]))
+                },
+            ),
+        )
+        .unwrap()
+        .collect::<Vec<_>>();
+        assert_eq!(
+            results,
+            vec![
+                KvPair(written.clone(), b"put".to_vec()),
+                KvPair(inserted.clone(), b"insert".to_vec()),
+            ]
+        );
+        assert!(matches!(
+            buffer.entry_map.get(&written),
+            Some(BufferEntry::Put(_))
+        ));
+        assert!(matches!(
+            buffer.entry_map.get(&deleted),
+            Some(BufferEntry::Del)
+        ));
+        assert!(matches!(
+            buffer.entry_map.get(&inserted),
+            Some(BufferEntry::Insert(_))
+        ));
+        assert!(matches!(
+            buffer.entry_map.get(&locked),
+            Some(BufferEntry::Locked(Some(None)))
+        ));
+        assert!(matches!(
+            buffer.entry_map.get(&missing),
+            Some(BufferEntry::Cached(None))
+        ));
+        let mutations = buffer
+            .to_proto_mutations()
+            .into_iter()
+            .map(|mutation| (mutation.key, mutation.op))
+            .collect::<Vec<(Vec<u8>, i32)>>();
+        let expected: Vec<(Vec<u8>, i32)> = vec![
+            (deleted.into(), kvrpcpb::Op::Del.into()),
+            (inserted.into(), kvrpcpb::Op::Insert.into()),
+            (locked.clone().into(), kvrpcpb::Op::Lock.into()),
+            (written.into(), kvrpcpb::Op::Put.into()),
+        ];
+        assert_eq!(mutations, expected);
+        assert_eq!(
+            block_on(buffer.get_or_else(locked, move |_| ready(Err(internal_err!(""))))).unwrap(),
+            None
+        );
+    }
+
+    fn locked_key() -> Key {
+        b"locked".to_vec().into()
+    }
+
+    fn missing_key() -> Key {
+        b"missing".to_vec().into()
     }
 
     #[test]

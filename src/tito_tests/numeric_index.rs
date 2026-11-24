@@ -1,6 +1,5 @@
 use super::*;
 use crate::encode_index_integer;
-use crate::types::TitoIndexValue;
 use serde_json::Value;
 
 #[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -20,7 +19,6 @@ fn numeric_index(
     condition: bool,
 ) -> TitoIndexConfig {
     TitoIndexConfig {
-        value: TitoIndexValue::RecordReference,
         name: name.to_string(),
         fields: fields
             .iter()
@@ -159,7 +157,13 @@ async fn signed_integer_writes_and_exact_queries_share_one_encoding_at_every_wid
         assert_eq!(saved.value, json!(value));
         let encoded = encode_index_integer(value);
         let key = format!("index:numeric-by-value:value:{encoded}:table:numeric-records:{id}");
-        assert_eq!(engine.raw_bytes(&key).await.unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            engine.raw_bytes(&key).await.unwrap(),
+            engine
+                .raw_bytes(&format!("table:numeric-records:{id}"))
+                .await
+                .unwrap()
+        );
         for reverse in [false, true] {
             let mut query = model.query_by_index("numeric-by-value");
             query.value(value.to_string());
@@ -315,7 +319,7 @@ async fn numeric_unique_indexes_match_extrema_and_release_conditional_ownership(
         };
         assert_eq!(
             model
-                .find_one_by_unique_index(payload.clone(), None)
+                .find_one_by_unique_index_for_share(payload.clone(), None)
                 .await
                 .unwrap(),
             owner
@@ -332,7 +336,10 @@ async fn numeric_unique_indexes_match_extrema_and_release_conditional_ownership(
         save_numeric(&engine, owner).await.unwrap();
         save_numeric(&engine, competitor.clone()).await.unwrap();
         assert_eq!(
-            model.find_one_by_unique_index(payload, None).await.unwrap(),
+            model
+                .find_one_by_unique_index_for_share(payload, None)
+                .await
+                .unwrap(),
             competitor
         );
     }
@@ -362,7 +369,13 @@ async fn numeric_array_and_map_entries_use_the_same_signed_encoding() {
     }
     for (name, value) in &record.measurements {
         let key = format!("index:numeric-by-measurements:measurements:{name}:{}:table:numeric-records:collections", encode_index_integer(value.as_i64().unwrap()));
-        assert_eq!(engine.raw_bytes(&key).await.unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            engine.raw_bytes(&key).await.unwrap(),
+            engine
+                .raw_bytes("table:numeric-records:collections")
+                .await
+                .unwrap()
+        );
     }
 }
 
@@ -382,7 +395,13 @@ async fn numeric_map_entry_keys_are_encoded_exactly() {
             "index:numeric-by-measurements:measurements:{encoded_name}:{}:table:numeric-records:map-keys",
             encode_index_integer(value)
         );
-        assert_eq!(engine.raw_bytes(&key).await.unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            engine.raw_bytes(&key).await.unwrap(),
+            engine
+                .raw_bytes("table:numeric-records:map-keys")
+                .await
+                .unwrap()
+        );
     }
     assert_eq!(
         engine
@@ -527,7 +546,7 @@ async fn numeric_queries_reject_noncanonical_text_in_every_lookup_direction() {
         ));
         assert!(matches!(
             model
-                .find_one_by_unique_index(
+                .find_one_by_unique_index_for_share(
                     TitoFindOneByIndexPayload {
                         index: "numeric-unique-value".to_string(),
                         values: vec!["tenant".to_string(), invalid.to_string()],
@@ -594,7 +613,7 @@ async fn numeric_updates_and_bounded_batch_removal_preserve_other_values_and_opa
     }
     assert_eq!(removed, vec![opaque_id, "a2", "a20", "a3"]);
     assert_eq!(
-        model.get("retained").execute(None).await.unwrap().value,
+        model.get_for_share("retained", None).await.unwrap().value,
         json!(0)
     );
     assert!(!engine.contains_key(&updated_key).await);

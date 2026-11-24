@@ -1,5 +1,4 @@
 use super::*;
-use crate::types::TitoIndexValue;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -40,7 +39,6 @@ impl ComputedRecord {
             });
         }
         TitoIndexConfig {
-            value: TitoIndexValue::RecordReference,
             name: name.to_string(),
             condition: self.enabled && (!unique || self.unique),
             fields,
@@ -107,18 +105,22 @@ async fn custom_string_uses_existing_encoding_without_a_stored_field_and_default
     let json = serde_json::to_value(&stored).unwrap();
     assert!(json.get("target_key").is_none());
     let encoded = encode_index_string(&stored.target_key());
+    let copy = engine
+        .raw_bytes("table:computed-records:first")
+        .await
+        .unwrap();
     assert_eq!(
         engine.raw_bytes(&format!(
             "index:computed-by-target:tenant:store-1:target_key:{encoded}:table:computed-records:first"
         )).await.unwrap(),
-        Vec::<u8>::new()
+        copy
     );
     assert_eq!(
         engine.raw_bytes(&format!(
             "index:computed-by-target-rank:tenant:store-1:target_key:{encoded}:rank:{}:table:computed-records:first",
             crate::encode_index_integer(-1)
         )).await.unwrap(),
-        Vec::<u8>::new()
+        copy
     );
     assert_eq!(
         engine
@@ -127,7 +129,7 @@ async fn custom_string_uses_existing_encoding_without_a_stored_field_and_default
             ))
             .await
             .unwrap(),
-        b"first".to_vec()
+        copy
     );
     let query = TitoFindByIndexPayload {
         index: "computed-by-target".to_string(),
@@ -141,7 +143,7 @@ async fn custom_string_uses_existing_encoding_without_a_stored_field_and_default
     );
     assert_eq!(
         model
-            .find_one_by_unique_index(
+            .find_one_by_unique_index_for_share(
                 TitoFindOneByIndexPayload {
                     index: "computed-unique-target".to_string(),
                     values: vec![stored.tenant.clone(), stored.target_key()],
@@ -206,17 +208,27 @@ async fn computed_unique_ownership_is_scoped_and_updates_release_old_reverse_ind
     ] {
         for key in engine.keys_with_prefix(prefix).await {
             assert!(!key.ends_with(":table:computed-records:owner"));
-            assert_eq!(engine.raw_bytes(&key).await.unwrap(), Vec::<u8>::new());
+            let owner = key.rsplit(':').next().unwrap().to_string();
+            assert_eq!(
+                engine.raw_bytes(&key).await.unwrap(),
+                engine
+                    .raw_bytes(&format!("table:computed-records:{owner}"))
+                    .await
+                    .unwrap()
+            );
         }
     }
     for key in engine
         .keys_with_prefix("unique-index:computed-records:")
         .await
     {
-        assert_ne!(engine.raw_bytes(&key).await.unwrap(), b"owner".to_vec());
+        let copy: ComputedRecord =
+            serde_json::from_slice(&engine.raw_bytes(&key).await.unwrap()).unwrap();
+        assert_ne!(copy.id, "owner");
+        assert_eq!(model.get_for_share(&copy.id, None).await.unwrap(), copy);
     }
-    assert_eq!(model.get("owner").execute(None).await.unwrap(), owner);
-    assert_eq!(model.get("foreign").execute(None).await.unwrap(), foreign);
+    assert_eq!(model.get_for_share("owner", None).await.unwrap(), owner);
+    assert_eq!(model.get_for_share("foreign", None).await.unwrap(), foreign);
 }
 
 #[tokio::test]
@@ -229,7 +241,7 @@ async fn empty_computed_values_remain_sparse_and_definition_discovery_is_not_con
     source.target_id.clear();
     source.unique = true;
     let source = save(&engine, source).await.unwrap();
-    assert_eq!(model.get("empty").execute(None).await.unwrap(), source);
+    assert_eq!(model.get_for_share("empty", None).await.unwrap(), source);
     assert!(engine.keys_with_prefix("index:computed-").await.is_empty());
     assert!(engine
         .keys_with_prefix("unique-index:computed-records:")

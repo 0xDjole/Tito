@@ -75,7 +75,7 @@ async fn new_tally(
 }
 
 async fn tally_value(tallies: &TitoModel<TiKVBackend, NativeTally>, id: &str) -> i64 {
-    tallies.get(id).execute(None).await.unwrap().value
+    tallies.get_for_share(id, None).await.unwrap().value
 }
 
 async fn publish_change(
@@ -110,7 +110,7 @@ async fn apply_change(
     if !queue.ack_in_tx(event, tx).await? {
         return Ok(false);
     }
-    let mut tally = tallies.get(tally_id).execute(Some(tx)).await?;
+    let mut tally = tallies.get_for_share(tally_id, Some(tx)).await?;
     tally.value += event.payload.value;
     tallies.set(tally).timestamps(false).execute(tx).await?;
     Ok(true)

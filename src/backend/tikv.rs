@@ -642,6 +642,7 @@ impl TitoTransaction for TiKVTransaction {
             .map(|key| key.as_ref().to_vec())
             .collect::<Vec<_>>()];
         let mut found = Vec::new();
+        let mut attempt = 0;
         while let Some(mut chunk) = chunks.pop() {
             let request: Vec<tikv_client::Key> = chunk.iter().cloned().map(Into::into).collect();
             let result = self
@@ -663,11 +664,17 @@ impl TitoTransaction for TiKVTransaction {
                     chunks.push(chunk);
                 }
                 Err(error) => {
-                    return Err(classify_tikv_error(
-                        error,
-                        "Batch get operation failed",
-                        &self.had_retryable_error,
-                    ))
+                    let pending = AtomicBool::new(false);
+                    let error = classify_tikv_error(error, "Batch get operation failed", &pending);
+                    attempt += 1;
+                    if !error.is_retryable() || attempt >= MAX_READ_LOCK_RESOLUTION_ATTEMPTS {
+                        if pending.load(Ordering::Relaxed) {
+                            self.had_retryable_error.store(true, Ordering::Relaxed);
+                        }
+                        return Err(error);
+                    }
+                    sleep(READ_LOCK_RESOLUTION_BACKOFF * attempt).await;
+                    chunks.push(chunk);
                 }
             }
         }

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -131,11 +131,16 @@ impl<E: TitoEngine> Queue<E> {
         tx: &E::Transaction,
         key: &str,
     ) -> Result<Option<T>, TitoError> {
-        let Some(bytes) = tx
+        let bytes = tx
             .get(key.as_bytes())
             .await
-            .map_err(|e| TitoError::QueryFailed(format!("Get cluster queue key: {}", e)))?
-        else {
+            .map_err(|e| TitoError::QueryFailed(format!("Get cluster queue key: {}", e)))?;
+
+        Self::decode_json(bytes)
+    }
+
+    fn decode_json<T: DeserializeOwned>(bytes: Option<Vec<u8>>) -> Result<Option<T>, TitoError> {
+        let Some(bytes) = bytes else {
             return Ok(None);
         };
 
@@ -264,13 +269,23 @@ impl<E: TitoEngine> Queue<E> {
                         .collect::<BTreeSet<_>>();
                     let desired = desired_partition_owners(partition_count, &nodes);
                     let mut assignments = Vec::new();
+                    let keys = (0..partition_count)
+                        .map(|partition| self.partition_key(partition))
+                        .collect::<Vec<_>>();
+                    let mut found: HashMap<_, _> = tx
+                        .batch_get(keys.iter().collect::<Vec<_>>())
+                        .await
+                        .map_err(|e| {
+                            TitoError::QueryFailed(format!("Get cluster queue key: {}", e))
+                        })?
+                        .into_iter()
+                        .collect();
 
-                    for partition in 0..partition_count {
-                        let key = self.partition_key(partition);
-                        let mut assignment =
-                            Self::read_json::<ClusterPartitionAssignment>(&tx, &key)
-                                .await?
-                                .unwrap_or_else(|| ClusterPartitionAssignment::new(partition));
+                    for (partition, key) in (0..partition_count).zip(keys) {
+                        let mut assignment = Self::decode_json::<ClusterPartitionAssignment>(
+                            found.remove(key.as_bytes()),
+                        )?
+                        .unwrap_or_else(|| ClusterPartitionAssignment::new(partition));
 
                         let next_desired = desired.get(&partition).cloned();
                         let desired_changed = assignment.desired_node_id != next_desired;

@@ -6,7 +6,7 @@ use crate::types::{
 use crate::TitoError;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -60,6 +60,7 @@ pub(crate) struct MemoryEngine {
     next_commit_unknown_after_apply: Arc<Mutex<Option<bool>>>,
     next_transaction_version: Arc<AtomicU64>,
     pending_queue_scans: Arc<AtomicU64>,
+    read_round_trips: Arc<AtomicU64>,
     recorded_reads: Arc<Mutex<Option<Vec<Vec<u8>>>>>,
     recorded_batch_gets: Arc<Mutex<Option<Vec<Vec<String>>>>>,
     recorded_writes: Arc<Mutex<Option<Vec<RecordedWrite>>>>,
@@ -75,6 +76,7 @@ pub(crate) enum RecordedWrite {
 pub(crate) struct MemoryTransaction {
     store: Arc<Mutex<MemoryStore>>,
     local: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
+    buffered: Arc<Mutex<HashSet<Vec<u8>>>>,
     writes: Arc<Mutex<MemoryWrites>>,
     guards: Arc<Mutex<Guards>>,
     snapshot: u64,
@@ -83,6 +85,7 @@ pub(crate) struct MemoryTransaction {
     start_version: u64,
     shared_fence_pick: u64,
     pending_queue_scans: Arc<AtomicU64>,
+    read_round_trips: Arc<AtomicU64>,
     recorded_reads: Arc<Mutex<Option<Vec<Vec<u8>>>>>,
     recorded_batch_gets: Arc<Mutex<Option<Vec<Vec<String>>>>>,
     recorded_writes: Arc<Mutex<Option<Vec<RecordedWrite>>>>,
@@ -141,6 +144,10 @@ impl MemoryEngine {
         self.pending_queue_scans.load(Ordering::SeqCst)
     }
 
+    pub(crate) fn read_round_trips(&self) -> u64 {
+        self.read_round_trips.load(Ordering::SeqCst)
+    }
+
     pub(crate) async fn raw_bytes(&self, key: &str) -> Option<Vec<u8>> {
         self.store.lock().await.values.get(key.as_bytes()).cloned()
     }
@@ -183,6 +190,7 @@ impl TitoEngine for MemoryEngine {
         Ok(MemoryTransaction {
             store: self.store.clone(),
             local: Arc::new(Mutex::new(local)),
+            buffered: Arc::new(Mutex::new(HashSet::new())),
             writes: Arc::new(Mutex::new(MemoryWrites::new())),
             guards: Arc::new(Mutex::new(Guards::default())),
             snapshot,
@@ -191,6 +199,7 @@ impl TitoEngine for MemoryEngine {
             start_version,
             shared_fence_pick: rand::random(),
             pending_queue_scans: self.pending_queue_scans.clone(),
+            read_round_trips: self.read_round_trips.clone(),
             recorded_reads: self.recorded_reads.clone(),
             recorded_batch_gets: self.recorded_batch_gets.clone(),
             recorded_writes: self.recorded_writes.clone(),
@@ -259,12 +268,16 @@ impl TitoTransaction for MemoryTransaction {
     }
 
     async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<TitoValue>, TitoError> {
+        if !self.buffered.lock().await.contains(key.as_ref()) {
+            self.read_round_trips.fetch_add(1, Ordering::SeqCst);
+        }
         if let Some(reads) = self.recorded_reads.lock().await.as_mut() {
             reads.push(key.as_ref().to_vec());
         }
         if let Some(message) = self.next_get_error.lock().await.take() {
             return Err(TitoError::QueryFailed(message));
         }
+        self.buffered.lock().await.insert(key.as_ref().to_vec());
         Ok(self.local.lock().await.get(key.as_ref()).cloned())
     }
 
@@ -286,6 +299,7 @@ impl TitoTransaction for MemoryTransaction {
             .lock()
             .await
             .insert(key.as_ref().to_vec(), Some(value.as_ref().to_vec()));
+        self.buffered.lock().await.insert(key.as_ref().to_vec());
         note_write(&mut *self.guards.lock().await, key.as_ref());
         Ok(())
     }
@@ -298,6 +312,7 @@ impl TitoTransaction for MemoryTransaction {
         }
         self.local.lock().await.remove(key.as_ref());
         self.writes.lock().await.insert(key.as_ref().to_vec(), None);
+        self.buffered.lock().await.insert(key.as_ref().to_vec());
         note_write(&mut *self.guards.lock().await, key.as_ref());
         Ok(())
     }
@@ -307,6 +322,7 @@ impl TitoTransaction for MemoryTransaction {
         range: Range<K>,
         limit: u32,
     ) -> Result<Vec<TitoKvPair>, TitoError> {
+        self.read_round_trips.fetch_add(1, Ordering::SeqCst);
         let start = range.start.as_ref().to_vec();
         let end = range.end.as_ref().to_vec();
         if let Some(reads) = self.recorded_reads.lock().await.as_mut() {
@@ -315,14 +331,19 @@ impl TitoTransaction for MemoryTransaction {
         if start.starts_with(b"queue:pending:") {
             self.pending_queue_scans.fetch_add(1, Ordering::SeqCst);
         }
-        Ok(self
+        let rows = self
             .local
             .lock()
             .await
             .range(start..end)
             .take(limit as usize)
             .map(|(key, value)| (key.clone(), value.clone()))
-            .collect())
+            .collect::<Vec<_>>();
+        self.buffered
+            .lock()
+            .await
+            .extend(rows.iter().map(|(key, _)| key.clone()));
+        Ok(rows)
     }
 
     async fn scan_keys<K: AsRef<[u8]> + Send>(
@@ -330,6 +351,7 @@ impl TitoTransaction for MemoryTransaction {
         range: Range<K>,
         limit: u32,
     ) -> Result<Vec<Vec<u8>>, TitoError> {
+        self.read_round_trips.fetch_add(1, Ordering::SeqCst);
         let start = range.start.as_ref().to_vec();
         let end = range.end.as_ref().to_vec();
         if let Some(reads) = self.recorded_reads.lock().await.as_mut() {
@@ -350,12 +372,13 @@ impl TitoTransaction for MemoryTransaction {
         range: Range<K>,
         limit: u32,
     ) -> Result<Vec<TitoKvPair>, TitoError> {
+        self.read_round_trips.fetch_add(1, Ordering::SeqCst);
         let start = range.start.as_ref().to_vec();
         let end = range.end.as_ref().to_vec();
         if let Some(reads) = self.recorded_reads.lock().await.as_mut() {
             reads.push([b"scan-reverse:", start.as_slice()].concat());
         }
-        Ok(self
+        let rows = self
             .local
             .lock()
             .await
@@ -363,13 +386,25 @@ impl TitoTransaction for MemoryTransaction {
             .rev()
             .take(limit as usize)
             .map(|(key, value)| (key.clone(), value.clone()))
-            .collect())
+            .collect::<Vec<_>>();
+        self.buffered
+            .lock()
+            .await
+            .extend(rows.iter().map(|(key, _)| key.clone()));
+        Ok(rows)
     }
 
     async fn batch_get<K: AsRef<[u8]> + Send>(
         &self,
         keys: Vec<K>,
     ) -> Result<Vec<TitoKvPair>, TitoError> {
+        let all_buffered = {
+            let buffered = self.buffered.lock().await;
+            keys.iter().all(|key| buffered.contains(key.as_ref()))
+        };
+        if !all_buffered {
+            self.read_round_trips.fetch_add(1, Ordering::SeqCst);
+        }
         if let Some(reads) = self.recorded_reads.lock().await.as_mut() {
             reads.extend(keys.iter().map(|key| key.as_ref().to_vec()));
         }
@@ -380,14 +415,22 @@ impl TitoTransaction for MemoryTransaction {
                     .collect(),
             );
         }
-        let data = self.local.lock().await;
-        Ok(keys
-            .into_iter()
-            .filter_map(|key| {
-                let bytes = key.as_ref().to_vec();
-                data.get(&bytes).map(|value| (bytes, value.clone()))
-            })
-            .collect())
+        if let Some(message) = self.next_get_error.lock().await.take() {
+            return Err(TitoError::QueryFailed(message));
+        }
+        let requested = keys
+            .iter()
+            .map(|key| key.as_ref().to_vec())
+            .collect::<Vec<_>>();
+        let found = {
+            let data = self.local.lock().await;
+            requested
+                .iter()
+                .filter_map(|key| data.get(key).map(|value| (key.clone(), value.clone())))
+                .collect::<Vec<_>>()
+        };
+        self.buffered.lock().await.extend(requested);
+        Ok(found)
     }
 
     async fn commit(self) -> Result<(), TitoError> {

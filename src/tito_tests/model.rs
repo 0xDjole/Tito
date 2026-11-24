@@ -30,7 +30,7 @@ fn seventeen_fence_keys(table_and_id: &str) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn get_exclusive_requires_an_existing_record_and_changes_no_stored_byte() {
+async fn get_for_update_requires_an_existing_record_and_changes_no_stored_byte() {
     let engine = engine();
     let model = shops(&engine);
     save_shop(&engine, shop("s1")).await.unwrap();
@@ -39,14 +39,18 @@ async fn get_exclusive_requires_an_existing_record_and_changes_no_stored_byte() 
         .raw_bytes("reverse-index:table:shops:s1")
         .await
         .unwrap();
-    let version = model.get_versioned("s1", None).await.unwrap().version;
+    let version = model
+        .get_versioned_for_share("s1", None)
+        .await
+        .unwrap()
+        .version;
 
     let tx = engine.begin_transaction().await.unwrap();
     assert!(matches!(
-        model.get_exclusive("missing", &tx).await,
+        model.get_for_update("missing", &tx).await,
         Err(TitoError::NotFound(_))
     ));
-    assert_eq!(model.get_exclusive("s1", &tx).await.unwrap(), shop("s1"));
+    assert_eq!(model.get_for_update("s1", &tx).await.unwrap(), shop("s1"));
     assert_eq!(
         commit_writes(&engine, tx).await,
         vec![RecordedWrite::Delete(exclusive_fence_key("shops", "s1"))]
@@ -61,14 +65,18 @@ async fn get_exclusive_requires_an_existing_record_and_changes_no_stored_byte() 
         manifest
     );
     assert_eq!(
-        model.get_versioned("s1", None).await.unwrap().version,
+        model
+            .get_versioned_for_share("s1", None)
+            .await
+            .unwrap()
+            .version,
         version
     );
     assert!(engine.keys_with_prefix("fence:").await.is_empty());
 }
 
 #[tokio::test]
-async fn a_read_by_id_in_a_writing_transaction_deletes_one_shared_key_of_its_pick_at_commit() {
+async fn a_read_for_share_in_a_writing_transaction_deletes_one_shared_key_of_its_pick_at_commit() {
     let engine = engine();
     let model = shops(&engine);
     let accounts = unique_accounts(&engine);
@@ -80,7 +88,7 @@ async fn a_read_by_id_in_a_writing_transaction_deletes_one_shared_key_of_its_pic
     .await;
 
     let tx = engine.begin_transaction().await.unwrap();
-    model.get("s1").execute(Some(&tx)).await.unwrap();
+    model.get_for_share("s1", Some(&tx)).await.unwrap();
     write_scratch(&tx).await;
     let key = shared_fence_key("shops", "s1", picked_number(&tx));
     assert_eq!(
@@ -90,8 +98,7 @@ async fn a_read_by_id_in_a_writing_transaction_deletes_one_shared_key_of_its_pic
 
     let tx = engine.begin_transaction().await.unwrap();
     model
-        .get_many(vec!["s1".to_string()])
-        .execute(Some(&tx))
+        .get_many_for_share(vec!["s1".to_string()], Some(&tx))
         .await
         .unwrap();
     write_scratch(&tx).await;
@@ -102,7 +109,10 @@ async fn a_read_by_id_in_a_writing_transaction_deletes_one_shared_key_of_its_pic
     );
 
     let tx = engine.begin_transaction().await.unwrap();
-    model.get_versioned("s1", Some(&tx)).await.unwrap();
+    model
+        .get_versioned_for_share("s1", Some(&tx))
+        .await
+        .unwrap();
     write_scratch(&tx).await;
     let key = shared_fence_key("shops", "s1", picked_number(&tx));
     assert_eq!(
@@ -112,7 +122,7 @@ async fn a_read_by_id_in_a_writing_transaction_deletes_one_shared_key_of_its_pic
 
     let tx = engine.begin_transaction().await.unwrap();
     accounts
-        .find_one_by_unique_index(account_by_email("a1@example.com"), Some(&tx))
+        .find_one_by_unique_index_for_share(account_by_email("a1@example.com"), Some(&tx))
         .await
         .unwrap();
     write_scratch(&tx).await;
@@ -125,22 +135,58 @@ async fn a_read_by_id_in_a_writing_transaction_deletes_one_shared_key_of_its_pic
 }
 
 #[tokio::test]
-async fn get_exclusive_deletes_the_exclusive_key_at_commit_in_place_of_the_shared_one() {
+async fn a_plain_read_in_a_writing_transaction_deletes_no_fence_key_at_commit() {
+    let engine = engine();
+    let model = shops(&engine);
+    let accounts = unique_accounts(&engine);
+    save_shop(&engine, shop("s1")).await.unwrap();
+    save_unique_account(
+        &engine,
+        unique_account("a1", "tenant", "a1@example.com", true),
+    )
+    .await;
+
+    let tx = engine.begin_transaction().await.unwrap();
+    assert_eq!(model.get("s1", Some(&tx)).await.unwrap(), shop("s1"));
+    assert_eq!(
+        model
+            .get_many(vec!["s1".to_string()], Some(&tx))
+            .await
+            .unwrap(),
+        vec![shop("s1")]
+    );
+    assert_eq!(
+        accounts
+            .find_one_by_unique_index(account_by_email("a1@example.com"), Some(&tx))
+            .await
+            .unwrap()
+            .id,
+        "a1"
+    );
+    write_scratch(&tx).await;
+    assert!(commit_writes(&engine, tx).await.is_empty());
+    assert!(engine.keys_with_prefix("fence:").await.is_empty());
+}
+
+#[tokio::test]
+async fn get_for_update_deletes_the_exclusive_key_at_commit_in_place_of_the_shared_one() {
     let engine = engine();
     let model = shops(&engine);
     save_shop(&engine, shop("s1")).await.unwrap();
     save_shop(&engine, shop("s2")).await.unwrap();
 
     let tx = engine.begin_transaction().await.unwrap();
-    model.get("s1").execute(Some(&tx)).await.unwrap();
-    model.get_exclusive("s1", &tx).await.unwrap();
-    model.get_exclusive("s2", &tx).await.unwrap();
+    model.get_for_share("s1", Some(&tx)).await.unwrap();
+    model.get_for_update("s1", &tx).await.unwrap();
+    model.get_for_update("s2", &tx).await.unwrap();
     model
-        .get_many(vec!["s1".to_string(), "s2".to_string()])
-        .execute(Some(&tx))
+        .get_many_for_share(vec!["s1".to_string(), "s2".to_string()], Some(&tx))
         .await
         .unwrap();
-    model.get_versioned("s2", Some(&tx)).await.unwrap();
+    model
+        .get_versioned_for_share("s2", Some(&tx))
+        .await
+        .unwrap();
     write_scratch(&tx).await;
     assert_eq!(
         commit_writes(&engine, tx).await,
@@ -165,29 +211,30 @@ async fn a_transaction_that_writes_nothing_and_a_read_without_a_transaction_add_
     .await;
 
     let tx = engine.begin_transaction().await.unwrap();
-    model.get("s1").execute(Some(&tx)).await.unwrap();
+    model.get_for_share("s1", Some(&tx)).await.unwrap();
     model
-        .get_many(vec!["s1".to_string()])
-        .execute(Some(&tx))
+        .get_many_for_share(vec!["s1".to_string()], Some(&tx))
         .await
         .unwrap();
-    model.get_versioned("s1", Some(&tx)).await.unwrap();
+    model
+        .get_versioned_for_share("s1", Some(&tx))
+        .await
+        .unwrap();
     accounts
-        .find_one_by_unique_index(account_by_email("a1@example.com"), Some(&tx))
+        .find_one_by_unique_index_for_share(account_by_email("a1@example.com"), Some(&tx))
         .await
         .unwrap();
     assert!(commit_writes(&engine, tx).await.is_empty());
 
     engine.start_recording_writes().await;
-    model.get("s1").execute(None).await.unwrap();
+    model.get_for_share("s1", None).await.unwrap();
     model
-        .get_many(vec!["s1".to_string()])
-        .execute(None)
+        .get_many_for_share(vec!["s1".to_string()], None)
         .await
         .unwrap();
-    model.get_versioned("s1", None).await.unwrap();
+    model.get_versioned_for_share("s1", None).await.unwrap();
     accounts
-        .find_one_by_unique_index(account_by_email("a1@example.com"), None)
+        .find_one_by_unique_index_for_share(account_by_email("a1@example.com"), None)
         .await
         .unwrap();
     assert!(engine.take_recorded_writes().await.is_empty());
@@ -195,7 +242,7 @@ async fn a_transaction_that_writes_nothing_and_a_read_without_a_transaction_add_
 }
 
 #[tokio::test]
-async fn get_exclusive_counts_as_a_write_so_its_transaction_deletes_every_key_it_noted() {
+async fn get_for_update_counts_as_a_write_so_its_transaction_deletes_every_key_it_noted() {
     let engine = engine();
     let model = shops(&engine);
     for id in ["s1", "s2", "s3"] {
@@ -203,13 +250,12 @@ async fn get_exclusive_counts_as_a_write_so_its_transaction_deletes_every_key_it
     }
 
     let tx = engine.begin_transaction().await.unwrap();
-    model.get("s1").execute(Some(&tx)).await.unwrap();
+    model.get_for_share("s1", Some(&tx)).await.unwrap();
     model
-        .get_many(vec!["s2".to_string()])
-        .execute(Some(&tx))
+        .get_many_for_share(vec!["s2".to_string()], Some(&tx))
         .await
         .unwrap();
-    model.get_exclusive("s3", &tx).await.unwrap();
+    model.get_for_update("s3", &tx).await.unwrap();
     let number = picked_number(&tx);
     assert_eq!(
         commit_writes(&engine, tx).await,
@@ -222,14 +268,14 @@ async fn get_exclusive_counts_as_a_write_so_its_transaction_deletes_every_key_it
 
     let first = engine.begin_transaction().await.unwrap();
     let second = engine.begin_transaction().await.unwrap();
-    model.get_exclusive("s1", &first).await.unwrap();
-    model.get_exclusive("s1", &second).await.unwrap();
+    model.get_for_update("s1", &first).await.unwrap();
+    model.get_for_update("s1", &second).await.unwrap();
     second.commit().await.unwrap();
     assert!(matches!(first.commit().await, Err(TitoError::Retryable(_))));
 
     let reader = engine.begin_transaction().await.unwrap();
-    model.get_exclusive("s1", &reader).await.unwrap();
-    model.get("s2").execute(Some(&reader)).await.unwrap();
+    model.get_for_update("s1", &reader).await.unwrap();
+    model.get_for_share("s2", Some(&reader)).await.unwrap();
     save_shop(
         &engine,
         Shop {
@@ -256,14 +302,14 @@ async fn a_fence_write_does_not_cancel_another_guard_key() {
         let tx = engine.begin_transaction().await.unwrap();
         let (written, expected) = match guard {
             TitoGuard::Shared => {
-                model.get("s1").execute(Some(&tx)).await.unwrap();
+                model.get_for_share("s1", Some(&tx)).await.unwrap();
                 (
                     exclusive_fence_key("shops", "s1"),
                     shared_fence_key("shops", "s1", picked_number(&tx)),
                 )
             }
             TitoGuard::Exclusive => {
-                model.get_exclusive("s1", &tx).await.unwrap();
+                model.get_for_update("s1", &tx).await.unwrap();
                 (
                     shared_fence_key("shops", "s1", picked_number(&tx)),
                     exclusive_fence_key("shops", "s1"),
@@ -286,7 +332,7 @@ async fn a_record_saved_or_removed_in_its_own_transaction_adds_no_guard() {
     save_shop(&engine, shop("s1")).await.unwrap();
 
     let tx = engine.begin_transaction().await.unwrap();
-    model.get("s1").execute(Some(&tx)).await.unwrap();
+    model.get_for_share("s1", Some(&tx)).await.unwrap();
     engine.start_recording_writes().await;
     model
         .set(Shop {
@@ -304,7 +350,7 @@ async fn a_record_saved_or_removed_in_its_own_transaction_adds_no_guard() {
     assert!(commit_writes(&engine, tx).await.is_empty());
 
     let tx = engine.begin_transaction().await.unwrap();
-    model.get_exclusive("s1", &tx).await.unwrap();
+    model.get_for_update("s1", &tx).await.unwrap();
     engine.start_recording_writes().await;
     model
         .set(shop("s1"))
@@ -330,13 +376,13 @@ async fn a_record_saved_or_removed_in_its_own_transaction_adds_no_guard() {
         fence_writes(&engine.take_recorded_writes().await),
         record_fence_keys("shops", "s2")
     );
-    model.get("s2").execute(Some(&tx)).await.unwrap();
-    model.get_exclusive("s2", &tx).await.unwrap();
+    model.get_for_share("s2", Some(&tx)).await.unwrap();
+    model.get_for_update("s2", &tx).await.unwrap();
     assert!(commit_writes(&engine, tx).await.is_empty());
 
     let tx = engine.begin_transaction().await.unwrap();
-    model.get("s1").execute(Some(&tx)).await.unwrap();
-    model.get_exclusive("s2", &tx).await.unwrap();
+    model.get_for_share("s1", Some(&tx)).await.unwrap();
+    model.get_for_update("s2", &tx).await.unwrap();
     engine.start_recording_writes().await;
     assert!(model.remove("s1", &tx).await.unwrap());
     assert!(model.remove("s2", &tx).await.unwrap());
@@ -414,26 +460,25 @@ async fn index_reads_scans_and_misses_add_no_guard() {
     assert_eq!(model.scan(scan(), &tx).await.unwrap().0.len(), 1);
     assert_eq!(model.scan_reverse(scan(), &tx).await.unwrap().0.len(), 1);
     assert!(matches!(
-        model.get("missing").execute(Some(&tx)).await,
+        model.get_for_share("missing", Some(&tx)).await,
         Err(TitoError::NotFound(_))
     ));
     assert!(model
-        .get_many(vec!["missing".to_string()])
-        .execute(Some(&tx))
+        .get_many_for_share(vec!["missing".to_string()], Some(&tx))
         .await
         .unwrap()
         .is_empty());
     assert!(matches!(
-        model.get_versioned("missing", Some(&tx)).await,
+        model.get_versioned_for_share("missing", Some(&tx)).await,
         Err(TitoError::NotFound(_))
     ));
     assert!(matches!(
-        model.get_exclusive("missing", &tx).await,
+        model.get_for_update("missing", &tx).await,
         Err(TitoError::NotFound(_))
     ));
     assert!(matches!(
         accounts
-            .find_one_by_unique_index(account_by_email("missing@example.com"), Some(&tx))
+            .find_one_by_unique_index_for_share(account_by_email("missing@example.com"), Some(&tx))
             .await,
         Err(TitoError::NotFound(_))
     ));
@@ -452,12 +497,11 @@ async fn every_read_of_one_transaction_uses_the_shared_key_of_its_pick_once_per_
 
     let tx = engine.begin_transaction().await.unwrap();
     for id in &ids {
-        model.get(id).execute(Some(&tx)).await.unwrap();
-        model.get_versioned(id, Some(&tx)).await.unwrap();
+        model.get_for_share(id, Some(&tx)).await.unwrap();
+        model.get_versioned_for_share(id, Some(&tx)).await.unwrap();
     }
     model
-        .get_many(ids.clone())
-        .execute(Some(&tx))
+        .get_many_for_share(ids.clone(), Some(&tx))
         .await
         .unwrap();
     write_scratch(&tx).await;
@@ -489,7 +533,10 @@ async fn shared_reads_take_turns_only_when_their_transactions_pick_one_key() {
     let same = transaction_with_shared_key(&engine, |picked| picked == number).await;
     for tx in [&first, &other, &same] {
         assert_eq!(
-            model.get_many(ids.clone()).execute(Some(tx)).await.unwrap(),
+            model
+                .get_many_for_share(ids.clone(), Some(tx))
+                .await
+                .unwrap(),
             ids.iter().map(|id| shop(id)).collect::<Vec<_>>()
         );
         write_scratch(tx).await;
@@ -520,7 +567,7 @@ async fn every_attempt_of_a_retried_transaction_guards_with_its_own_pick_and_sta
                     numbers.len()
                 };
                 let read = if attempt == 1 { "s1" } else { "s2" };
-                model.get(read).execute(Some(&tx)).await?;
+                model.get_for_share(read, Some(&tx)).await?;
                 write_scratch(&tx).await;
                 save_shop(
                     &engine,
@@ -548,7 +595,7 @@ async fn every_attempt_of_a_retried_transaction_guards_with_its_own_pick_and_sta
         ))]
     );
     assert_eq!(
-        shops(&engine).get("s1").execute(None).await.unwrap().name,
+        shops(&engine).get_for_share("s1", None).await.unwrap().name,
         "Renamed during attempt 2"
     );
 }
@@ -753,16 +800,14 @@ async fn model_set_get_and_get_many_round_trip() {
     save_author(&engine, author("a2", "grace@example.com", 42, "org-a")).await;
 
     assert_eq!(
-        model.get("a1").execute(None).await.unwrap().email,
+        model.get_for_share("a1", None).await.unwrap().email,
         "Ada@Example.com"
     );
     let many = model
-        .get_many(vec![
-            "a2".to_string(),
-            "missing".to_string(),
-            "a1".to_string(),
-        ])
-        .execute(None)
+        .get_many_for_share(
+            vec!["a2".to_string(), "missing".to_string(), "a1".to_string()],
+            None,
+        )
         .await
         .unwrap();
     let mut ids = many.into_iter().map(|item| item.id).collect::<Vec<_>>();
@@ -810,7 +855,7 @@ async fn model_explicit_signed_epoch_milliseconds_round_trip_without_unit_guessi
             })
             .await
             .unwrap();
-        let restored = model.get(&saved.id).execute(None).await.unwrap();
+        let restored = model.get_for_share(&saved.id, None).await.unwrap();
         assert_eq!(saved.created_at, timestamp);
         assert_eq!(restored.created_at, timestamp);
         assert_eq!(restored.updated_at, timestamp);
@@ -896,8 +941,8 @@ async fn transaction_commits_successful_writes_and_rolls_back_errors() {
         .await;
 
     assert!(result.is_err());
-    assert!(model.get("committed").execute(None).await.is_ok());
-    assert!(model.get("rolled-back").execute(None).await.is_err());
+    assert!(model.get_for_share("committed", None).await.is_ok());
+    assert!(model.get_for_share("rolled-back", None).await.is_err());
 }
 
 #[tokio::test]
@@ -913,7 +958,7 @@ async fn transaction_reads_own_writes_before_commit() {
                     .set(author("a1", "ada@example.com", 1, "org"))
                     .execute(&tx)
                     .await?;
-                model.get("a1").execute(Some(&tx)).await
+                model.get_for_share("a1", Some(&tx)).await
             }
         })
         .await
@@ -927,7 +972,7 @@ async fn get_missing_record_returns_not_found() {
     let model = engine().model::<Author>(TitoModelOptions::default());
 
     assert!(matches!(
-        model.get("missing").execute(None).await.unwrap_err(),
+        model.get("missing", None).await.unwrap_err(),
         TitoError::NotFound(_)
     ));
 }
@@ -941,7 +986,7 @@ async fn get_malformed_record_returns_deserialization_error() {
         .await;
 
     assert!(matches!(
-        model.get("malformed").execute(None).await.unwrap_err(),
+        model.get("malformed", None).await.unwrap_err(),
         TitoError::DeserializationFailed(_)
     ));
 }
@@ -958,7 +1003,7 @@ async fn get_schema_incompatible_record_returns_deserialization_error() {
         .await;
 
     assert!(matches!(
-        model.get("incompatible").execute(None).await.unwrap_err(),
+        model.get("incompatible", None).await.unwrap_err(),
         TitoError::DeserializationFailed(_)
     ));
 }
@@ -970,7 +1015,7 @@ async fn get_preserves_backend_read_error() {
     engine.fail_next_get("read failed").await;
 
     assert_eq!(
-        model.get("a1").execute(None).await.unwrap_err(),
+        model.get("a1", None).await.unwrap_err(),
         TitoError::QueryFailed("read failed".to_string())
     );
 }
@@ -1361,8 +1406,7 @@ async fn paginated_scan_and_get_many_fail_on_schema_incompatible_rows() {
     ));
     assert!(matches!(
         model
-            .get_many(vec!["incompatible".to_string()])
-            .execute(None)
+            .get_many_for_share(vec!["incompatible".to_string()], None)
             .await
             .unwrap_err(),
         TitoError::DeserializationFailed(_)
@@ -1461,7 +1505,7 @@ async fn model_tx_runs_through_engine_transaction() {
         .unwrap();
 
     assert_eq!(saved.id, "a1");
-    assert!(model.get("a1").execute(None).await.is_ok());
+    assert!(model.get_for_share("a1", None).await.is_ok());
 }
 
 #[tokio::test]

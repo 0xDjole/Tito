@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tito::backend::tikv::TiKV;
-use tito::types::TitoIndexValue;
 use tito::types::{
     TitoFindOneByIndexPayload, TitoIndexConfig, TitoIndexField, TitoIndexFieldType, TitoTransaction,
 };
@@ -23,7 +22,6 @@ impl TitoModelTrait for NativeOwner {
     }
     fn unique_indexes(&self) -> Vec<TitoIndexConfig> {
         vec![TitoIndexConfig {
-            value: TitoIndexValue::RecordReference,
             condition: true,
             name: "native-owner-slot".into(),
             fields: vec![
@@ -132,8 +130,8 @@ async fn native_batch_swap_fences_every_source_and_commits_only_final_owners() {
             .await
             .unwrap();
         assert!(matches!(stale.commit().await, Err(TitoError::Retryable(_))));
-        assert_eq!(model.get(&a.id).execute(None).await.unwrap(), a);
-        assert_eq!(model.get(&b.id).execute(None).await.unwrap(), winner);
+        assert_eq!(model.get_for_share(&a.id, None).await.unwrap(), a);
+        assert_eq!(model.get_for_share(&b.id, None).await.unwrap(), winner);
 
         let refused = engine
             .transaction(|tx| {
@@ -180,7 +178,7 @@ async fn native_batch_swap_fences_every_source_and_commits_only_final_owners() {
         for expected in [&next_a, &next_b] {
             assert_eq!(
                 model
-                    .find_one_by_unique_index(
+                    .find_one_by_unique_index_for_share(
                         TitoFindOneByIndexPayload {
                             index: "native-owner-slot".into(),
                             values: vec![scope.clone(), expected.slot.clone()],
@@ -192,8 +190,8 @@ async fn native_batch_swap_fences_every_source_and_commits_only_final_owners() {
                 *expected
             );
         }
-        let first = model.get_versioned(&a.id, None).await.unwrap();
-        let second = model.get_versioned(&b.id, None).await.unwrap();
+        let first = model.get_versioned_for_share(&a.id, None).await.unwrap();
+        let second = model.get_versioned_for_share(&b.id, None).await.unwrap();
         assert_eq!(first.version, second.version);
     })
     .await

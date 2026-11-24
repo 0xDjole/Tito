@@ -3,18 +3,20 @@ use crate::{
     key_encoder::{encode_index_integer_query, encode_index_number, encode_index_string},
     types::{
         FieldValue, TitoEngine, TitoFindByIndexPayload, TitoFindOneByIndexPayload, TitoGuard,
-        TitoIndexConfig, TitoIndexFieldType, TitoIndexValue, TitoKvPair, TitoModelTrait,
-        TitoPaginated, TitoScanPayload, TitoTransaction,
+        TitoIndexConfig, TitoIndexFieldType, TitoKvPair, TitoModelTrait, TitoPaginated,
+        TitoScanPayload, TitoTransaction,
     },
     TitoModel,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-enum ScannedRow {
-    Value(Value),
-    Record(String),
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeySpace {
+    Index,
+    UniqueIndex,
+    HolderIndex,
 }
 
 fn after_segment(value: &str) -> Option<&str> {
@@ -43,12 +45,20 @@ impl<
             + TitoModelTrait,
     > TitoModel<E, T>
 {
-    fn build_index_keys(
+    pub(crate) fn key_base(space: KeySpace, name: &str) -> String {
+        match space {
+            KeySpace::Index => format!("index:{name}:"),
+            KeySpace::UniqueIndex => format!("unique-index:{}:{name}:", T::table()),
+            KeySpace::HolderIndex => format!("holder-index:{name}:"),
+        }
+    }
+
+    pub(crate) fn build_index_keys(
         &self,
         id: &str,
-        indexes: &[crate::types::TitoIndexConfig],
+        indexes: &[TitoIndexConfig],
         json: &Value,
-        unique: bool,
+        space: KeySpace,
     ) -> Result<Vec<String>, TitoError> {
         let mut all_index_keys = vec![];
 
@@ -57,11 +67,7 @@ impl<
                 continue;
             }
 
-            let base_key = if unique {
-                format!("unique-index:{}:{}:", T::table(), index_config.name)
-            } else {
-                format!("index:{}:", index_config.name)
-            };
+            let base_key = Self::key_base(space, &index_config.name);
 
             let mut combinations: Vec<String> = vec![String::new()];
 
@@ -134,10 +140,11 @@ impl<
 
             for combo in combinations {
                 if !combo.is_empty() {
-                    let key = if unique {
-                        format!("{base_key}{combo}")
-                    } else {
-                        format!("{base_key}{combo}:{id}")
+                    let key = match space {
+                        KeySpace::UniqueIndex => format!("{base_key}{combo}"),
+                        KeySpace::Index | KeySpace::HolderIndex => {
+                            format!("{base_key}{combo}:{id}")
+                        }
                     };
                     all_index_keys.push(key);
                 }
@@ -153,87 +160,62 @@ impl<
         value: &T,
         json: &Value,
     ) -> Result<Vec<(String, Vec<u8>)>, TitoError> {
-        let owner = value.id().into_bytes();
-        let indexes = value.indexes();
-        let unique_indexes = value.unique_indexes();
-        let record_copy = if indexes
-            .iter()
-            .chain(&unique_indexes)
-            .any(|index| index.condition && index.value == TitoIndexValue::RecordCopy)
-        {
-            serde_json::to_vec(json)
-                .map_err(|error| TitoError::SerializationFailed(error.to_string()))?
-        } else {
-            Vec::new()
-        };
-        let mut all_index_keys = Vec::new();
-        let mut seen = HashMap::new();
-        for (unique, indexes) in [(false, indexes), (true, unique_indexes)] {
-            for index in indexes {
-                for key in self.build_index_keys(&id, std::slice::from_ref(&index), json, unique)? {
-                    if let Some(previous) = seen.insert(key.clone(), index.value) {
-                        if previous != index.value {
-                            return Err(TitoError::IndexError(format!(
-                                "Index key '{key}' declares conflicting value modes"
-                            )));
-                        }
-                        continue;
-                    }
-                    let bytes = match index.value {
-                        TitoIndexValue::RecordCopy => record_copy.clone(),
-                        TitoIndexValue::RecordReference if unique => owner.clone(),
-                        TitoIndexValue::RecordReference => Vec::new(),
-                    };
-                    all_index_keys.push((key, bytes));
+        let copy = serde_json::to_vec(json)
+            .map_err(|error| TitoError::SerializationFailed(error.to_string()))?;
+        Ok(self
+            .index_keys(&id, value, json)?
+            .into_iter()
+            .map(|(key, space)| (key, Self::entry_bytes(space, &copy)))
+            .collect())
+    }
+
+    pub(crate) fn index_keys(
+        &self,
+        id: &str,
+        value: &T,
+        json: &Value,
+    ) -> Result<Vec<(String, KeySpace)>, TitoError> {
+        let mut keys = Vec::new();
+        let mut seen = HashSet::new();
+        for (space, indexes) in [
+            (KeySpace::Index, value.indexes()),
+            (KeySpace::UniqueIndex, value.unique_indexes()),
+            (KeySpace::HolderIndex, value.holder_indexes()),
+        ] {
+            for key in self.build_index_keys(id, &indexes, json, space)? {
+                if seen.insert(key.clone()) {
+                    keys.push((key, space));
                 }
             }
         }
-        Ok(all_index_keys)
+        Ok(keys)
     }
 
-    fn unique_index_value(key: &str) -> Result<TitoIndexValue, TitoError> {
-        let indexes = T::default().unique_indexes();
-        let mut matches = indexes.iter().filter(|index| {
-            key.starts_with(&format!("unique-index:{}:{}:", T::table(), index.name))
-        });
-        let index = matches.next().ok_or_else(|| {
-            TitoError::IndexError(format!(
-                "Index key '{key}' is not a unique entry of model '{}'",
-                T::table()
-            ))
-        })?;
-        if matches.any(|other| other.name != index.name || other.value != index.value) {
-            return Err(TitoError::IndexError(format!(
-                "Index key '{key}' has conflicting declarations on model '{}'",
-                T::table()
-            )));
+    pub(crate) fn entry_bytes(space: KeySpace, record: &[u8]) -> Vec<u8> {
+        match space {
+            KeySpace::Index | KeySpace::UniqueIndex => record.to_vec(),
+            KeySpace::HolderIndex => Vec::new(),
         }
-        Ok(index.value)
     }
 
-    pub(crate) fn unique_owner_id(key: &str, bytes: Vec<u8>) -> Result<String, TitoError> {
-        match Self::unique_index_value(key)? {
-            TitoIndexValue::RecordReference => String::from_utf8(bytes).map_err(|_| {
+    pub(crate) fn unique_owner_id(key: &str, bytes: &[u8]) -> Result<String, TitoError> {
+        serde_json::from_slice::<T>(bytes)
+            .map(|record| record.id())
+            .map_err(|error| {
                 TitoError::DeserializationFailed(format!(
-                    "Unique index key '{key}' on model '{}' holds an owner id that is not UTF-8",
-                    T::table()
+                    "Failed to deserialize the copied owner of unique index key '{key}': {error}"
                 ))
-            }),
-            TitoIndexValue::RecordCopy => serde_json::from_slice::<T>(&bytes)
-                .map(|record| record.id())
-                .map_err(|error| {
-                    TitoError::DeserializationFailed(format!(
-                        "Failed to deserialize copied owner for unique index key '{key}': {error}"
-                    ))
-                }),
-        }
+            })
     }
 
-    fn index_entry_id(index: &TitoIndexConfig, key: &str) -> Option<String> {
-        let mut rest = key
-            .strip_prefix("index:")?
-            .strip_prefix(index.name.as_str())?
-            .strip_prefix(':')?;
+    fn holder_record_read(key: &str) -> TitoError {
+        TitoError::IndexError(format!(
+            "Holder index key '{key}' holds no record and is read only by key"
+        ))
+    }
+
+    fn index_entry_id(index: &TitoIndexConfig, key: &str, space: KeySpace) -> Option<String> {
+        let mut rest = key.strip_prefix(Self::key_base(space, &index.name).as_str())?;
         for (position, field) in index.fields.iter().enumerate() {
             rest = after_segment(rest.strip_prefix(field.name.as_str())?.strip_prefix(':')?)?;
             if matches!(field.r#type, TitoIndexFieldType::Number) {
@@ -254,34 +236,11 @@ impl<
             .map(str::to_string)
     }
 
-    fn index_entry_owner(
-        indexes: &mut Option<Vec<TitoIndexConfig>>,
-        key: &str,
-    ) -> Result<(String, TitoIndexValue), TitoError> {
-        let indexes = indexes.get_or_insert_with(|| T::default().indexes());
-        let mut owners = indexes
-            .iter()
-            .filter_map(|index| Self::index_entry_id(index, key).map(|id| (id, index.value)));
-        let owner = owners.next().ok_or_else(|| {
-            TitoError::IndexError(format!(
-                "Index key '{key}' is not an entry of model '{}'",
-                T::table()
-            ))
-        })?;
-        if owners.any(|other| other != owner) {
-            return Err(TitoError::IndexError(format!(
-                "Index key '{key}' matches more than one index of model '{}'",
-                T::table()
-            )));
-        }
-        Ok(owner)
-    }
-
     fn copied_index_record(
         &self,
         key: &str,
         bytes: &[u8],
-        unique: bool,
+        space: KeySpace,
     ) -> Result<(T, Value), TitoError> {
         let json = Self::scanned_json(key, bytes)?;
         let record: T = serde_json::from_value(json.clone()).map_err(|error| {
@@ -289,14 +248,18 @@ impl<
                 "Failed to deserialize copied record for index key '{key}': {error}"
             ))
         })?;
-        let primary = format!("{}:{}", self.get_table(), record.id());
-        let indexes = if unique {
-            record.unique_indexes()
-        } else {
-            record.indexes()
+        let indexes = match space {
+            KeySpace::Index => record.indexes(),
+            KeySpace::UniqueIndex => record.unique_indexes(),
+            KeySpace::HolderIndex => return Err(Self::holder_record_read(key)),
         };
+        let own = indexes
+            .into_iter()
+            .filter(|index| key.starts_with(Self::key_base(space, &index.name).as_str()))
+            .collect::<Vec<_>>();
+        let primary = format!("{}:{}", self.get_table(), record.id());
         if !self
-            .build_index_keys(&primary, &indexes, &json, unique)?
+            .build_index_keys(&primary, &own, &json, space)?
             .iter()
             .any(|owned| owned == key)
         {
@@ -307,72 +270,29 @@ impl<
         Ok((record, json))
     }
 
-    pub(crate) async fn scanned_values(
+    pub(crate) fn scanned_values(
         &self,
         rows: Vec<TitoKvPair>,
-        tx: &E::Transaction,
     ) -> Result<Vec<(String, Value)>, TitoError> {
-        let mut indexes = None;
         let mut scanned = Vec::with_capacity(rows.len());
-        let mut owners = Vec::new();
-        let mut requested = HashSet::new();
         for (key, value) in rows {
             let key = Self::scanned_key(key)?;
-            let row = if key.starts_with("unique-index:") {
-                match Self::unique_index_value(&key)? {
-                    TitoIndexValue::RecordCopy => {
-                        ScannedRow::Value(self.copied_index_record(&key, &value, true)?.1)
-                    }
-                    TitoIndexValue::RecordReference => ScannedRow::Record(format!(
-                        "{}:{}",
-                        self.get_table(),
-                        Self::unique_owner_id(&key, value)?
-                    )),
-                }
+            let json = if key.starts_with("unique-index:") {
+                self.copied_index_record(&key, &value, KeySpace::UniqueIndex)?
+                    .1
             } else if key.starts_with("index:") {
-                let (owner, mode) = Self::index_entry_owner(&mut indexes, &key)?;
-                match mode {
-                    TitoIndexValue::RecordCopy => {
-                        ScannedRow::Value(self.copied_index_record(&key, &value, false)?.1)
-                    }
-                    TitoIndexValue::RecordReference => {
-                        if !value.is_empty() {
-                            return Err(TitoError::IndexError(format!(
-                                "Reference index key '{key}' has a non-empty value"
-                            )));
-                        }
-                        ScannedRow::Record(format!("{}:{owner}", self.get_table()))
-                    }
-                }
+                self.copied_index_record(&key, &value, KeySpace::Index)?.1
+            } else if key.starts_with("holder-index:") {
+                return Err(Self::holder_record_read(&key));
             } else {
-                ScannedRow::Value(Self::scanned_json(&key, &value)?)
+                Self::scanned_json(&key, &value)?
             };
-            if let ScannedRow::Record(primary) = &row {
-                if requested.insert(primary.clone()) {
-                    owners.push(primary.clone());
-                }
-            }
-            scanned.push((key, row));
+            scanned.push((key, json));
         }
-        let mut records = HashMap::new();
-        if !owners.is_empty() {
-            records.extend(self.batch_get(owners, tx).await?);
-        }
-        scanned
-            .into_iter()
-            .map(|(key, row)| match row {
-                ScannedRow::Value(value) => Ok((key, value)),
-                ScannedRow::Record(primary) => match records.get(&primary) {
-                    Some(record) => Ok((key, record.clone())),
-                    None => Err(TitoError::IndexError(format!(
-                        "Index key '{key}' names the missing record '{primary}'"
-                    ))),
-                },
-            })
-            .collect()
+        Ok(scanned)
     }
 
-    fn unique_index_key(&self, payload: &TitoFindOneByIndexPayload) -> Result<String, TitoError> {
+    pub fn unique_key(&self, payload: &TitoFindOneByIndexPayload) -> Result<String, TitoError> {
         let schema = T::default();
         let indexes = schema.unique_indexes();
         let index = indexes
@@ -388,10 +308,8 @@ impl<
 
         let fields = Self::exact_index_fields(index, &payload.values)?;
         Ok(format!(
-            "unique-index:{}:{}:{}",
-            T::table(),
-            payload.index,
-            fields
+            "{}{fields}",
+            Self::key_base(KeySpace::UniqueIndex, &payload.index)
         ))
     }
 
@@ -436,57 +354,53 @@ impl<
         }
     }
 
+    pub async fn find_one_by_unique_index_for_share(
+        &self,
+        payload: TitoFindOneByIndexPayload,
+        tx: Option<&E::Transaction>,
+    ) -> Result<T, TitoError> {
+        match tx {
+            Some(tx) => {
+                self.find_one_by_unique_index_for_share_with_tx(&payload, tx)
+                    .await
+            }
+            None => {
+                self.tx(|tx| {
+                    let payload = payload.clone();
+                    async move {
+                        self.find_one_by_unique_index_for_share_with_tx(&payload, &tx)
+                            .await
+                    }
+                })
+                .await
+            }
+        }
+    }
+
     async fn find_one_by_unique_index_with_tx(
         &self,
         payload: &TitoFindOneByIndexPayload,
         tx: &E::Transaction,
     ) -> Result<T, TitoError> {
-        let key = self.unique_index_key(payload)?;
-        let owner_bytes = tx.get(&key).await?.ok_or_else(|| {
+        let key = self.unique_key(payload)?;
+        let copy = tx.get(&key).await?.ok_or_else(|| {
             TitoError::NotFound(format!(
                 "No record found for unique index '{}'",
                 payload.index
             ))
         })?;
-        if Self::unique_index_value(&key)? == TitoIndexValue::RecordCopy {
-            let (record, _) = self.copied_index_record(&key, &owner_bytes, true)?;
-            tx.guard(&T::table(), &record.id(), TitoGuard::Shared).await;
-            return Ok(record);
-        }
-        let owner_id = Self::unique_owner_id(&key, owner_bytes)?;
-        let primary_key = format!("{}:{owner_id}", self.get_table());
-        let primary_bytes = tx.get(&primary_key).await?.ok_or_else(|| {
-            TitoError::IndexError(format!(
-                "Unique index '{}' on model '{}' points to a missing owner",
-                payload.index,
-                T::table()
-            ))
-        })?;
-        let json = serde_json::from_slice::<Value>(&primary_bytes).map_err(|error| {
-            TitoError::DeserializationFailed(format!(
-                "Failed to deserialize owner of unique index '{}': {}",
-                payload.index, error
-            ))
-        })?;
-        let primary: T = serde_json::from_value(json.clone()).map_err(|error| {
-            TitoError::DeserializationFailed(format!(
-                "Failed to deserialize owner of unique index '{}': {}",
-                payload.index, error
-            ))
-        })?;
-        if primary.id() != owner_id
-            || !self
-                .build_index_keys(&primary_key, &primary.unique_indexes(), &json, true)?
-                .contains(&key)
-        {
-            return Err(TitoError::IndexError(format!(
-                "Unique index '{}' on model '{}' disagrees with its owner",
-                payload.index,
-                T::table()
-            )));
-        }
-        tx.guard(&T::table(), &owner_id, TitoGuard::Shared).await;
-        Ok(primary)
+        let (record, _) = self.copied_index_record(&key, &copy, KeySpace::UniqueIndex)?;
+        Ok(record)
+    }
+
+    async fn find_one_by_unique_index_for_share_with_tx(
+        &self,
+        payload: &TitoFindOneByIndexPayload,
+        tx: &E::Transaction,
+    ) -> Result<T, TitoError> {
+        let record = self.find_one_by_unique_index_with_tx(payload, tx).await?;
+        tx.guard(&T::table(), &record.id(), TitoGuard::Shared).await;
+        Ok(record)
     }
 
     fn declared_index<'a>(
@@ -505,9 +419,29 @@ impl<
             })
     }
 
+    fn read_index<'a>(
+        indexes: &'a [TitoIndexConfig],
+        name: &str,
+    ) -> Result<&'a TitoIndexConfig, TitoError> {
+        if !indexes.iter().any(|index| index.name == name)
+            && T::default()
+                .holder_indexes()
+                .iter()
+                .any(|holder| holder.name == name)
+        {
+            return Err(TitoError::IndexError(format!(
+                "Index '{}' of model '{}' is a holder index: it holds no record and is read only by key",
+                name,
+                T::table()
+            )));
+        }
+        Self::declared_index(indexes, name)
+    }
+
     fn index_scan(
         index: &TitoIndexConfig,
         payload: TitoFindByIndexPayload,
+        space: KeySpace,
     ) -> Result<TitoScanPayload, TitoError> {
         if payload.values.is_empty() {
             return Err(TitoError::IndexError(format!(
@@ -537,7 +471,11 @@ impl<
         }
 
         Ok(TitoScanPayload {
-            start: format!("index:{}:{}:", payload.index, key_from_values.join(":")),
+            start: format!(
+                "{}{}:",
+                Self::key_base(space, &payload.index),
+                key_from_values.join(":")
+            ),
             end: None,
             limit: payload.limit,
             cursor: payload.cursor,
@@ -554,8 +492,9 @@ impl<
     {
         let schema = T::default();
         let indexes = schema.indexes();
-        let index = Self::declared_index(&indexes, &payload.index)?;
-        self.scan(Self::index_scan(index, payload)?, tx).await
+        let index = Self::read_index(&indexes, &payload.index)?;
+        self.scan(Self::index_scan(index, payload, KeySpace::Index)?, tx)
+            .await
     }
 
     pub async fn find_by_index_reverse_raw(
@@ -568,14 +507,15 @@ impl<
     {
         let schema = T::default();
         let indexes = schema.indexes();
-        let index = Self::declared_index(&indexes, &payload.index)?;
-        self.scan_reverse(Self::index_scan(index, payload)?, tx)
+        let index = Self::read_index(&indexes, &payload.index)?;
+        self.scan_reverse(Self::index_scan(index, payload, KeySpace::Index)?, tx)
             .await
     }
 
     fn index_id_page(
         &self,
         index: &TitoIndexConfig,
+        space: KeySpace,
         rows: Vec<TitoKvPair>,
         has_more: bool,
     ) -> Result<TitoPaginated<String>, TitoError> {
@@ -583,7 +523,7 @@ impl<
         let mut last_key = None;
         for (key, _) in rows {
             let key = Self::scanned_key(key)?;
-            let id = Self::index_entry_id(index, &key).ok_or_else(|| {
+            let id = Self::index_entry_id(index, &key, space).ok_or_else(|| {
                 TitoError::IndexError(format!(
                     "Index key '{key}' is not an entry of index '{}' on model '{}'",
                     index.name,
@@ -606,11 +546,18 @@ impl<
     ) -> Result<TitoPaginated<String>, TitoError> {
         let schema = T::default();
         let indexes = schema.indexes();
-        let index = Self::declared_index(&indexes, &payload.index)?;
+        let holders = schema.holder_indexes();
+        let (index, space) = match indexes.iter().find(|index| index.name == payload.index) {
+            Some(index) => (index, KeySpace::Index),
+            None => (
+                Self::declared_index(&holders, &payload.index)?,
+                KeySpace::HolderIndex,
+            ),
+        };
         let (rows, has_more) = self
-            .scan_rows(Self::index_scan(index, payload)?, true, tx)
+            .scan_rows(Self::index_scan(index, payload, space)?, true, tx)
             .await?;
-        self.index_id_page(index, rows, has_more)
+        self.index_id_page(index, space, rows, has_more)
     }
 
     pub(crate) async fn index_ids(

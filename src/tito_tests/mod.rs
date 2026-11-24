@@ -1,7 +1,6 @@
 use crate::encode_index_string;
 use crate::queue::{Queue, QueueConfig, QueueEvent, QueueEventStatus, QueueHandlerOutcome};
 use crate::test_support::{MemoryEngine, MemoryTransaction, RecordedWrite};
-use crate::types::TitoIndexValue;
 use crate::types::{
     TitoCursor, TitoEngine, TitoFindByIndexPayload, TitoFindOneByIndexPayload, TitoIndexConfig,
     TitoIndexField, TitoIndexFieldType, TitoModelOptions, TitoModelTrait, TitoPaginated,
@@ -39,7 +38,6 @@ impl TitoModelTrait for Author {
     fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![
             TitoIndexConfig {
-                value: TitoIndexValue::RecordReference,
                 condition: true,
                 name: "author-by-email".to_string(),
                 fields: vec![TitoIndexField {
@@ -48,7 +46,6 @@ impl TitoModelTrait for Author {
                 }],
             },
             TitoIndexConfig {
-                value: TitoIndexValue::RecordReference,
                 condition: true,
                 name: "author-by-age".to_string(),
                 fields: vec![TitoIndexField {
@@ -57,7 +54,6 @@ impl TitoModelTrait for Author {
                 }],
             },
             TitoIndexConfig {
-                value: TitoIndexValue::RecordReference,
                 condition: true,
                 name: "author-by-org-email".to_string(),
                 fields: vec![
@@ -72,7 +68,6 @@ impl TitoModelTrait for Author {
                 ],
             },
             TitoIndexConfig {
-                value: TitoIndexValue::RecordReference,
                 condition: true,
                 name: "author-by-kind-org".to_string(),
                 fields: vec![
@@ -87,7 +82,6 @@ impl TitoModelTrait for Author {
                 ],
             },
             TitoIndexConfig {
-                value: TitoIndexValue::RecordReference,
                 condition: true,
                 name: "author-by-optional".to_string(),
                 fields: vec![TitoIndexField {
@@ -96,7 +90,6 @@ impl TitoModelTrait for Author {
                 }],
             },
             TitoIndexConfig {
-                value: TitoIndexValue::RecordReference,
                 condition: true,
                 name: "author-by-org-optional".to_string(),
                 fields: vec![
@@ -111,7 +104,6 @@ impl TitoModelTrait for Author {
                 ],
             },
             TitoIndexConfig {
-                value: TitoIndexValue::RecordReference,
                 condition: false,
                 name: "author-disabled".to_string(),
                 fields: vec![TitoIndexField {
@@ -149,7 +141,6 @@ struct UniqueAccount {
 impl TitoModelTrait for UniqueAccount {
     fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![TitoIndexConfig {
-            value: TitoIndexValue::RecordReference,
             condition: true,
             name: "account-by-email".to_string(),
             fields: vec![TitoIndexField {
@@ -161,7 +152,6 @@ impl TitoModelTrait for UniqueAccount {
 
     fn unique_indexes(&self) -> Vec<TitoIndexConfig> {
         vec![TitoIndexConfig {
-            value: TitoIndexValue::RecordReference,
             condition: self.verified,
             name: "verified-account-by-tenant-email".to_string(),
             fields: vec![
@@ -213,7 +203,6 @@ async fn save_unique_account(engine: &MemoryEngine, value: UniqueAccount) -> Uni
 impl TitoModelTrait for Tag {
     fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![TitoIndexConfig {
-            value: TitoIndexValue::RecordReference,
             condition: true,
             name: "tag-by-name".to_string(),
             fields: vec![TitoIndexField {
@@ -241,7 +230,6 @@ struct Shop {
 impl TitoModelTrait for Shop {
     fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![TitoIndexConfig {
-            value: TitoIndexValue::RecordReference,
             condition: true,
             name: "shop-by-name".to_string(),
             fields: vec![TitoIndexField {
@@ -315,7 +303,6 @@ impl TitoModelTrait for Post {
     fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![
             TitoIndexConfig {
-                value: TitoIndexValue::RecordReference,
                 condition: true,
                 name: "post-by-author".to_string(),
                 fields: vec![TitoIndexField {
@@ -324,7 +311,6 @@ impl TitoModelTrait for Post {
                 }],
             },
             TitoIndexConfig {
-                value: TitoIndexValue::RecordReference,
                 condition: true,
                 name: "post-by-tag".to_string(),
                 fields: vec![TitoIndexField {
@@ -333,7 +319,6 @@ impl TitoModelTrait for Post {
                 }],
             },
             TitoIndexConfig {
-                value: TitoIndexValue::RecordReference,
                 condition: true,
                 name: "post-by-comment-author".to_string(),
                 fields: vec![TitoIndexField {
@@ -342,7 +327,6 @@ impl TitoModelTrait for Post {
                 }],
             },
             TitoIndexConfig {
-                value: TitoIndexValue::RecordReference,
                 condition: true,
                 name: "post-by-metadata".to_string(),
                 fields: vec![TitoIndexField {
@@ -602,3 +586,4 @@ mod model;
 mod model_batch;
 mod numeric_index;
 mod queue;
+mod round_trips;

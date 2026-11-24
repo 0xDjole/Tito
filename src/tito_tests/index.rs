@@ -10,7 +10,6 @@ impl TitoModelTrait for SparseMembership {
     fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![
             TitoIndexConfig {
-                value: TitoIndexValue::RecordReference,
                 condition: true,
                 name: "sparse-membership-by-role".to_string(),
                 fields: vec![TitoIndexField {
@@ -19,7 +18,6 @@ impl TitoModelTrait for SparseMembership {
                 }],
             },
             TitoIndexConfig {
-                value: TitoIndexValue::RecordCopy,
                 condition: true,
                 name: "sparse-membership-by-x".to_string(),
                 fields: vec![TitoIndexField {
@@ -191,7 +189,14 @@ async fn set_refuses_a_corrupt_old_unique_owner_before_staging_any_write() {
     let unique_key = "unique-index:unique-accounts:verified-account-by-tenant-email:tenant_id:tenant:email:old@example.com";
     let primary = engine.raw_bytes(primary_key).await.unwrap();
     let manifest = engine.raw_bytes(manifest_key).await.unwrap();
-    engine.put_raw(unique_key, b"another-owner".to_vec()).await;
+    let another = serde_json::to_vec(&unique_account(
+        "another-owner",
+        "tenant",
+        "old@example.com",
+        true,
+    ))
+    .unwrap();
+    engine.put_raw(unique_key, another.clone()).await;
 
     let tx = engine.begin_transaction().await.unwrap();
     engine.start_recording_writes().await;
@@ -213,10 +218,7 @@ async fn set_refuses_a_corrupt_old_unique_owner_before_staging_any_write() {
     assert_eq!(engine.raw_bytes(primary_key).await.unwrap(), primary);
     assert_eq!(engine.raw_bytes(manifest_key).await.unwrap(), manifest);
     assert!(engine.contains_key(ordinary_key).await);
-    assert_eq!(
-        engine.raw_bytes(unique_key).await.unwrap(),
-        b"another-owner"
-    );
+    assert_eq!(engine.raw_bytes(unique_key).await.unwrap(), another);
     assert_eq!(
         engine.raw_bytes("scratch:rejected-set").await.unwrap(),
         b"kept"
@@ -241,7 +243,7 @@ async fn conditional_unique_index_owns_one_value_and_supports_exact_lookup() {
     .await;
 
     let found = model
-        .find_one_by_unique_index(
+        .find_one_by_unique_index_for_share(
             TitoFindOneByIndexPayload {
                 index: "verified-account-by-tenant-email".to_string(),
                 values: vec!["store-1".to_string(), "Ada@Example.com".to_string()],
@@ -261,7 +263,7 @@ async fn conditional_unique_index_owns_one_value_and_supports_exact_lookup() {
     );
     assert!(matches!(
         model
-            .find_one_by_unique_index(
+            .find_one_by_unique_index_for_share(
                 TitoFindOneByIndexPayload {
                     index: "verified-account-by-tenant-email".to_string(),
                     values: vec!["store-1".to_string(), "ada@example.com".to_string()],
@@ -293,7 +295,7 @@ async fn unique_values_differing_only_by_case_coexist_and_are_found_exactly() {
 
     for (id, email) in emails {
         let found = model
-            .find_one_by_unique_index(
+            .find_one_by_unique_index_for_share(
                 TitoFindOneByIndexPayload {
                     index: "verified-account-by-tenant-email".to_string(),
                     values: vec!["store-1".to_string(), email.to_string()],
@@ -307,7 +309,7 @@ async fn unique_values_differing_only_by_case_coexist_and_are_found_exactly() {
     }
     assert!(matches!(
         model
-            .find_one_by_unique_index(
+            .find_one_by_unique_index_for_share(
                 TitoFindOneByIndexPayload {
                     index: "verified-account-by-tenant-email".to_string(),
                     values: vec!["store-1".to_string(), "Ada@example.com".to_string()],
@@ -387,7 +389,7 @@ async fn unique_index_changes_and_releases_ownership_atomically() {
 
     assert_eq!(
         model
-            .find_one_by_unique_index(
+            .find_one_by_unique_index_for_share(
                 TitoFindOneByIndexPayload {
                     index: "verified-account-by-tenant-email".to_string(),
                     values: vec!["store-1".to_string(), "new@example.com".to_string()],
@@ -401,7 +403,7 @@ async fn unique_index_changes_and_releases_ownership_atomically() {
     );
     assert_eq!(
         model
-            .find_one_by_unique_index(
+            .find_one_by_unique_index_for_share(
                 TitoFindOneByIndexPayload {
                     index: "verified-account-by-tenant-email".to_string(),
                     values: vec!["store-1".to_string(), "old@example.com".to_string()],
@@ -859,7 +861,7 @@ async fn set_propagates_index_state_read_failures_without_writing() {
 }
 
 #[tokio::test]
-async fn index_entries_store_no_record_data_and_a_unique_entry_stores_its_owner_id() {
+async fn index_entries_store_a_copy_of_their_record_and_holder_entries_store_nothing() {
     let engine = engine();
     let mut first = author("a1", "a1@example.com", 36, "org-a");
     first.optional = Some("present".to_string());
@@ -881,14 +883,13 @@ async fn index_entries_store_no_record_data_and_a_unique_entry_stores_its_owner_
             .map(|key| key.as_str().unwrap().to_string())
             .collect::<Vec<_>>();
         assert!(manifest.iter().any(|key| key.starts_with("index:")));
+        let copy = engine.raw_bytes(primary).await.unwrap();
         for key in manifest {
             let stored = engine.raw_bytes(&key).await.unwrap();
-            if key.starts_with("unique-index:") {
-                assert_eq!(stored, b"u:1\\x".to_vec());
-            } else {
+            if !key.starts_with("unique-index:") {
                 assert!(key.ends_with(&format!(":{primary}")));
-                assert!(stored.is_empty());
             }
+            assert_eq!(stored, copy, "{key}");
         }
     }
     assert_eq!(
@@ -898,13 +899,39 @@ async fn index_entries_store_no_record_data_and_a_unique_entry_stores_its_owner_
             )
             .await
             .unwrap(),
-        b"u:1\\x".to_vec()
+        engine
+            .raw_bytes("table:unique-accounts:u:1\\x")
+            .await
+            .unwrap()
     );
-    assert!(engine
-        .raw_bytes("index:author-by-optional:optional:present:table:authors:a1")
-        .await
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        engine
+            .raw_bytes("index:author-by-optional:optional:present:table:authors:a1")
+            .await
+            .unwrap(),
+        engine.raw_bytes("table:authors:a1").await.unwrap()
+    );
+
+    save_holder(&engine, holder("h1", 2, 3)).await.unwrap();
+    let copy = engine.raw_bytes("table:holders:h1").await.unwrap();
+    assert_eq!(
+        engine
+            .raw_bytes("index:holder-by-name:name:h1:table:holders:h1")
+            .await
+            .unwrap(),
+        copy
+    );
+    for held in ["held-0", "held-1", "held-2"] {
+        assert_eq!(
+            engine
+                .raw_bytes(&format!(
+                    "holder-index:holder-by-held:held_ids:{held}:table:holders:h1"
+                ))
+                .await
+                .unwrap(),
+            Vec::<u8>::new()
+        );
+    }
 }
 
 #[tokio::test]
@@ -921,7 +948,7 @@ async fn removing_record_deletes_row_reverse_index_and_index_keys() {
         .await
         .unwrap();
 
-    assert!(model.get("a1").execute(None).await.is_err());
+    assert!(model.get_for_share("a1", None).await.is_err());
     assert!(!engine.contains_key("table:authors:a1").await);
     assert!(!engine.contains_key("reverse-index:table:authors:a1").await);
     assert!(engine
@@ -947,9 +974,9 @@ async fn remove_by_index_deletes_matching_batch() {
         .unwrap();
 
     assert_eq!(removed.len(), 2);
-    assert!(model.get("a2").execute(None).await.is_err());
-    assert!(model.get("a3").execute(None).await.is_err());
-    assert!(model.get("a1").execute(None).await.is_ok());
+    assert!(model.get_for_share("a2", None).await.is_err());
+    assert!(model.get_for_share("a3", None).await.is_err());
+    assert!(model.get_for_share("a1", None).await.is_ok());
 }
 
 #[tokio::test]
@@ -1291,56 +1318,264 @@ async fn identical_index_keys_of_one_record_are_written_once_and_case_variants_a
     assert!(engine.keys_with_prefix("index:post-by-").await.is_empty());
 }
 
-#[tokio::test]
-async fn a_manifest_over_the_key_or_byte_limit_fails_the_save() {
-    let engine = engine();
-    let model = engine.clone().model::<Post>(TitoModelOptions::default());
+#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct Holder {
+    id: String,
+    name: String,
+    tags: Vec<String>,
+    held_ids: Vec<String>,
+    body: String,
+}
 
-    for item in [
-        post(
-            "p1",
-            "a1",
-            (0..10_001).map(|position| format!("t{position}")).collect(),
-        ),
-        post(
-            "p1",
-            "a1",
-            (0..600)
-                .map(|position| format!("{position:04}{}", "t".repeat(1_996)))
-                .collect(),
-        ),
-    ] {
-        let saved = engine
-            .transaction(|tx| {
-                let model = model.clone();
-                let item = item.clone();
-                async move { model.set(item).timestamps(false).execute(&tx).await }
-            })
-            .await;
-        assert!(matches!(saved, Err(TitoError::InvalidInput(_))));
+impl TitoModelTrait for Holder {
+    fn indexes(&self) -> Vec<TitoIndexConfig> {
+        vec![
+            TitoIndexConfig {
+                condition: true,
+                name: "holder-by-name".to_string(),
+                fields: vec![TitoIndexField {
+                    name: "name".to_string(),
+                    r#type: TitoIndexFieldType::String,
+                }],
+            },
+            TitoIndexConfig {
+                condition: true,
+                name: "holder-by-tag".to_string(),
+                fields: vec![TitoIndexField {
+                    name: "tags".to_string(),
+                    r#type: TitoIndexFieldType::String,
+                }],
+            },
+        ]
     }
 
-    assert!(!engine.contains_key("table:posts:p1").await);
-    assert!(!engine.contains_key("reverse-index:table:posts:p1").await);
-    assert!(engine.keys_with_prefix("index:").await.is_empty());
-    assert!(engine.keys_with_prefix("fence:").await.is_empty());
+    fn holder_indexes(&self) -> Vec<TitoIndexConfig> {
+        vec![TitoIndexConfig {
+            condition: true,
+            name: "holder-by-held".to_string(),
+            fields: vec![TitoIndexField {
+                name: "held_ids".to_string(),
+                r#type: TitoIndexFieldType::String,
+            }],
+        }]
+    }
 
-    let fits = post(
-        "p1",
-        "a1",
-        (0..9_996).map(|position| format!("t{position}")).collect(),
-    );
+    fn table() -> String {
+        "holders".to_string()
+    }
+
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+}
+
+fn holder(id: &str, tags: usize, held: usize) -> Holder {
+    Holder {
+        id: id.to_string(),
+        name: id.to_string(),
+        tags: (0..tags).map(|tag| format!("tag-{tag}")).collect(),
+        held_ids: (0..held).map(|held| format!("held-{held}")).collect(),
+        body: String::new(),
+    }
+}
+
+async fn save_holder(engine: &MemoryEngine, value: Holder) -> Result<Holder, TitoError> {
+    let model = engine.clone().model::<Holder>(TitoModelOptions::default());
     engine
         .transaction(|tx| {
             let model = model.clone();
-            let fits = fits.clone();
-            async move { model.set(fits).timestamps(false).execute(&tx).await }
+            let value = value.clone();
+            async move { model.set(value).timestamps(false).execute(&tx).await }
         })
         .await
-        .unwrap();
-    assert_eq!(engine.keys_with_prefix("index:").await.len(), 10_000);
+}
+
+#[tokio::test]
+async fn a_manifest_over_the_key_or_byte_limit_fails_the_save() {
+    let engine = engine();
+
+    for item in [
+        holder("h1", 0, 10_000),
+        Holder {
+            held_ids: (0..600)
+                .map(|position| format!("{position:04}{}", "t".repeat(1_996)))
+                .collect(),
+            ..holder("h1", 0, 0)
+        },
+    ] {
+        assert!(matches!(
+            save_holder(&engine, item).await,
+            Err(TitoError::InvalidInput(_))
+        ));
+    }
+
+    assert!(!engine.contains_key("table:holders:h1").await);
+    assert!(!engine.contains_key("reverse-index:table:holders:h1").await);
+    assert!(engine.keys_with_prefix("index:").await.is_empty());
+    assert!(engine.keys_with_prefix("holder-index:").await.is_empty());
+    assert!(engine.keys_with_prefix("fence:").await.is_empty());
+
+    save_holder(&engine, holder("h1", 0, 9_999)).await.unwrap();
+    assert_eq!(engine.keys_with_prefix("index:").await.len(), 1);
     assert_eq!(
-        engine.keys_with_prefix("index:post-by-tag:").await.len(),
-        9_996
+        engine
+            .keys_with_prefix("holder-index:holder-by-held:")
+            .await
+            .len(),
+        9_999
     );
+}
+
+#[tokio::test]
+async fn a_save_whose_copies_pass_the_bound_is_refused_before_it_reads_further_or_writes() {
+    let engine = engine();
+    let model = engine.clone().model::<Holder>(TitoModelOptions::default());
+    let body = "b".repeat(1024 * 1024);
+    let copies = crate::MAX_SAVE_BYTES / body.len();
+    let under = Holder {
+        body: body.clone(),
+        ..holder("under", copies - 3, 0)
+    };
+    let over = Holder {
+        body: body.clone(),
+        ..holder("over", copies, 0)
+    };
+
+    let saved = save_holder(&engine, under.clone()).await.unwrap();
+    assert_eq!(saved, under);
+    assert_eq!(
+        engine.keys_with_prefix("index:holder-by-tag:").await.len(),
+        copies - 3
+    );
+    let copy = engine.raw_bytes("table:holders:under").await.unwrap();
+    for key in engine.keys_with_prefix("index:holder-by-tag:").await {
+        assert_eq!(engine.raw_bytes(&key).await.unwrap(), copy);
+    }
+
+    let tx = engine.begin_transaction().await.unwrap();
+    engine.start_recording_writes().await;
+    engine.start_recording_batch_gets().await;
+    assert_eq!(
+        model.set(over.clone()).timestamps(false).execute(&tx).await,
+        Err(TitoError::InvalidInput(format!(
+            "A save exceeds the {}-byte limit",
+            crate::MAX_SAVE_BYTES
+        )))
+    );
+    assert!(engine.take_recorded_writes().await.is_empty());
+    assert_eq!(engine.take_recorded_batch_gets().await.len(), 1);
+    tx.commit().await.unwrap();
+    assert!(!engine.contains_key("table:holders:over").await);
+    assert!(
+        !engine
+            .contains_key("reverse-index:table:holders:over")
+            .await
+    );
+
+    let held = Holder {
+        body,
+        ..holder("held", 0, 9_998)
+    };
+    save_holder(&engine, held.clone()).await.unwrap();
+    assert_eq!(
+        engine
+            .keys_with_prefix("holder-index:holder-by-held:held_ids:held-")
+            .await
+            .len(),
+        9_998
+    );
+    for key in engine
+        .keys_with_prefix("holder-index:holder-by-held:held_ids:held-0:")
+        .await
+    {
+        assert!(engine.raw_bytes(&key).await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_holder_index_is_read_only_by_key_and_never_through_a_record() {
+    let engine = engine();
+    let model = engine.clone().model::<Holder>(TitoModelOptions::default());
+    save_holder(&engine, holder("h1", 0, 2)).await.unwrap();
+    save_holder(&engine, holder("h2", 0, 1)).await.unwrap();
+
+    engine.start_recording_reads().await;
+    let mut holders = model.query_by_index("holder-by-held");
+    holders.value("held-0");
+    assert_eq!(
+        holders.execute_ids(None).await.unwrap().items,
+        vec!["h1", "h2"]
+    );
+    assert_eq!(
+        engine.take_recorded_reads().await,
+        vec![b"scan-keys:holder-index:holder-by-held:held_ids:held-0:".to_vec()]
+    );
+    holders.limit(Some(1));
+    let first = holders.execute_ids(None).await.unwrap();
+    assert_eq!(first.items, vec!["h1"]);
+    holders.cursor(first.cursor);
+    assert_eq!(holders.execute_ids(None).await.unwrap().items, vec!["h2"]);
+
+    let refused = TitoError::IndexError(
+        "Index 'holder-by-held' of model 'holders' is a holder index: it holds no record and is read only by key"
+            .to_string(),
+    );
+    let mut records = model.query_by_index("holder-by-held");
+    records.value("held-0");
+    assert_eq!(records.execute(None).await.unwrap_err(), refused);
+    assert_eq!(records.execute_reverse(None).await.unwrap_err(), refused);
+    assert_eq!(
+        model
+            .find_one_by_index(
+                TitoFindOneByIndexPayload {
+                    index: "holder-by-held".to_string(),
+                    values: vec!["held-0".to_string()],
+                },
+                None,
+            )
+            .await
+            .unwrap_err(),
+        refused
+    );
+    let tx = engine.begin_transaction().await.unwrap();
+    let key = "holder-index:holder-by-held:held_ids:held-0:table:holders:h1";
+    for scanned in [
+        model
+            .scan(whole_range("holder-index:holder-by-held:"), &tx)
+            .await,
+        model
+            .scan_reverse(whole_range("holder-index:holder-by-held:"), &tx)
+            .await,
+    ] {
+        assert!(
+            matches!(scanned, Err(TitoError::IndexError(ref message)) if message.contains("holder-index:holder-by-held:")),
+            "{scanned:?}"
+        );
+    }
+    tx.rollback().await.unwrap();
+
+    engine.put_raw(key, b"not a record".to_vec()).await;
+    holders.cursor(None::<String>).limit(None);
+    assert_eq!(
+        holders.execute_ids(None).await.unwrap().items,
+        vec!["h1", "h2"]
+    );
+
+    let tx = engine.begin_transaction().await.unwrap();
+    model.remove("h1", &tx).await.unwrap();
+    tx.commit().await.unwrap();
+    assert!(engine
+        .keys_with_prefix("holder-index:holder-by-held:held_ids:held-1:")
+        .await
+        .is_empty());
+    assert_eq!(holders.execute_ids(None).await.unwrap().items, vec!["h2"]);
+}
+
+fn whole_range(start: &str) -> TitoScanPayload {
+    TitoScanPayload {
+        start: start.to_string(),
+        end: None,
+        limit: None,
+        cursor: None,
+    }
 }

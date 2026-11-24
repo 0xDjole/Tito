@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import contextlib
 import fcntl
 import hashlib
@@ -7,18 +8,34 @@ import json
 import os
 from pathlib import Path
 import re
+import resource
+import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 import uuid
 
 
-PD_IMAGE = "pingcap/pd:v7.1.6@sha256:59c9896b8040bc183ef75f28e2d7972deeccf1c682336e3c9e9406e629c40dcc"
-TIKV_IMAGE = "pingcap/tikv:v7.1.6@sha256:6b07644a3378d98a5069fb9036399640861a1b7a0458efec4a562fcc6212b890"
-OWNER_LABEL = "org.arky.tito-native-run"
+RUNTIME_VERSION = "7.1.6"
+FILE_LIMIT = 16384
+TIKV_CONFIG = """[storage]
+reserve-space = "0MiB"
+reserve-raft-space = "0MiB"
+
+[storage.block-cache]
+capacity = "512MiB"
+
+[raftdb]
+max-open-files = 1024
+
+[raft-engine]
+purge-threshold = "256MB"
+target-file-size = "32MB"
+"""
 NATIVE_CASE = "pd::retry::native_recovery_tests::actual_pd_leadership_transfer_recovers_the_same_closed_oracle_client_with_monotonic_timestamps"
 PROTOCOL_CASES = {
     "pd::retry::reconnect_regression_tests::a_closed_request_channel_waits_for_replacement_instead_of_exhausting_retries",
@@ -32,37 +49,55 @@ PROTOCOL_CASES = {
     "pd::retry::test::test_reconnect",
     "pd::retry::test::test_retry",
 }
+BUFFER_CASES = {
+    "transaction::buffer::tests::set_and_get_from_buffer",
+    "transaction::buffer::tests::insert_and_get_from_buffer",
+    "transaction::buffer::tests::repeat_reads_are_cached",
+    "transaction::buffer::tests::a_batch_read_remembers_the_keys_it_did_not_find",
+    "transaction::buffer::tests::a_batch_read_keeps_the_writes_and_locks_of_its_transaction",
+    "transaction::buffer::tests::scan_and_fetch_redundant_limit_does_not_overflow",
+    "transaction::buffer::tests::scan_and_fetch_overlays_insert_and_check_not_exist",
+    "transaction::buffer::tests::state_machine",
+}
 TITO_NATIVE_CASES = {
     "native_batch_creation_commits_indexed_records_in_input_order_and_rolls_back_with_its_transaction",
     "native_batch_creation_rejects_conflicts_corruption_and_limits_before_staging_any_record",
     "native_batch_creation_competing_with_another_batch_or_set_leaves_only_the_committed_owner",
-    "native_index_value_modes_store_selected_bytes_and_preserve_pages",
-    "native_copied_index_reads_avoid_primaries_and_id_queries_skip_values",
-    "native_index_value_modes_refresh_copies_on_every_write_and_remove_old_entries",
-    "native_index_value_modes_preserve_unique_claims_and_batch_swaps",
-    "native_copied_unique_hits_guard_the_owner_while_lists_remain_unguarded",
-    "native_reference_record_reads_reject_nonempty_values_while_ids_remain_key_only",
+    "native_index_entries_hold_copies_and_holder_entries_hold_nothing_across_pages",
+    "native_index_reads_come_from_the_copies_and_id_queries_skip_values",
+    "native_every_save_refreshes_every_copy_and_removes_old_entries",
+    "native_copied_unique_entries_keep_claims_and_batch_swaps",
+    "native_copied_unique_hits_for_share_guard_the_owner_while_lists_remain_unguarded",
+    "native_holder_entries_are_read_only_by_key_and_refuse_record_reads",
     "native_batch_swap_fences_every_source_and_commits_only_final_owners",
     "expired_secondary_without_a_primary_heals_through_normal_tito_reads",
     "native_reads_forty_one_mib_records_through_byte_bounded_requests",
-    "native_index_entries_of_a_large_record_store_no_record_data_and_a_list_reads_the_record",
+    "native_index_entries_of_a_large_record_hold_its_copy_and_holder_entries_hold_nothing",
+    "native_a_save_under_the_bound_commits_its_copies_and_a_larger_one_is_refused_before_writing",
     "native_queue_pulls_and_completes_sixteen_one_mib_events",
     "native_a_queue_handler_completes_its_own_pending_row_inside_its_transaction",
     "native_a_duplicate_delivery_conflicts_on_the_pending_row_and_its_retry_skips",
     "native_a_rolled_back_handler_transaction_leaves_its_row_pending_for_redelivery",
     "native_ack_in_tx_refuses_an_undelivered_event_and_a_row_of_another_event",
     "native_public_guard_modes_cannot_cancel_a_read_guard",
-    "native_every_read_by_id_in_a_writing_transaction_conflicts_with_a_save_of_its_record",
+    "native_every_read_for_share_or_for_update_in_a_writing_transaction_conflicts_with_a_save_of_its_record",
     "native_index_reads_scans_and_misses_add_no_guard",
     "native_two_transactions_reading_the_same_twenty_records_conflict_about_one_time_in_sixteen",
-    "native_two_exclusive_reads_of_one_record_always_conflict_and_the_retry_passes",
-    "native_a_shared_and_an_exclusive_read_of_one_record_commit_together_in_either_order",
-    "native_a_save_and_a_remove_conflict_with_shared_and_exclusive_reads_in_either_order",
-    "native_a_transaction_that_writes_nothing_adds_no_guard_and_get_exclusive_counts_as_a_write",
+    "native_two_reads_for_update_of_one_record_always_conflict_and_the_retry_passes",
+    "native_a_read_for_share_and_a_read_for_update_of_one_record_commit_together_in_either_order",
+    "native_writers_that_read_one_record_unguarded_never_conflict",
+    "native_an_unguarded_read_conflicts_with_no_save_or_remove_of_its_record",
+    "native_an_unguarded_read_cancels_no_guard_of_its_transaction",
+    "native_a_save_and_a_remove_conflict_with_reads_for_share_and_for_update_in_either_order",
+    "native_a_transaction_that_writes_nothing_adds_no_guard_and_get_for_update_counts_as_a_write",
     "native_a_retry_starts_without_the_guards_of_the_attempt_before",
     "native_a_new_holder_and_a_delete_of_the_record_it_names_conflict_in_either_order",
     "native_concurrent_claims_of_one_unique_value_conflict_and_the_retry_is_refused",
     "native_unique_values_differing_only_by_case_or_spacing_coexist_and_are_found_exactly",
+    "native_a_save_whose_batch_read_meets_a_live_lock_waits_for_it_like_a_single_read",
+    "native_a_key_a_batch_read_did_not_find_is_answered_from_memory_while_a_lock_sits_on_it",
+    "native_a_batch_read_keeps_the_writes_and_locks_of_its_own_transaction",
+    "native_a_save_after_a_batch_read_of_its_save_keys_sends_no_read",
 }
 
 
@@ -87,13 +122,28 @@ def require_cases(output, cases, expected_count=None):
         raise RuntimeError("Executed case count differs from the exact mandatory discovery")
 
 
-def docker(*arguments, check=True):
-    result = subprocess.run(
-        ["docker", *arguments], capture_output=True, text=True, timeout=60
+def runtime_binary(path, name):
+    if not path:
+        raise RuntimeError(
+            f"Tito verification needs the {name} {RUNTIME_VERSION} binary: pass --{name} or set "
+            f"TITO_VERIFY_{name.upper()}"
+        )
+    binary = Path(path)
+    if not binary.is_absolute() or not binary.is_file() or not os.access(binary, os.X_OK):
+        raise RuntimeError(f"The {name} binary is missing or not executable: {binary}")
+    version = subprocess.run(
+        [str(binary), "--version"], capture_output=True, text=True, timeout=30, env={}
     )
-    if check and result.returncode:
-        raise RuntimeError(f"Docker {arguments[0]} refused: {result.stderr.strip()}")
-    return result
+    if version.returncode or RUNTIME_VERSION not in version.stdout:
+        raise RuntimeError(f"The {name} binary {binary} is not version {RUNTIME_VERSION}")
+    return binary
+
+
+def raise_file_limit():
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    wanted = FILE_LIMIT if hard == resource.RLIM_INFINITY else min(hard, FILE_LIMIT)
+    if soft != resource.RLIM_INFINITY and soft < wanted:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
 
 
 def source_hashes(root):
@@ -127,13 +177,13 @@ def cargo_target(root):
 
 
 class OwnedRuntime:
-    def __init__(self, artifacts, run_id, member_count, with_tikv):
+    def __init__(self, artifacts, run_id, member_count, binaries):
         self.artifacts = artifacts
         self.run_id = run_id
         self.member_count = member_count
-        self.with_tikv = with_tikv
-        self.containers = []
-        self.volumes = []
+        self.binaries = binaries
+        self.processes = []
+        self.data = None
         self.endpoints = []
         self.cleanup_attempts = []
         self.artifacts.mkdir(mode=0o700)
@@ -145,139 +195,100 @@ class OwnedRuntime:
             {
                 "run_id": self.run_id,
                 "member_count": self.member_count,
-                "containers": self.containers,
-                "volumes": self.volumes,
+                "binaries": {name: str(path) for name, path in self.binaries.items()},
+                "data": str(self.data) if self.data else None,
+                "processes": [
+                    {key: value for key, value in entry.items() if key != "process"}
+                    for entry in self.processes
+                ],
                 "endpoints": self.endpoints,
                 "cleanup_attempts": self.cleanup_attempts,
                 **extra,
             },
         )
 
-    def create_volume(self, name):
-        if docker("volume", "inspect", name, check=False).returncode == 0:
-            raise RuntimeError(f"Refusing an existing volume: {name}")
-        self.volumes.append(name)
+    def start_process(self, name, binary, arguments):
+        log = self.artifacts / f"{name}.log"
+        entry = {"name": name, "pid": None, "arguments": [str(binary), *arguments], "log": str(log)}
+        self.processes.append(entry)
+        with log.open("wb") as output:
+            entry["process"] = subprocess.Popen(
+                [str(binary), *arguments],
+                cwd=self.data,
+                env={},
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        entry["pid"] = entry["process"].pid
         self.persist()
-        docker("volume", "create", "--label", f"{OWNER_LABEL}={self.run_id}", name)
-
-    def create_container(self, name, options, image, command):
-        if docker("container", "inspect", name, check=False).returncode == 0:
-            raise RuntimeError(f"Refusing an existing container: {name}")
-        entry = {"name": name, "id": None}
-        self.containers.append(entry)
-        self.persist()
-        entry["id"] = docker(
-            "create",
-            "--pull=never",
-            "--name",
-            name,
-            "--label",
-            f"{OWNER_LABEL}={self.run_id}",
-            *options,
-            image,
-            *command,
-        ).stdout.strip()
-        self.persist()
-        docker("start", entry["id"])
-        return entry["id"]
 
     def start(self):
-        images = [PD_IMAGE] + ([TIKV_IMAGE] if self.with_tikv else [])
-        for image in images:
-            docker("image", "inspect", "--format", "{{.Id}}", image)
-            volumes = json.loads(
-                docker("image", "inspect", "--format", "{{json .Config.Volumes}}", image).stdout
-            ) or {}
-            if set(volumes) - {"/data"}:
-                raise RuntimeError("Pinned image declares an uncovered anonymous data volume")
+        self.data = Path(tempfile.mkdtemp(prefix=f"{self.run_id}-"))
+        self.persist()
+        with_tikv = "tikv" in self.binaries
         with contextlib.ExitStack() as reservations:
             ports = []
-            for _ in range(self.member_count * 2 + (2 if self.with_tikv else 0)):
+            for _ in range(self.member_count * 2 + (2 if with_tikv else 0)):
                 listener = reservations.enter_context(socket.socket())
                 listener.bind(("127.0.0.1", 0))
                 ports.append(listener.getsockname()[1])
-            clients = ports[: self.member_count]
-            peers = ports[self.member_count : self.member_count * 2]
-            self.endpoints = [f"http://127.0.0.1:{port}" for port in clients]
-            members = [f"{self.run_id}-pd{index + 1}" for index in range(self.member_count)]
-            initial_cluster = ",".join(
-                f"{name}=http://127.0.0.1:{port}" for name, port in zip(members, peers)
-            )
-            for name in members:
-                self.create_volume(f"{name}-data")
-            if self.with_tikv:
-                self.create_volume(f"{self.run_id}-tikv-data")
-            self.persist()
-        anchor = None
+        clients = ports[: self.member_count]
+        peers = ports[self.member_count : self.member_count * 2]
+        self.endpoints = [f"http://127.0.0.1:{port}" for port in clients]
+        members = [f"{self.run_id}-pd{index + 1}" for index in range(self.member_count)]
+        initial_cluster = ",".join(
+            f"{name}=http://127.0.0.1:{port}" for name, port in zip(members, peers)
+        )
+        self.persist()
         for index, name in enumerate(members):
-            options = [
-                "--memory",
-                "512m",
-                "--cpus",
-                "1",
-                "--mount",
-                f"type=volume,src={name}-data,dst=/data",
-            ]
-            if anchor is None:
-                published = clients + (ports[-2:] if self.with_tikv else [])
-                for port in published:
-                    options.extend(["--publish", f"127.0.0.1:{port}:{port}"])
-            else:
-                options.extend(["--network", f"container:{anchor}"])
-            container = self.create_container(
+            self.start_process(
                 name,
-                options,
-                PD_IMAGE,
+                self.binaries["pd"],
                 [
                     f"--name={name}",
-                    "--data-dir=/data/pd",
-                    f"--client-urls=http://0.0.0.0:{clients[index]}",
+                    f"--data-dir={self.data / name}",
+                    f"--client-urls={self.endpoints[index]}",
                     f"--advertise-client-urls={self.endpoints[index]}",
-                    f"--peer-urls=http://0.0.0.0:{peers[index]}",
+                    f"--peer-urls=http://127.0.0.1:{peers[index]}",
                     f"--advertise-peer-urls=http://127.0.0.1:{peers[index]}",
                     f"--initial-cluster={initial_cluster}",
                 ],
             )
-            if anchor is None:
-                anchor = container
         self.wait_members()
-        if self.with_tikv:
-            config = self.artifacts / "tikv.toml"
-            config.write_text(
-                '[storage]\nreserve-space = "0MiB"\nreserve-raft-space = "0MiB"\n'
-                '[storage.block-cache]\ncapacity = "512MiB"\n'
-            )
-            self.create_container(
+        if with_tikv:
+            config = self.data / "tikv.toml"
+            config.write_text(TIKV_CONFIG)
+            self.start_process(
                 f"{self.run_id}-tikv",
+                self.binaries["tikv"],
                 [
-                    "--network",
-                    f"container:{anchor}",
-                    "--memory",
-                    "3g",
-                    "--cpus",
-                    "2",
-                    "--mount",
-                    f"type=volume,src={self.run_id}-tikv-data,dst=/data",
-                    "--mount",
-                    f"type=bind,src={config},dst=/etc/tikv.toml,readonly",
-                ],
-                TIKV_IMAGE,
-                [
-                    "--config=/etc/tikv.toml",
+                    f"--config={config}",
                     f"--pd={','.join(self.endpoints)}",
-                    f"--addr=0.0.0.0:{ports[-2]}",
+                    f"--addr=127.0.0.1:{ports[-2]}",
                     f"--advertise-addr=127.0.0.1:{ports[-2]}",
-                    f"--status-addr=0.0.0.0:{ports[-1]}",
+                    f"--status-addr=127.0.0.1:{ports[-1]}",
                     f"--advertise-status-addr=127.0.0.1:{ports[-1]}",
-                    "--data-dir=/data/tikv",
+                    f"--data-dir={self.data / 'tikv'}",
                 ],
             )
             self.wait_store(f"127.0.0.1:{ports[-2]}")
+
+    def exited(self):
+        return [
+            entry["name"]
+            for entry in self.processes
+            if "process" in entry and entry["process"].poll() is not None
+        ]
 
     def wait(self, path, predicate, all_members=False):
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline:
+            stopped = self.exited()
+            if stopped:
+                raise RuntimeError(f"Owned {self.run_id} process exited before it was ready: {stopped}")
             try:
                 ready = True
                 for endpoint in (self.endpoints if all_members else self.endpoints[:1]):
@@ -324,77 +335,53 @@ class OwnedRuntime:
 
     def close(self):
         failures = []
-        for entry in reversed(self.containers):
-            name = entry["name"]
-            reference = entry["id"] or name
+        for entry in reversed(self.processes):
+            process = entry.get("process")
+            if process is None:
+                continue
             try:
-                inspected = docker(
-                    "container", "inspect", "--format", "{{json .Config.Labels}}", reference, check=False
-                )
-                if inspected.returncode:
-                    continue
-                labels = json.loads(inspected.stdout)
-                if not isinstance(labels, dict) or labels.get(OWNER_LABEL) != self.run_id:
-                    failures.append(f"Refused container with different ownership: {name}")
-                    continue
-                try:
-                    logs = docker("logs", "--timestamps", reference, check=False)
-                    for stream in ["stdout", "stderr"]:
-                        path = self.artifacts / f"{name}.{stream}.log"
-                        path.write_text(getattr(logs, stream))
-                        entry[f"{stream}_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
-                    if logs.returncode:
-                        failures.append(f"Native log capture refused: {name}")
-                except Exception as error:
-                    failures.append(f"Native log capture failed for {name}: {error}")
-                if docker("rm", "--force", reference, check=False).returncode:
-                    failures.append(f"Container removal refused: {name}")
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    try:
+                        process.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait(timeout=30)
+                entry["exit_code"] = process.returncode
+                log = Path(entry["log"])
+                if log.exists():
+                    entry["log_sha256"] = hashlib.sha256(log.read_bytes()).hexdigest()
             except Exception as error:
-                failures.append(f"Container cleanup failed for {name}: {error}")
-        for name in reversed(self.volumes):
+                failures.append(f"Process stop failed for {entry['name']}: {error}")
+        running = [
+            entry["name"]
+            for entry in self.processes
+            if "process" in entry and entry["process"].poll() is None
+        ]
+        if self.data is not None:
             try:
-                inspected = docker(
-                    "volume", "inspect", "--format", "{{json .Labels}}", name, check=False
-                )
-                if inspected.returncode:
-                    continue
-                labels = json.loads(inspected.stdout)
-                if not isinstance(labels, dict) or labels.get(OWNER_LABEL) != self.run_id:
-                    failures.append(f"Refused volume with different ownership: {name}")
-                    continue
-                if docker("volume", "rm", name, check=False).returncode:
-                    failures.append(f"Volume removal refused: {name}")
+                shutil.rmtree(self.data)
+            except FileNotFoundError:
+                pass
             except Exception as error:
-                failures.append(f"Volume cleanup failed for {name}: {error}")
-        remaining_containers = None
-        remaining_volumes = None
-        try:
-            remaining_containers = docker(
-                "ps", "--all", "--quiet", "--filter", f"label={OWNER_LABEL}={self.run_id}"
-            ).stdout.split()
-        except Exception as error:
-            failures.append(f"Final container verification failed: {error}")
-        try:
-            remaining_volumes = docker(
-                "volume", "ls", "--quiet", "--filter", f"label={OWNER_LABEL}={self.run_id}"
-            ).stdout.split()
-        except Exception as error:
-            failures.append(f"Final volume verification failed: {error}")
+                failures.append(f"Data folder removal failed for {self.data}: {error}")
+        remaining_data = self.data is not None and self.data.exists()
         cleanup = {
-            "verified": not failures and not remaining_containers and not remaining_volumes,
+            "verified": not failures and not running and not remaining_data,
             "failures": failures,
-            "remaining_containers": remaining_containers,
-            "remaining_volumes": remaining_volumes,
+            "running_processes": running,
+            "remaining_data": remaining_data,
         }
         self.cleanup_attempts.append(cleanup)
         self.persist(cleanup=cleanup)
-        if failures or remaining_containers or remaining_volumes:
+        if failures or running or remaining_data:
             raise RuntimeError(f"Owned runtime cleanup failed; inspect {self.artifacts / 'runtime.json'}")
 
 
 class Verification:
-    def __init__(self, root):
+    def __init__(self, root, binaries):
         self.root = root
+        self.binaries = binaries
         self.run_id = "run-tito-" + uuid.uuid4().hex[:16]
         self.artifacts = root / "target/native-test-runs" / self.run_id
         self.artifacts.mkdir(parents=True, mode=0o700)
@@ -473,7 +460,11 @@ class Verification:
         ]:
             output = self.command(phase, vendor + [selector])
             require_cases(output, {case for case in PROTOCOL_CASES if case.startswith(selector)}, count)
-        self.runtime = OwnedRuntime(self.artifacts / "ordinary", self.run_id + "-ordinary", 1, True)
+        output = self.command("vendor-buffer", vendor + ["transaction::buffer::tests::"])
+        require_cases(output, BUFFER_CASES, len(BUFFER_CASES))
+        self.runtime = OwnedRuntime(
+            self.artifacts / "ordinary", self.run_id + "-ordinary", 1, self.binaries
+        )
         try:
             self.runtime.start()
             environment = {
@@ -486,7 +477,12 @@ class Verification:
         finally:
             self.runtime.close()
             self.runtime = None
-        self.runtime = OwnedRuntime(self.artifacts / "leadership", self.run_id + "-transfer", 3, False)
+        self.runtime = OwnedRuntime(
+            self.artifacts / "leadership",
+            self.run_id + "-transfer",
+            3,
+            {"pd": self.binaries["pd"]},
+        )
         try:
             self.runtime.start()
             environment = {
@@ -507,7 +503,16 @@ def interrupted(_signal, _frame):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Complete Tito verification on owned PD and TiKV processes")
+    parser.add_argument("--pd", default=os.environ.get("TITO_VERIFY_PD"))
+    parser.add_argument("--tikv", default=os.environ.get("TITO_VERIFY_TIKV"))
+    arguments = parser.parse_args()
+    binaries = {
+        "pd": runtime_binary(arguments.pd, "pd"),
+        "tikv": runtime_binary(arguments.tikv, "tikv"),
+    }
     os.umask(0o077)
+    raise_file_limit()
     root = Path(__file__).resolve().parents[1]
     target = cargo_target(root)
     target.mkdir(parents=True, exist_ok=True)
@@ -518,7 +523,7 @@ def main():
             raise RuntimeError("Another verification command owns this Tito checkout")
         signal.signal(signal.SIGINT, interrupted)
         signal.signal(signal.SIGTERM, interrupted)
-        verification = Verification(root)
+        verification = Verification(root, binaries)
         try:
             verification.verify()
         finally:

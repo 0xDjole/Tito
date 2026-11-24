@@ -7,9 +7,9 @@ pub mod types;
 mod base;
 
 pub use base::{
-    CreateManyBuilder, GetBuilder, GetManyBuilder, ReplaceManyBuilder, SetBuilder, TitoModel,
-    MAX_BATCH_BYTES, MAX_BATCH_KEYS, MAX_BATCH_RECORDS, MAX_REPLACE_MANY_BYTES,
-    MAX_REPLACE_MANY_KEYS, MAX_REPLACE_MANY_RECORDS,
+    CreateManyBuilder, ReplaceManyBuilder, SetBuilder, TitoModel, MAX_BATCH_BYTES, MAX_BATCH_KEYS,
+    MAX_BATCH_RECORDS, MAX_REPLACE_MANY_BYTES, MAX_REPLACE_MANY_KEYS, MAX_REPLACE_MANY_RECORDS,
+    MAX_SAVE_BYTES,
 };
 
 mod utils;

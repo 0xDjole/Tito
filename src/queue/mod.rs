@@ -17,6 +17,7 @@ pub use types::{
     MAX_QUEUE_OWNER_COMPONENT_BYTES,
 };
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -967,20 +968,42 @@ impl<E: TitoEngine> Queue<E> {
                     } else {
                         None
                     };
-                    let mut events = Vec::with_capacity(entries.len());
-                    for (index_key, _) in entries {
-                        let storage_key = Self::indexed_storage_key(&index_key, &prefix)?;
-                        if !storage_key.starts_with(self.status_prefix(status).as_bytes()) {
-                            return Err(TitoError::DeserializationFailed(
-                                "Queue owner index points outside its status".into(),
-                            ));
+                    let mut storage_keys = Vec::with_capacity(entries.len());
+                    for (index_key, _) in &entries {
+                        let storage_key =
+                            Self::indexed_storage_key(index_key, &prefix).and_then(|storage_key| {
+                                if storage_key.starts_with(self.status_prefix(status).as_bytes()) {
+                                    Ok(storage_key)
+                                } else {
+                                    Err(TitoError::DeserializationFailed(
+                                        "Queue owner index points outside its status".into(),
+                                    ))
+                                }
+                            });
+                        let valid = storage_key.is_ok();
+                        storage_keys.push(storage_key);
+                        if !valid {
+                            break;
                         }
-                        let value = tx.get(&storage_key).await?.ok_or_else(|| {
+                    }
+                    let readable = storage_keys
+                        .iter()
+                        .filter_map(|storage_key| storage_key.as_ref().ok())
+                        .collect::<Vec<_>>();
+                    let found: HashMap<_, _> = if readable.is_empty() {
+                        HashMap::new()
+                    } else {
+                        tx.batch_get(readable).await?.into_iter().collect()
+                    };
+                    let mut events = Vec::with_capacity(storage_keys.len());
+                    for storage_key in storage_keys {
+                        let storage_key = storage_key?;
+                        let value = found.get(&storage_key).ok_or_else(|| {
                             TitoError::DeserializationFailed(
                                 "Queue owner index points to a missing event".into(),
                             )
                         })?;
-                        let event = Self::read_event_from_value::<T>(&value)?;
+                        let event = Self::read_event_from_value::<T>(value)?;
                         if event.status != status || event.owner.as_ref() != Some(owner) {
                             return Err(TitoError::DeserializationFailed(
                                 "Queue owner index conflicts with its event".into(),
@@ -1610,5 +1633,74 @@ mod tests {
             ));
             assert!(isolated_engine.contains_key(&dangling_index).await);
         }
+    }
+
+    #[tokio::test]
+    async fn owner_reader_reads_the_events_of_a_page_in_one_batch_after_its_scan() {
+        let engine = MemoryEngine::default();
+        let queue = queue(engine.clone());
+        let owner = QueueOwner::new("store", "target").unwrap();
+        for i in 0..3 {
+            queue
+                .publish(
+                    QueueEvent::new(format!("entry:{i}"), payload(&i.to_string()), 0)
+                        .with_owner(owner.clone()),
+                )
+                .await
+                .unwrap();
+        }
+
+        let before = engine.read_round_trips();
+        let page = queue
+            .scan_by_owner::<Payload>(&owner, QueueEventStatus::Pending, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(engine.read_round_trips() - before, 2);
+        assert_eq!(
+            page.events
+                .iter()
+                .map(|(_, event)| event.payload.name.clone())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_reader_reports_the_first_corrupt_entry_in_index_order() {
+        let engine = MemoryEngine::default();
+        let queue = queue(engine.clone());
+        let owner = QueueOwner::new("store", "target").unwrap();
+        let missing = queue
+            .owner_index_key(
+                &owner,
+                QueueEventStatus::Completed,
+                b"queue:completed:missing",
+            )
+            .unwrap();
+        let outside = queue
+            .owner_index_key(
+                &owner,
+                QueueEventStatus::Completed,
+                b"queue:pending:outside",
+            )
+            .unwrap();
+        engine.put_raw(&missing, vec![]).await;
+        engine.put_raw(&outside, vec![]).await;
+        let first = if missing < outside {
+            "Queue owner index points to a missing event"
+        } else {
+            "Queue owner index points outside its status"
+        };
+
+        assert_eq!(
+            queue
+                .scan_by_owner::<Payload>(&owner, QueueEventStatus::Completed, None, 10)
+                .await
+                .unwrap_err(),
+            TitoError::DeserializationFailed(first.to_string())
+        );
+        assert!(engine.contains_key(&missing).await);
+        assert!(engine.contains_key(&outside).await);
     }
 }

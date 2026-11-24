@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tito::backend::tikv::{TiKVBackend, TiKVTransaction};
 use tito::types::{
-    TitoFindOneByIndexPayload, TitoIndexConfig, TitoIndexField, TitoIndexFieldType, TitoIndexValue,
-    TitoScanPayload, TitoTransaction,
+    TitoFindByIndexPayload, TitoFindOneByIndexPayload, TitoIndexConfig, TitoIndexField,
+    TitoIndexFieldType, TitoScanPayload, TitoTransaction,
 };
 use tito::{TitoEngine, TitoError, TitoModel, TitoModelOptions, TitoModelTrait};
 use uuid::Uuid;
@@ -19,21 +19,16 @@ struct IndexValueRecord {
     rank: i64,
     code: String,
     tags: Vec<String>,
+    holds: Vec<String>,
     enabled: bool,
     body: String,
     created_at: i64,
     updated_at: i64,
 }
 
-fn index(
-    name: &str,
-    value: TitoIndexValue,
-    fields: Vec<(&str, TitoIndexFieldType)>,
-    condition: bool,
-) -> TitoIndexConfig {
+fn index(name: &str, fields: Vec<(&str, TitoIndexFieldType)>, condition: bool) -> TitoIndexConfig {
     TitoIndexConfig {
         name: name.into(),
-        value,
         condition,
         fields: fields
             .into_iter()
@@ -49,8 +44,7 @@ impl TitoModelTrait for IndexValueRecord {
     fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![
             index(
-                "native-value-rank-copy",
-                TitoIndexValue::RecordCopy,
+                "native-value-rank",
                 vec![
                     ("scope", TitoIndexFieldType::String),
                     ("rank", TitoIndexFieldType::Number),
@@ -58,26 +52,7 @@ impl TitoModelTrait for IndexValueRecord {
                 true,
             ),
             index(
-                "native-value-rank-reference",
-                TitoIndexValue::RecordReference,
-                vec![
-                    ("scope", TitoIndexFieldType::String),
-                    ("rank", TitoIndexFieldType::Number),
-                ],
-                true,
-            ),
-            index(
-                "native-value-tag-copy",
-                TitoIndexValue::RecordCopy,
-                vec![
-                    ("scope", TitoIndexFieldType::String),
-                    ("tags", TitoIndexFieldType::String),
-                ],
-                self.enabled,
-            ),
-            index(
-                "native-value-tag-reference",
-                TitoIndexValue::RecordReference,
+                "native-value-tag",
                 vec![
                     ("scope", TitoIndexFieldType::String),
                     ("tags", TitoIndexFieldType::String),
@@ -88,26 +63,25 @@ impl TitoModelTrait for IndexValueRecord {
     }
 
     fn unique_indexes(&self) -> Vec<TitoIndexConfig> {
-        vec![
-            index(
-                "native-value-code-copy",
-                TitoIndexValue::RecordCopy,
-                vec![
-                    ("scope", TitoIndexFieldType::String),
-                    ("code", TitoIndexFieldType::String),
-                ],
-                true,
-            ),
-            index(
-                "native-value-code-reference",
-                TitoIndexValue::RecordReference,
-                vec![
-                    ("scope", TitoIndexFieldType::String),
-                    ("code", TitoIndexFieldType::String),
-                ],
-                true,
-            ),
-        ]
+        vec![index(
+            "native-value-code",
+            vec![
+                ("scope", TitoIndexFieldType::String),
+                ("code", TitoIndexFieldType::String),
+            ],
+            true,
+        )]
+    }
+
+    fn holder_indexes(&self) -> Vec<TitoIndexConfig> {
+        vec![index(
+            "native-value-holder",
+            vec![
+                ("scope", TitoIndexFieldType::String),
+                ("holds", TitoIndexFieldType::String),
+            ],
+            true,
+        )]
     }
 
     fn table() -> String {
@@ -139,6 +113,7 @@ fn record(scope: &str, rank: i64) -> IndexValueRecord {
         rank,
         code: format!("code:{rank}"),
         tags: vec!["common".into(), format!("tag:{rank}")],
+        holds: vec!["shared".into(), format!("held:{rank}")],
         enabled: true,
         body: format!("body {rank}"),
         created_at: 1,
@@ -150,41 +125,56 @@ fn primary(record: &IndexValueRecord) -> String {
     format!("table:native-index-values:{}", record.id)
 }
 
-fn by_code(record: &IndexValueRecord, index: &str) -> TitoFindOneByIndexPayload {
+fn by_code(record: &IndexValueRecord) -> TitoFindOneByIndexPayload {
     TitoFindOneByIndexPayload {
-        index: index.into(),
+        index: "native-value-code".into(),
         values: vec![record.scope.clone(), record.code.clone()],
     }
+}
+
+fn holder_key(record: &IndexValueRecord, held: &str) -> String {
+    format!(
+        "holder-index:native-value-holder:scope:{}:holds:{}:{}",
+        tito::encode_index_string(&record.scope),
+        tito::encode_index_string(held),
+        primary(record)
+    )
 }
 
 async fn assert_record_reads(
     model: &TitoModel<TiKVBackend, IndexValueRecord>,
     record: &IndexValueRecord,
 ) {
-    for index in ["native-value-rank-copy", "native-value-rank-reference"] {
-        assert_eq!(
-            model
-                .find_one_by_index(
-                    TitoFindOneByIndexPayload {
-                        index: index.into(),
-                        values: vec![record.scope.clone(), record.rank.to_string()],
-                    },
-                    None,
-                )
-                .await
-                .unwrap(),
-            *record
-        );
-    }
-    for index in ["native-value-code-copy", "native-value-code-reference"] {
-        assert_eq!(
-            model
-                .find_one_by_unique_index(by_code(record, index), None)
-                .await
-                .unwrap(),
-            *record
-        );
-    }
+    assert_eq!(
+        model
+            .find_one_by_index(
+                TitoFindOneByIndexPayload {
+                    index: "native-value-rank".into(),
+                    values: vec![record.scope.clone(), record.rank.to_string()],
+                },
+                None,
+            )
+            .await
+            .unwrap(),
+        *record
+    );
+    assert_eq!(
+        model
+            .find_one_by_unique_index_for_share(by_code(record), None)
+            .await
+            .unwrap(),
+        *record
+    );
+}
+
+async fn holder_ids(
+    model: &TitoModel<TiKVBackend, IndexValueRecord>,
+    scope: &str,
+    held: &str,
+) -> Vec<String> {
+    let mut holders = model.query_by_index("native-value-holder");
+    holders.value(scope).value(held).limit(Some(10));
+    holders.execute_ids(None).await.unwrap().items
 }
 
 async fn assert_conflict(tx: TiKVTransaction) {
@@ -198,7 +188,7 @@ async fn assert_conflict(tx: TiKVTransaction) {
 }
 
 #[tokio::test]
-async fn native_index_value_modes_store_selected_bytes_and_preserve_pages() {
+async fn native_index_entries_hold_copies_and_holder_entries_hold_nothing_across_pages() {
     tokio::time::timeout(Duration::from_secs(120), async {
         let (engine, model, scope) = fixture().await;
         let records = (-2..2).map(|rank| record(&scope, rank)).collect::<Vec<_>>();
@@ -211,96 +201,119 @@ async fn native_index_value_modes_store_selected_bytes_and_preserve_pages() {
             let keys = model
                 .get_index_keys(primary(record), record, &json)
                 .unwrap();
-            assert_eq!(keys.len(), 8);
+            assert_eq!(keys.len(), 6);
             let stored_primary = tx.get(primary(record)).await.unwrap().unwrap();
             for (key, expected) in keys {
                 let bytes = tx.get(&key).await.unwrap().unwrap();
                 assert_eq!(bytes, expected);
-                if key.contains("-copy:") {
-                    assert_eq!(bytes, stored_primary);
-                } else if key.starts_with("unique-index:") {
-                    assert_eq!(bytes, record.id.as_bytes());
+                if key.starts_with("holder-index:") {
+                    assert!(bytes.is_empty(), "{key}");
                 } else {
-                    assert!(bytes.is_empty());
+                    assert_eq!(bytes, stored_primary, "{key}");
                 }
+            }
+            for held in ["shared".to_string(), format!("held:{}", record.rank)] {
+                assert_eq!(
+                    tx.get(holder_key(record, &held)).await.unwrap(),
+                    Some(Vec::new())
+                );
             }
         }
         tx.rollback().await.unwrap();
-        for index in ["native-value-rank-copy", "native-value-rank-reference"] {
-            let mut query = model.query_by_index(index);
-            query.value(&scope).limit(Some(2));
-            let first = query.execute(None).await.unwrap();
-            assert_eq!(first.items, records[..2]);
-            assert!(first.cursor.is_some());
-            let ids = query.execute_ids(None).await.unwrap();
-            assert_eq!(
-                ids.items,
-                records[..2]
-                    .iter()
-                    .map(|r| r.id.clone())
-                    .collect::<Vec<_>>()
-            );
-            assert_eq!(ids.cursor, first.cursor);
-            query.cursor(first.cursor);
-            let last = query.execute(None).await.unwrap();
-            assert_eq!(last.items, records[2..]);
-            assert!(last.cursor.is_none());
-            query.cursor(None::<String>);
-            let reverse = query.execute_reverse(None).await.unwrap();
-            assert_eq!(
-                reverse.items,
-                records[2..].iter().rev().cloned().collect::<Vec<_>>()
-            );
-            query.cursor(reverse.cursor);
-            let reverse_end = query.execute_reverse(None).await.unwrap();
-            assert_eq!(
-                reverse_end.items,
-                records[..2].iter().rev().cloned().collect::<Vec<_>>()
-            );
-            assert!(reverse_end.cursor.is_none());
+
+        let mut query = model.query_by_index("native-value-rank");
+        query.value(&scope).limit(Some(2));
+        let first = query.execute(None).await.unwrap();
+        assert_eq!(first.items, records[..2]);
+        assert!(first.cursor.is_some());
+        let ids = query.execute_ids(None).await.unwrap();
+        assert_eq!(
+            ids.items,
+            records[..2]
+                .iter()
+                .map(|r| r.id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(ids.cursor, first.cursor);
+        query.cursor(first.cursor);
+        let last = query.execute(None).await.unwrap();
+        assert_eq!(last.items, records[2..]);
+        assert!(last.cursor.is_none());
+        query.cursor(None::<String>);
+        let reverse = query.execute_reverse(None).await.unwrap();
+        assert_eq!(
+            reverse.items,
+            records[2..].iter().rev().cloned().collect::<Vec<_>>()
+        );
+        query.cursor(reverse.cursor);
+        let reverse_end = query.execute_reverse(None).await.unwrap();
+        assert_eq!(
+            reverse_end.items,
+            records[..2].iter().rev().cloned().collect::<Vec<_>>()
+        );
+        assert!(reverse_end.cursor.is_none());
+
+        let mut tags = model.query_by_index("native-value-tag");
+        tags.value(&scope).value("common").limit(Some(10));
+        let page = tags.execute(None).await.unwrap();
+        assert_eq!(page.items.len(), records.len());
+        assert!(page.cursor.is_none());
+        for record in &records {
+            assert!(page.items.contains(record));
         }
-        for index in ["native-value-tag-copy", "native-value-tag-reference"] {
-            let mut query = model.query_by_index(index);
-            query.value(&scope).value("common").limit(Some(10));
-            let page = query.execute(None).await.unwrap();
-            assert_eq!(page.items.len(), records.len());
-            assert!(page.cursor.is_none());
-            for record in &records {
-                assert!(page.items.contains(record));
-            }
+
+        let tx = engine.begin_transaction().await.unwrap();
+        let start = format!("unique-index:native-index-values:native-value-code:scope:{scope}:");
+        let payload = || TitoScanPayload {
+            start: start.clone(),
+            end: None,
+            limit: Some(2),
+            cursor: None,
+        };
+        let (first, more) = model.scan(payload(), &tx).await.unwrap();
+        assert!(more);
+        assert_eq!(first.len(), 2);
+        let (last, more) = model.scan_reverse(payload(), &tx).await.unwrap();
+        assert!(more);
+        assert_eq!(last.len(), 2);
+        assert_ne!(first[0].0, last[0].0);
+        for (_, value) in first.into_iter().chain(last) {
+            assert!(records.contains(&serde_json::from_value(value).unwrap()));
         }
-        for index in ["native-value-code-copy", "native-value-code-reference"] {
-            let tx = engine.begin_transaction().await.unwrap();
-            let start = format!("unique-index:native-index-values:{index}:scope:{scope}:");
-            let payload = || TitoScanPayload {
-                start: start.clone(),
-                end: None,
-                limit: Some(2),
-                cursor: None,
-            };
-            let (first, more) = model.scan(payload(), &tx).await.unwrap();
-            assert!(more);
-            assert_eq!(first.len(), 2);
-            let (last, more) = model.scan_reverse(payload(), &tx).await.unwrap();
-            assert!(more);
-            assert_eq!(last.len(), 2);
-            assert_ne!(first[0].0, last[0].0);
-            for (_, value) in first.into_iter().chain(last) {
-                assert!(records.contains(&serde_json::from_value(value).unwrap()));
-            }
-            tx.rollback().await.unwrap();
-        }
+        tx.rollback().await.unwrap();
+
+        let mut holders = model.query_by_index("native-value-holder");
+        holders.value(&scope).value("shared").limit(Some(3));
+        let held = holders.execute_ids(None).await.unwrap();
+        assert_eq!(held.items.len(), 3);
+        assert!(held.cursor.is_some());
+        holders.cursor(held.cursor);
+        let rest = holders.execute_ids(None).await.unwrap();
+        assert_eq!(rest.items.len(), 1);
+        assert!(rest.cursor.is_none());
+        let mut every = held.items;
+        every.extend(rest.items);
+        every.sort();
+        let mut expected = records.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(every, expected);
+        assert_eq!(
+            holder_ids(&model, &scope, "held:1").await,
+            vec![records[3].id.clone()]
+        );
+
         for record in &records {
             assert_record_reads(&model, record).await;
             assert!(remove(&engine, &model, &record.id).await.unwrap());
         }
+        assert!(holder_ids(&model, &scope, "shared").await.is_empty());
     })
     .await
-    .expect("Native mixed index pages must finish within their owned run");
+    .expect("Native copied index pages must finish within their owned run");
 }
 
 #[tokio::test]
-async fn native_copied_index_reads_avoid_primaries_and_id_queries_skip_values() {
+async fn native_index_reads_come_from_the_copies_and_id_queries_skip_values() {
     tokio::time::timeout(Duration::from_secs(120), async {
         let (engine, model, scope) = fixture().await;
         let record = IndexValueRecord {
@@ -314,38 +327,30 @@ async fn native_copied_index_reads_avoid_primaries_and_id_queries_skip_values() 
             .unwrap();
         let (copy_key, copy_bytes) = keys
             .iter()
-            .find(|(key, _)| key.starts_with("index:native-value-rank-copy:"))
+            .find(|(key, _)| key.starts_with("index:native-value-rank:"))
             .unwrap();
         let tx = engine.begin_transaction().await.unwrap();
         let primary_bytes = tx.get(primary(&record)).await.unwrap().unwrap();
         tx.delete(primary(&record)).await.unwrap();
         tx.commit().await.unwrap();
 
-        let mut copies = model.query_by_index("native-value-rank-copy");
+        let mut copies = model.query_by_index("native-value-rank");
         copies.value(&scope);
         assert_eq!(
             copies.execute(None).await.unwrap().items,
             vec![record.clone()]
         );
         assert_eq!(
+            copies.execute_reverse(None).await.unwrap().items,
+            vec![record.clone()]
+        );
+        assert_eq!(
             model
-                .find_one_by_unique_index(by_code(&record, "native-value-code-copy"), None)
+                .find_one_by_unique_index_for_share(by_code(&record), None)
                 .await
                 .unwrap(),
             record
         );
-        let mut references = model.query_by_index("native-value-rank-reference");
-        references.value(&scope);
-        assert!(matches!(
-            references.execute(None).await,
-            Err(TitoError::IndexError(_))
-        ));
-        assert!(matches!(
-            model
-                .find_one_by_unique_index(by_code(&record, "native-value-code-reference"), None)
-                .await,
-            Err(TitoError::IndexError(_))
-        ));
 
         let tx = engine.begin_transaction().await.unwrap();
         tx.put(copy_key, b"invalid JSON").await.unwrap();
@@ -381,6 +386,19 @@ async fn native_copied_index_reads_avoid_primaries_and_id_queries_skip_values() 
             copies.execute(None).await,
             Err(TitoError::IndexError(_))
         ));
+        let moved = IndexValueRecord {
+            rank: 7,
+            ..record.clone()
+        };
+        let tx = engine.begin_transaction().await.unwrap();
+        tx.put(copy_key, serde_json::to_vec(&moved).unwrap())
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert!(matches!(
+            copies.execute(None).await,
+            Err(TitoError::IndexError(ref message)) if message.contains(copy_key.as_str())
+        ));
         let tx = engine.begin_transaction().await.unwrap();
         tx.put(copy_key, copy_bytes).await.unwrap();
         tx.commit().await.unwrap();
@@ -392,7 +410,7 @@ async fn native_copied_index_reads_avoid_primaries_and_id_queries_skip_values() 
 }
 
 #[tokio::test]
-async fn native_index_value_modes_refresh_copies_on_every_write_and_remove_old_entries() {
+async fn native_every_save_refreshes_every_copy_and_removes_old_entries() {
     tokio::time::timeout(Duration::from_secs(120), async {
         let (engine, model, scope) = fixture().await;
         let first = record(&scope, 1);
@@ -417,10 +435,22 @@ async fn native_index_value_modes_refresh_copies_on_every_write_and_remove_old_e
                 &serde_json::to_value(&updated).unwrap(),
             )
             .unwrap();
+        let tx = engine.begin_transaction().await.unwrap();
+        let stored = tx.get(primary(&updated)).await.unwrap().unwrap();
+        for (key, _) in &before {
+            let bytes = tx.get(key).await.unwrap().unwrap();
+            if key.starts_with("holder-index:") {
+                assert!(bytes.is_empty(), "{key}");
+            } else {
+                assert_eq!(bytes, stored, "{key}");
+            }
+        }
+        tx.rollback().await.unwrap();
         let changed = IndexValueRecord {
             rank: 9,
             code: "changed".into(),
             tags: vec!["changed-tag".into()],
+            holds: vec!["changed-held".into()],
             enabled: false,
             ..updated.clone()
         };
@@ -433,7 +463,7 @@ async fn native_index_value_modes_refresh_copies_on_every_write_and_remove_old_e
             .unwrap();
         assert_eq!(
             model
-                .find_one_by_unique_index(by_code(&changed, "native-value-code-copy"), Some(&tx))
+                .find_one_by_unique_index_for_share(by_code(&changed), Some(&tx))
                 .await
                 .unwrap(),
             changed
@@ -442,6 +472,11 @@ async fn native_index_value_modes_refresh_copies_on_every_write_and_remove_old_e
         assert_record_reads(&model, &updated).await;
         save(&engine, &model, changed.clone()).await.unwrap();
         assert_record_reads(&model, &changed).await;
+        assert!(holder_ids(&model, &scope, "shared").await.is_empty());
+        assert_eq!(
+            holder_ids(&model, &scope, "changed-held").await,
+            vec![changed.id.clone()]
+        );
         let after = model
             .get_index_keys(
                 primary(&changed),
@@ -449,7 +484,7 @@ async fn native_index_value_modes_refresh_copies_on_every_write_and_remove_old_e
                 &serde_json::to_value(&changed).unwrap(),
             )
             .unwrap();
-        assert_eq!(after.len(), 4);
+        assert_eq!(after.len(), 3);
         let tx = engine.begin_transaction().await.unwrap();
         for (key, _) in &before {
             assert!(tx.get(key).await.unwrap().is_none(), "old entry {key}");
@@ -476,7 +511,7 @@ async fn native_index_value_modes_refresh_copies_on_every_write_and_remove_old_e
 }
 
 #[tokio::test]
-async fn native_index_value_modes_preserve_unique_claims_and_batch_swaps() {
+async fn native_copied_unique_entries_keep_claims_and_batch_swaps() {
     tokio::time::timeout(Duration::from_secs(120), async {
         let (engine, model, scope) = fixture().await;
         let first = record(&scope, 1);
@@ -492,7 +527,7 @@ async fn native_index_value_modes_preserve_unique_claims_and_batch_swaps() {
             Err(TitoError::UniqueViolation { .. })
         ));
         assert!(matches!(
-            model.get(&duplicate.id).execute(None).await,
+            model.get_for_share(&duplicate.id, None).await,
             Err(TitoError::NotFound(_))
         ));
         let first_next = IndexValueRecord {
@@ -548,7 +583,7 @@ async fn native_index_value_modes_preserve_unique_claims_and_batch_swaps() {
             Err(TitoError::UniqueViolation { .. })
         ));
         assert!(matches!(
-            model.get(&losing.id).execute(None).await,
+            model.get_for_share(&losing.id, None).await,
             Err(TitoError::NotFound(_))
         ));
         assert_record_reads(&model, &contender).await;
@@ -561,7 +596,7 @@ async fn native_index_value_modes_preserve_unique_claims_and_batch_swaps() {
 }
 
 #[tokio::test]
-async fn native_copied_unique_hits_guard_the_owner_while_lists_remain_unguarded() {
+async fn native_copied_unique_hits_for_share_guard_the_owner_while_lists_remain_unguarded() {
     tokio::time::timeout(Duration::from_secs(120), async {
         let (engine, model, scope) = fixture().await;
         let first = record(&scope, 1);
@@ -569,7 +604,7 @@ async fn native_copied_unique_hits_guard_the_owner_while_lists_remain_unguarded(
         let guarded = engine.begin_transaction().await.unwrap();
         assert_eq!(
             model
-                .find_one_by_unique_index(by_code(&first, "native-value-code-copy"), Some(&guarded))
+                .find_one_by_unique_index_for_share(by_code(&first), Some(&guarded))
                 .await
                 .unwrap(),
             first
@@ -586,11 +621,17 @@ async fn native_copied_unique_hits_guard_the_owner_while_lists_remain_unguarded(
         assert_conflict(guarded).await;
 
         let list = engine.begin_transaction().await.unwrap();
-        let mut query = model.query_by_index("native-value-rank-copy");
+        let mut query = model.query_by_index("native-value-rank");
         query.value(&scope);
         assert_eq!(
             query.execute(Some(&list)).await.unwrap().items,
             vec![next.clone()]
+        );
+        let mut holders = model.query_by_index("native-value-holder");
+        holders.value(&scope).value("shared");
+        assert_eq!(
+            holders.execute_ids(Some(&list)).await.unwrap().items,
+            vec![next.id.clone()]
         );
         list.delete(format!("native-value-probe:{scope}:list"))
             .await
@@ -605,10 +646,7 @@ async fn native_copied_unique_hits_guard_the_owner_while_lists_remain_unguarded(
         let read_only = engine.begin_transaction().await.unwrap();
         assert_eq!(
             model
-                .find_one_by_unique_index(
-                    by_code(&current, "native-value-code-copy"),
-                    Some(&read_only)
-                )
+                .find_one_by_unique_index_for_share(by_code(&current), Some(&read_only))
                 .await
                 .unwrap(),
             current
@@ -621,39 +659,30 @@ async fn native_copied_unique_hits_guard_the_owner_while_lists_remain_unguarded(
 }
 
 #[tokio::test]
-async fn native_reference_record_reads_reject_nonempty_values_while_ids_remain_key_only() {
+async fn native_holder_entries_are_read_only_by_key_and_refuse_record_reads() {
     tokio::time::timeout(Duration::from_secs(120), async {
         let (engine, model, scope) = fixture().await;
         let record = record(&scope, 1);
         save(&engine, &model, record.clone()).await.unwrap();
-        let keys = model
-            .get_index_keys(
-                primary(&record),
-                &record,
-                &serde_json::to_value(&record).unwrap(),
-            )
-            .unwrap();
-        let key = &keys
-            .iter()
-            .find(|(key, _)| key.starts_with("index:native-value-rank-reference:"))
-            .unwrap()
-            .0;
-        let mut query = model.query_by_index("native-value-rank-reference");
-        query.value(&scope);
-        for invalid in [
-            b"not JSON".to_vec(),
-            b"{}".to_vec(),
-            serde_json::to_vec(&record).unwrap(),
-        ] {
+        let key = holder_key(&record, "shared");
+        let payload = TitoFindByIndexPayload {
+            index: "native-value-holder".into(),
+            values: vec![scope.clone(), "shared".into()],
+            limit: Some(1),
+            cursor: None,
+        };
+        let mut query = model.query_by_index("native-value-holder");
+        query.value(&scope).value("shared");
+        for stored in [Vec::new(), b"not JSON".to_vec(), serde_json::to_vec(&record).unwrap()] {
             let tx = engine.begin_transaction().await.unwrap();
-            tx.put(key, invalid).await.unwrap();
+            tx.put(&key, stored).await.unwrap();
             tx.commit().await.unwrap();
             assert_eq!(
                 query.execute_ids(None).await.unwrap().items,
                 vec![record.id.clone()]
             );
             let tx = engine.begin_transaction().await.unwrap();
-            let payload = || TitoScanPayload {
+            let scan = || TitoScanPayload {
                 start: key.clone(),
                 end: Some(tito::key_after(key.clone())),
                 limit: Some(1),
@@ -662,35 +691,56 @@ async fn native_reference_record_reads_reject_nonempty_values_while_ids_remain_k
             let errors = [
                 query.execute(None).await.unwrap_err(),
                 query.execute_reverse(None).await.unwrap_err(),
+                model.find_by_index(payload.clone(), None).await.unwrap_err(),
+                model
+                    .find_by_index_reverse(payload.clone(), None)
+                    .await
+                    .unwrap_err(),
                 model
                     .find_one_by_index(
                         TitoFindOneByIndexPayload {
-                            index: "native-value-rank-reference".into(),
-                            values: vec![scope.clone(), record.rank.to_string()],
+                            index: "native-value-holder".into(),
+                            values: vec![scope.clone(), "shared".into()],
                         },
                         None,
                     )
                     .await
                     .unwrap_err(),
-                model.scan(payload(), &tx).await.unwrap_err(),
-                model.scan_reverse(payload(), &tx).await.unwrap_err(),
             ];
             for error in errors {
                 assert!(
-                    matches!(error, TitoError::IndexError(ref message) if message.contains(key)),
+                    matches!(error, TitoError::IndexError(ref message) if message.contains("holder index")),
                     "{error:?}"
                 );
             }
+            for error in [
+                model.scan(scan(), &tx).await.unwrap_err(),
+                model.scan_reverse(scan(), &tx).await.unwrap_err(),
+            ] {
+                assert!(
+                    matches!(error, TitoError::IndexError(ref message) if message.contains(key.as_str())),
+                    "{error:?}"
+                );
+            }
+            assert_eq!(
+                tx.scan_keys(
+                    key.as_bytes().to_vec()..tito::key_after(key.clone()).into_bytes(),
+                    2
+                )
+                .await
+                .unwrap(),
+                vec![key.as_bytes().to_vec()]
+            );
             tx.rollback().await.unwrap();
         }
-        let tx = engine.begin_transaction().await.unwrap();
-        tx.put(key, Vec::<u8>::new()).await.unwrap();
-        tx.commit().await.unwrap();
         assert_record_reads(&model, &record).await;
         assert!(remove(&engine, &model, &record.id).await.unwrap());
+        let tx = engine.begin_transaction().await.unwrap();
+        assert!(tx.get(&key).await.unwrap().is_none());
+        tx.rollback().await.unwrap();
     })
     .await
-    .expect("Native reference validation must finish within its owned run");
+    .expect("Native holder entries must finish within their owned run");
 }
 
 #[tokio::test]
@@ -725,13 +775,23 @@ async fn native_batch_creation_commits_indexed_records_in_input_order_and_rolls_
     }
     for value in &records {
         assert_eq!(
-            model.get(&value.id).execute(Some(&tx)).await.unwrap(),
+            model.get_for_share(&value.id, Some(&tx)).await.unwrap(),
             *value
         );
         assert!(matches!(
-            model.get(&value.id).execute(None).await,
+            model.get_for_share(&value.id, None).await,
             Err(TitoError::NotFound(_))
         ));
+        let stored = tx.get(primary(value)).await.unwrap().unwrap();
+        let json = serde_json::to_value(value).unwrap();
+        for (key, _) in model.get_index_keys(primary(value), value, &json).unwrap() {
+            let bytes = tx.get(&key).await.unwrap().unwrap();
+            if key.starts_with("holder-index:") {
+                assert!(bytes.is_empty(), "{key}");
+            } else {
+                assert_eq!(bytes, stored, "{key}");
+            }
+        }
     }
     tx.rollback().await.unwrap();
     let snapshot = engine.begin_transaction().await.unwrap();
@@ -744,12 +804,12 @@ async fn native_batch_creation_commits_indexed_records_in_input_order_and_rolls_
     snapshot.rollback().await.unwrap();
     for value in &records {
         assert!(matches!(
-            model.get(&value.id).execute(None).await,
+            model.get_for_share(&value.id, None).await,
             Err(TitoError::NotFound(_))
         ));
         assert!(matches!(
             model
-                .find_one_by_unique_index(by_code(value, "native-value-code-copy"), None)
+                .find_one_by_unique_index_for_share(by_code(value), None)
                 .await,
             Err(TitoError::NotFound(_))
         ));
@@ -768,13 +828,17 @@ async fn native_batch_creation_commits_indexed_records_in_input_order_and_rolls_
         assert_eq!(value.created_at, value.updated_at);
         assert_record_reads(&model, value).await;
         assert_eq!(
-            model.get_versioned(&value.id, None).await.unwrap().value,
+            model
+                .get_versioned_for_share(&value.id, None)
+                .await
+                .unwrap()
+                .value,
             *value
         );
         remove(&engine, &model, &value.id).await.unwrap();
         assert!(matches!(
             model
-                .find_one_by_unique_index(by_code(value, "native-value-code-copy"), None)
+                .find_one_by_unique_index_for_share(by_code(value), None)
                 .await,
             Err(TitoError::NotFound(_))
         ));
@@ -808,6 +872,12 @@ async fn native_batch_creation_rejects_conflicts_corruption_and_limits_before_st
     assert!(matches!(
         model.create_many(vec![large]).execute(&invalid).await,
         Err(TitoError::InvalidInput(_))
+    ));
+    let mut copied = record(&scope, 7);
+    copied.body = "x".repeat(tito::MAX_BATCH_BYTES / 4);
+    assert!(matches!(
+        model.create_many(vec![copied]).execute(&invalid).await,
+        Err(TitoError::InvalidInput(ref message)) if message.contains("bytes")
     ));
     assert!(matches!(
         model
@@ -845,7 +915,7 @@ async fn native_batch_creation_rejects_conflicts_corruption_and_limits_before_st
     invalid.delete(reverse).await.unwrap();
     invalid.commit().await.unwrap();
     assert!(matches!(
-        model.get(&first.id).execute(None).await,
+        model.get_for_share(&first.id, None).await,
         Err(TitoError::NotFound(_))
     ));
     assert_record_reads(&model, &existing).await;
@@ -905,7 +975,7 @@ async fn native_batch_creation_competing_with_another_batch_or_set_leaves_only_t
         }
         retry.commit().await.unwrap();
         assert!(matches!(
-            model.get(&witness.id).execute(None).await,
+            model.get_for_share(&witness.id, None).await,
             Err(TitoError::NotFound(_))
         ));
         assert_record_reads(&model, &winner).await;

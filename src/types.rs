@@ -161,22 +161,18 @@ pub struct TitoIndexField {
     pub r#type: TitoIndexFieldType,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TitoIndexValue {
-    RecordCopy,
-    RecordReference,
-}
-
 pub struct TitoIndexConfig {
     pub condition: bool,
     pub fields: Vec<TitoIndexField>,
     pub name: String,
-    pub value: TitoIndexValue,
 }
 
 pub trait TitoModelTrait {
     fn indexes(&self) -> Vec<TitoIndexConfig>;
     fn unique_indexes(&self) -> Vec<TitoIndexConfig> {
+        Vec::new()
+    }
+    fn holder_indexes(&self) -> Vec<TitoIndexConfig> {
         Vec::new()
     }
     fn table() -> String;

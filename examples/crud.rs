@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use tito::types::TitoIndexValue;
 use tito::{
     types::{
         DBUuid, TitoEngine, TitoIndexConfig, TitoIndexField, TitoIndexFieldType, TitoModelTrait,
@@ -17,7 +16,6 @@ struct User {
 impl TitoModelTrait for User {
     fn indexes(&self) -> Vec<TitoIndexConfig> {
         vec![TitoIndexConfig {
-            value: TitoIndexValue::RecordReference,
             condition: true,
             name: "by_email".to_string(),
             fields: vec![TitoIndexField {
@@ -57,7 +55,7 @@ async fn main() -> Result<(), TitoError> {
 
     println!("Created user: {:?}", saved_user);
 
-    let found_user = user_model.get(&user_id).execute(None).await?;
+    let found_user = user_model.get(&user_id, None).await?;
     println!("Found user: {:?}", found_user);
 
     let updated_user = User {

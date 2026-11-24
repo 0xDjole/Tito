@@ -80,10 +80,8 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> CreateManyBuilder<'_,
                 .value_with_options(&record, self.timestamps, true)?;
             let bytes = serde_json::to_vec(&value)
                 .map_err(|e| TitoError::SerializationFailed(e.to_string()))?;
-            writes.add(primary.clone(), Some(bytes))?;
-            let indexes = self
-                .model
-                .get_index_keys(primary.clone(), &record, &value)?;
+            writes.add(primary.clone(), Some(bytes.clone()))?;
+            let indexes = self.model.index_keys(&primary, &record, &value)?;
             let manifest = ReverseIndex {
                 value: indexes.iter().map(|(key, _)| key.clone()).collect(),
                 version,
@@ -94,7 +92,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> CreateManyBuilder<'_,
             )?;
             read_keys.extend([primary.clone(), reverse.clone()]);
             primary_keys.push((primary, reverse));
-            for (key, bytes) in indexes {
+            for (key, space) in indexes {
                 if let Some(index) = TitoModel::<E, T>::unique_index_name(&key) {
                     if unique_owners
                         .insert(key.clone(), (id.clone(), index.to_owned()))
@@ -107,7 +105,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> CreateManyBuilder<'_,
                     }
                     read_keys.push(key.clone());
                 }
-                writes.add(key, Some(bytes))?;
+                writes.add(key, Some(TitoModel::<E, T>::entry_bytes(space, &bytes)))?;
             }
             for key in record_fence_keys(&T::table(), &id) {
                 writes.add(key, None)?;
@@ -134,7 +132,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> CreateManyBuilder<'_,
         }
         for (key, (id, index)) in unique_owners {
             if let Some(bytes) = found.remove(key.as_bytes()) {
-                if TitoModel::<E, T>::unique_owner_id(&key, bytes)? == id {
+                if TitoModel::<E, T>::unique_owner_id(&key, &bytes)? == id {
                     return Err(TitoError::IndexError(format!(
                         "Unique index '{index}' has no primary record for its owner"
                     )));

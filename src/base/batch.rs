@@ -1,5 +1,5 @@
 use super::*;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 pub struct ReplaceManyBuilder<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> {
     model: &'a TitoModel<E, T>,
@@ -23,7 +23,7 @@ impl<'a, E: TitoEngine, T: crate::types::TitoModelConstraints> ReplaceManyBuilde
 struct PreparedReplacement<T> {
     id: String,
     old: ReverseIndex,
-    indexes: Vec<(String, Vec<u8>)>,
+    indexes: Vec<(String, KeySpace)>,
     stored: T,
     writes: BTreeMap<String, Vec<u8>>,
 }
@@ -64,13 +64,33 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
         let mut unique_owners = BTreeMap::new();
         let mut prepared_keys = BTreeSet::new();
         let mut prepared_bytes = 0usize;
+        let mut sources = BTreeSet::new();
+        for (expected, _) in &replacements {
+            let primary = format!("{}:{}", self.get_table(), expected.id());
+            sources.insert(format!("reverse-index:{primary}"));
+            sources.insert(primary);
+        }
+        let mut found: HashMap<_, _> = tx
+            .batch_get(sources.iter().collect::<Vec<_>>())
+            .await?
+            .into_iter()
+            .collect();
         for (expected, next) in replacements {
             let id = expected.id();
             let primary = format!("{}:{id}", self.get_table());
             let reverse = format!("reverse-index:{primary}");
-            let old = self.load_index_state(&primary, tx).await?.ok_or_else(|| {
-                TitoError::NotFound(format!("Record '{primary}' not found in database"))
-            })?;
+            let primary_value = found.remove(primary.as_bytes());
+            let reverse_value = found.remove(reverse.as_bytes());
+            let old = self
+                .index_state(
+                    &primary,
+                    &reverse,
+                    primary_value.is_some(),
+                    reverse_value.as_deref(),
+                )?
+                .ok_or_else(|| {
+                    TitoError::NotFound(format!("Record '{primary}' not found in database"))
+                })?;
             self.manifest_bytes(&primary, &old)?;
             prepared_keys.extend(old.value.iter().cloned());
             if prepared_keys.len() > MAX_REPLACE_MANY_KEYS {
@@ -83,7 +103,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                     "Batch replacement found duplicate source manifest keys".into(),
                 ));
             }
-            let current = self.get_key(&primary, tx).await?;
+            let current = Self::stored_json(&primary, primary_value.as_deref())?;
             let expected = serde_json::to_value(expected)
                 .map_err(|error| TitoError::SerializationFailed(error.to_string()))?;
             if current != expected {
@@ -104,7 +124,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                     "Failed to deserialize replacement for '{primary}': {error}"
                 ))
             })?;
-            let indexes = self.get_index_keys(primary.clone(), &next, &value)?;
+            let indexes = self.index_keys(&primary, &next, &value)?;
             let keys = indexes
                 .iter()
                 .map(|(key, _)| key.clone())
@@ -118,10 +138,8 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                 value: keys,
                 version,
             };
-            let mut writes = BTreeMap::new();
-            writes.insert(primary.clone(), primary_bytes);
-            writes.insert(reverse, self.manifest_bytes(&primary, &manifest)?);
-            for (key, value) in &indexes {
+            let manifest_bytes = self.manifest_bytes(&primary, &manifest)?;
+            for (key, _) in &indexes {
                 if let Some(index) = Self::unique_index_name(key) {
                     if unique_owners.insert(key.clone(), id.clone()).is_some() {
                         return Err(TitoError::UniqueViolation {
@@ -130,19 +148,22 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                         });
                     }
                 }
-                writes.insert(key.clone(), value.clone());
             }
-            prepared_keys.extend(writes.keys().cloned());
+            prepared_keys.extend(indexes.iter().map(|(key, _)| key.clone()));
+            prepared_keys.extend([primary.clone(), reverse.clone()]);
             if prepared_keys.len() > MAX_REPLACE_MANY_KEYS {
                 return Err(TitoError::InvalidInput(format!(
                     "Batch replacement needs more than {MAX_REPLACE_MANY_KEYS} storage keys"
                 )));
             }
-            prepared_bytes = writes
-                .iter()
-                .try_fold(prepared_bytes, |total, (key, bytes)| {
-                    total.checked_add(key.len())?.checked_add(bytes.len())
-                })
+            prepared_bytes = prepared_bytes
+                .checked_add(Self::written_bytes(
+                    &primary,
+                    &primary_bytes,
+                    &indexes,
+                    &reverse,
+                    &manifest_bytes,
+                ))
                 .ok_or_else(|| {
                     TitoError::InvalidInput("Batch replacement byte size overflowed".into())
                 })?;
@@ -151,6 +172,12 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                     "Batch replacement exceeds {MAX_REPLACE_MANY_BYTES} prepared bytes"
                 )));
             }
+            let mut writes = BTreeMap::new();
+            for (key, space) in &indexes {
+                writes.insert(key.clone(), Self::entry_bytes(*space, &primary_bytes));
+            }
+            writes.insert(primary.clone(), primary_bytes);
+            writes.insert(reverse, manifest_bytes);
             prepared.push(PreparedReplacement {
                 id,
                 old,
@@ -160,11 +187,23 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
             });
         }
 
+        let mut unique = BTreeSet::new();
+        for replacement in &prepared {
+            unique.extend(Self::unique_keys(&replacement.old.value));
+            for (key, _) in &replacement.indexes {
+                if Self::unique_index_name(key).is_some() {
+                    unique.insert(key.clone());
+                }
+            }
+        }
+        if !unique.is_empty() {
+            found.extend(tx.batch_get(unique.iter().collect::<Vec<_>>()).await?);
+        }
         let mut deletes = BTreeSet::new();
         for replacement in &prepared {
             for key in &replacement.old.value {
                 if Self::unique_index_name(key).is_some()
-                    && !self.validate_unique_owner(key, &replacement.id, tx).await?
+                    && !Self::is_unique_owner(key, found.get(key.as_bytes()), &replacement.id)?
                 {
                     return Err(TitoError::IndexError(format!(
                         "Unique index on model '{}' is missing or owned by another record",
@@ -177,7 +216,7 @@ impl<E: TitoEngine, T: crate::types::TitoModelConstraints> TitoModel<E, T> {
                 let Some(index) = Self::unique_index_name(key) else {
                     continue;
                 };
-                if let Some(bytes) = tx.get(key).await? {
+                if let Some(bytes) = found.get(key.as_bytes()) {
                     let owner_id = Self::unique_owner_id(key, bytes)?;
                     let Some(position) = ids.get(&owner_id) else {
                         return Err(TitoError::UniqueViolation {
