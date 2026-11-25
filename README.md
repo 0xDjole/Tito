@@ -35,9 +35,19 @@ transaction would remove the locks, and so the writes, its other keys still hold
 commit ends the same way; that transaction's locks stay until a reader meets them after their TTL and rolls the
 transaction back through its primary.
 
-A read that meets the lock of a transaction whose primary was never written (a prewrite that failed on its primary)
-fails, also after the lock's TTL has passed; `garbage_collect` rolls that transaction back once the lock is older
-than its retention window.
+A read or a commit that meets the lock of a transaction whose primary was never written (a prewrite that failed on
+its primary, or a process that stopped in the middle of its prewrite) gets TiKV's answer that the transaction isn't
+found. The client has code for that answer, but in 0.4.0 it never runs (`check_txn_status` looks for the answer in
+another error wrapper), so the client returns it at once instead of waiting. Tito treats it as a locked key and tries
+again. Once the lock's lifetime has run out by PD's clock (its TTL counted from the transaction's start, the rule the
+client's own code applies), Tito rolls that transaction back with the client's lock cleanup on exactly that key, and
+the next attempt passes. Until then the transaction may still be writing its primary, so its locks stay. A lock lives
+at least 3 seconds, so Tito looks a lock up only once its transaction is that old.
+
+PD can't give timestamps for a moment while it changes leader, and the client gives up after ten quick tries. Tito
+asks again for a transaction's start timestamp for up to 10 seconds, waiting longer between tries. A commit whose
+commit timestamp request failed (the client's request channel was closed, or PD's stream ended before answering)
+never sent its primary commit, so Tito rolls it back and retries it like a conflict.
 
 ## Connection
 
@@ -403,8 +413,8 @@ A batch read that is refused for its size is split in halves the same way. Tito'
 32 MiB. A TiKV that limits its responses below that (`server.max-grpc-send-msg-len`) only costs refused round trips
 before a request is halved; setting the limit to 32 MiB keeps a first request of 16 rows of 1 MiB in one round trip.
 
-A read is retried only for an error that can go away: a key that is locked, a write conflict, or a key error TiKV
-marks retryable. A batch read or a scan gets its key errors back together, and each is judged the same way; any
+A read is retried only for an error that can go away: a key that is locked, a lock whose transaction TiKV can't
+find, a write conflict, a timestamp PD couldn't give, or a key error TiKV marks retryable. A batch read or a scan gets its key errors back together, and each is judged the same way; any
 other key error fails the read at once.
 
 ## Storage Maintenance

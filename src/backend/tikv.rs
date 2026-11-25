@@ -15,15 +15,21 @@ use std::future::Future;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tikv_client::transaction::ResolveLocksOptions;
 use tikv_client::{
-    Snapshot, Timestamp, TimestampExt, Transaction, TransactionClient, TransactionOptions,
+    ProtoLockInfo, Snapshot, Timestamp, TimestampExt, Transaction, TransactionClient,
+    TransactionOptions,
 };
 use tokio::time::sleep;
 
 pub(crate) const MAX_TRANSACTION_RETRIES: u32 = 10;
 const MAX_READ_LOCK_RESOLUTION_ATTEMPTS: u32 = 8;
 const READ_LOCK_RESOLUTION_BACKOFF: Duration = Duration::from_millis(25);
+const TIMESTAMP_PATIENCE: Duration = Duration::from_secs(10);
+const TIMESTAMP_CHANNEL_CLOSED: &str = "TimestampRequest channel is closed";
+const SHORTEST_LOCK_LIFETIME_MS: i64 = 3_000;
+const LOCK_SCAN_LIMIT: u32 = 1_024;
 const TIKV_GRPC_MAX_DECODING_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 pub const SCAN_RPC_BYTES: usize = 4 * 1024 * 1024;
 pub const SCAN_RPC_FIRST_ROWS: u32 = 16;
@@ -78,10 +84,13 @@ fn is_retryable_tikv_error(error: &tikv_client::Error) -> bool {
         | tikv_client::Error::TxnNotFound(_)
         | tikv_client::Error::NoCurrentRegions
         | tikv_client::Error::EntryNotFoundInRegionCache
-        | tikv_client::Error::PessimisticLockError { .. } => true,
+        | tikv_client::Error::PessimisticLockError { .. }
+        | tikv_client::Error::Channel(_) => true,
+        tikv_client::Error::InternalError { message } => message == TIMESTAMP_CHANNEL_CLOSED,
         tikv_client::Error::KeyError(key_error) => {
             key_error.locked.is_some()
                 || key_error.conflict.is_some()
+                || key_error.txn_not_found.is_some()
                 || !key_error.retryable.is_empty()
         }
         tikv_client::Error::MultipleKeyErrors(errors)
@@ -102,6 +111,34 @@ fn already_exist_key(error: &tikv_client::Error) -> Option<Vec<u8>> {
         | tikv_client::Error::ExtractedErrors(errors) => errors.iter().find_map(already_exist_key),
         _ => None,
     }
+}
+
+fn missing_lock_owners(error: &tikv_client::Error) -> Vec<u64> {
+    match error {
+        tikv_client::Error::TxnNotFound(missing) => vec![missing.start_ts],
+        tikv_client::Error::KeyError(key_error) => key_error
+            .txn_not_found
+            .iter()
+            .map(|missing| missing.start_ts)
+            .collect(),
+        tikv_client::Error::MultipleKeyErrors(errors)
+        | tikv_client::Error::ExtractedErrors(errors) => {
+            errors.iter().flat_map(missing_lock_owners).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn lock_expired(lock: &ProtoLockInfo, now: &Timestamp) -> bool {
+    let lifetime = i64::try_from(lock.lock_ttl).unwrap_or(i64::MAX);
+    Timestamp::from_version(lock.lock_version)
+        .physical
+        .saturating_add(lifetime)
+        <= now.physical
+}
+
+fn timestamp_wait(attempt: u32) -> Duration {
+    Duration::from_millis((50u64 << attempt.min(6)).min(2_000))
 }
 
 fn classify_tikv_error(
@@ -191,12 +228,26 @@ impl TitoEngine for TiKVBackend {
     type Transaction = TiKVTransaction;
 
     async fn begin_transaction(&self) -> Result<Self::Transaction, TitoError> {
-        let no_flag = AtomicBool::new(false);
-        let tx = self
-            .client
-            .begin_optimistic()
-            .await
-            .map_err(|e| classify_tikv_error(e, "Failed to begin transaction", &no_flag))?;
+        let first_try = Instant::now();
+        let mut attempt = 0;
+        let tx = loop {
+            match self.client.begin_optimistic().await {
+                Ok(tx) => break tx,
+                Err(error) => {
+                    attempt += 1;
+                    let wait = timestamp_wait(attempt);
+                    if first_try.elapsed() + wait > TIMESTAMP_PATIENCE {
+                        let no_flag = AtomicBool::new(false);
+                        return Err(classify_tikv_error(
+                            error,
+                            "Failed to begin transaction",
+                            &no_flag,
+                        ));
+                    }
+                    sleep(wait).await;
+                }
+            }
+        };
         let start_version = tx.start_timestamp().version();
         let snapshot = self
             .client
@@ -205,6 +256,7 @@ impl TitoEngine for TiKVBackend {
             id: DBUuid::new_v4().to_string(),
             inner: Arc::new(tokio::sync::Mutex::new(tx)),
             snapshot: Arc::new(tokio::sync::Mutex::new(snapshot)),
+            client: self.client.clone(),
             had_retryable_error: Arc::new(AtomicBool::new(false)),
             commit_started: Arc::new(AtomicBool::new(false)),
             wrote: Arc::new(AtomicBool::new(false)),
@@ -347,6 +399,42 @@ mod tests {
     use crate::queue::{MAX_QUEUE_EVENT_BYTES, QUEUE_SCAN_RPC_LIMIT};
 
     #[test]
+    fn a_timestamp_request_the_client_could_not_send_is_retried_even_at_commit() {
+        let flag = AtomicBool::new(false);
+        let error = classify_tikv_error(
+            tikv_client::Error::InternalError {
+                message: TIMESTAMP_CHANNEL_CLOSED.to_string(),
+            },
+            "Transaction commit failed",
+            &flag,
+        );
+        assert!(matches!(error, TitoError::Retryable(_)));
+        assert_eq!(commit_failure_action(&error, 0), CommitFailureAction::Retry);
+        let other = classify_tikv_error(
+            tikv_client::Error::InternalError {
+                message: "PD gives more TsoResponse than expected".to_string(),
+            },
+            "Transaction commit failed",
+            &flag,
+        );
+        assert!(matches!(other, TitoError::TransactionFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn a_timestamp_request_whose_answer_never_came_is_retried_even_at_commit() {
+        let (answer, wait) = tokio::sync::oneshot::channel::<()>();
+        drop(answer);
+        let dropped = wait.await.expect_err("A dropped answer ends the wait");
+        let error = classify_tikv_error(
+            tikv_client::Error::Channel(dropped),
+            "Transaction commit failed",
+            &AtomicBool::new(false),
+        );
+        assert!(matches!(error, TitoError::Retryable(_)));
+        assert_eq!(commit_failure_action(&error, 0), CommitFailureAction::Retry);
+    }
+
+    #[test]
     fn queue_scan_pages_have_two_x_tikv_decode_headroom() {
         let maximum_valid_invocation_bytes = MAX_QUEUE_EVENT_BYTES * QUEUE_SCAN_RPC_LIMIT as usize;
 
@@ -442,6 +530,7 @@ pub struct TiKVTransaction {
     pub id: String,
     pub inner: Arc<tokio::sync::Mutex<Transaction>>,
     snapshot: Arc<tokio::sync::Mutex<Snapshot>>,
+    client: Arc<TransactionClient>,
     pub had_retryable_error: Arc<AtomicBool>,
     commit_started: Arc<AtomicBool>,
     wrote: Arc<AtomicBool>,
@@ -569,6 +658,49 @@ impl TiKVTransaction {
             .remove(key);
     }
 
+    fn written_span(&self, guards: &[Vec<u8>]) -> Option<(Vec<u8>, Vec<u8>)> {
+        let written = self
+            .written
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let first = written.first().into_iter().chain(guards).min()?.clone();
+        let last = written.last().into_iter().chain(guards).max()?;
+        Some((first, key_after_bytes(last)))
+    }
+
+    async fn clear_expired_locks(&self, owners: Vec<u64>, start: &[u8], end: &[u8]) {
+        if owners.is_empty() {
+            return;
+        }
+        let Ok(now) = self.client.current_timestamp().await else {
+            return;
+        };
+        for owner in owners.into_iter().collect::<BTreeSet<_>>() {
+            let began = Timestamp::from_version(owner);
+            if now.physical < began.physical.saturating_add(SHORTEST_LOCK_LIFETIME_MS) {
+                continue;
+            }
+            let Ok(locks) = self
+                .client
+                .scan_locks(&began, start.to_vec()..end.to_vec(), LOCK_SCAN_LIMIT)
+                .await
+            else {
+                continue;
+            };
+            let Some(lock) = locks
+                .into_iter()
+                .find(|lock| lock.lock_version == owner && lock_expired(lock, &now))
+            else {
+                continue;
+            };
+            let after = key_after_bytes(&lock.key);
+            let _ = self
+                .client
+                .cleanup_locks(lock.key..after, &began, ResolveLocksOptions::default())
+                .await;
+        }
+    }
+
     async fn scan_pages(
         &self,
         mut start: Vec<u8>,
@@ -592,11 +724,13 @@ impl TiKVTransaction {
                     continue;
                 }
                 Err(error) => {
+                    let owners = missing_lock_owners(&error);
+                    self.clear_expired_locks(owners, &start, &end).await;
                     return Err(classify_tikv_error(
                         error,
                         r#type.failure(),
                         &self.had_retryable_error,
-                    ))
+                    ));
                 }
             };
             let full = page.len() >= requested as usize;
@@ -795,6 +929,11 @@ impl TiKVTransaction {
                     chunks.push(chunk);
                 }
                 Err(error) => {
+                    let owners = missing_lock_owners(&error);
+                    if let (Some(first), Some(last)) = (chunk.iter().min(), chunk.iter().max()) {
+                        let end = key_after_bytes(last);
+                        self.clear_expired_locks(owners, first, &end).await;
+                    }
                     let pending = AtomicBool::new(false);
                     let error = classify_tikv_error(error, "Batch get operation failed", &pending);
                     attempt += 1;
@@ -838,17 +977,16 @@ impl TitoTransaction for TiKVTransaction {
         let tikv_key: tikv_client::Key = key.as_ref().to_vec().into();
         let mut attempt = 0;
         loop {
-            let pending = AtomicBool::new(false);
-            let outcome = self
-                .inner
-                .lock()
-                .await
-                .get(tikv_key.clone())
-                .await
-                .map_err(|e| classify_tikv_error(e, "Get operation failed", &pending));
+            let outcome = self.inner.lock().await.get(tikv_key.clone()).await;
             match outcome {
                 Ok(value) => return Ok(value),
                 Err(error) => {
+                    let owners = missing_lock_owners(&error);
+                    let start: Vec<u8> = tikv_key.clone().into();
+                    let end = key_after_bytes(&start);
+                    self.clear_expired_locks(owners, &start, &end).await;
+                    let pending = AtomicBool::new(false);
+                    let error = classify_tikv_error(error, "Get operation failed", &pending);
                     attempt += 1;
                     if !error.is_retryable() || attempt >= MAX_READ_LOCK_RESOLUTION_ATTEMPTS {
                         if pending.load(Ordering::Relaxed) {
@@ -968,13 +1106,16 @@ impl TitoTransaction for TiKVTransaction {
             let _ = transaction.rollback().await;
             return Err(refused);
         }
-        let keys = guard_keys(
+        let keys: Vec<Vec<u8>> = guard_keys(
             &*self.guards.lock().await,
             self.wrote.load(Ordering::Acquire),
             self.shared_fence_pick,
-        );
-        for key in keys {
-            transaction.delete(key.into_bytes()).await.map_err(|e| {
+        )
+        .into_iter()
+        .map(String::into_bytes)
+        .collect();
+        for key in &keys {
+            transaction.delete(key.clone()).await.map_err(|e| {
                 classify_tikv_error(e, "Guard delete failed", &self.had_retryable_error)
             })?;
         }
@@ -990,6 +1131,10 @@ impl TitoTransaction for TiKVTransaction {
                         "Transaction commit failed: {}",
                         error
                     )));
+                }
+                let owners = missing_lock_owners(&error);
+                if let Some((first, end)) = self.written_span(&keys) {
+                    self.clear_expired_locks(owners, &first, &end).await;
                 }
                 Err(classify_tikv_error(
                     error,

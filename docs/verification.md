@@ -70,6 +70,11 @@ Every native case is mandatory:
   transaction's own writes, deletes and locks as they were; a `create` and an `update` send no
   read: each returns while such a lock sits on its row; each case then removes the lock with the
   client's lock cleanup;
+- a batch read, a single read, a scan and a `create` that meet the lock a prewrite that failed on
+  its primary left on a record row each pass only after that lock's lifetime has ended: Tito rolls
+  the abandoned transaction back with the client's lock cleanup on that key, no lock is left, the
+  reads find nothing of the abandoned transaction, the create commits, and the committed primary is
+  untouched;
 - a note whose key holds a live lock waits for it as a single read does: with the locks of a
   prewrite that failed on a third key left on its primary and on the record key, a plain client
   batch read gives up while the lock lives, and the note is answered only after the lock's TTL has

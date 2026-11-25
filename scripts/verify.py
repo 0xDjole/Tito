@@ -64,6 +64,10 @@ TITO_NATIVE_CASES = {
     "native_a_batch_read_keeps_the_writes_and_locks_of_its_own_transaction",
     "native_a_create_sends_no_read_while_a_lock_sits_on_its_row",
     "native_an_update_sends_no_read_while_a_lock_sits_on_its_row",
+    "native_a_batch_read_that_meets_a_lock_whose_primary_was_never_written_passes_it_once_its_lifetime_ends",
+    "native_a_single_read_that_meets_a_lock_whose_primary_was_never_written_passes_it_once_its_lifetime_ends",
+    "native_a_scan_that_meets_a_lock_whose_primary_was_never_written_passes_it_once_its_lifetime_ends",
+    "native_a_create_that_meets_a_lock_whose_primary_was_never_written_passes_it_once_its_lifetime_ends",
 }
 
 
