@@ -3,6 +3,7 @@ mod native;
 use native::{create, native_endpoint, native_engine, read, remove};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use tikv_client::transaction::ResolveLocksOptions;
 use tikv_client::{Key, ProtoLockInfo, Timestamp, TimestampExt};
 use tito::backend::tikv::{TiKVBackend, TiKVTransaction};
 use tito::types::TitoTransaction;
@@ -126,23 +127,27 @@ async fn leave_lock(
         .expect("Observed lock expiry fits PD time")
 }
 
-async fn clear_lock(
-    engine: &TiKVBackend,
-    expiry: i64,
-    primary: &[u8],
-    secondary: &[u8],
-) -> Option<Vec<u8>> {
-    while pd_millis(engine).await <= expiry {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+async fn clear_lock(engine: &TiKVBackend, primary: &[u8], secondary: &[u8]) -> Option<Vec<u8>> {
+    let now = engine
+        .client
+        .current_timestamp()
+        .await
+        .expect("Read actual PD time");
+    let mut end = secondary.to_vec();
+    end.push(0);
+    engine
+        .client
+        .cleanup_locks(primary.to_vec()..end, &now, ResolveLocksOptions::default())
+        .await
+        .expect("Roll back the abandoned transaction of this case's lock");
+    assert!(locks(engine, primary, secondary).await.is_empty());
     let cleanup = engine
         .begin_transaction()
         .await
-        .expect("Begin the cleanup after the lock expired");
+        .expect("Begin the cleanup after the lock is gone");
     let left = cleanup.get(secondary).await.unwrap();
     cleanup.delete(primary).await.unwrap();
     cleanup.commit().await.expect("Commit the cleanup");
-    assert!(locks(engine, primary, secondary).await.is_empty());
     left
 }
 
@@ -216,7 +221,7 @@ async fn native_a_key_a_batch_read_did_not_find_is_answered_from_memory_while_a_
         );
         fresh.rollback().await.unwrap();
         reader.rollback().await.unwrap();
-        assert_eq!(clear_lock(&engine, expiry, &primary, &missing).await, None);
+        assert_eq!(clear_lock(&engine, &primary, &missing).await, None);
         assert_eq!(read(&engine, &records, &missing_id).await.unwrap(), None);
     })
     .await
@@ -381,7 +386,7 @@ async fn native_a_create_sends_no_read_while_a_lock_sits_on_its_row() {
             "The create must finish while the lock on its row is alive, so it read nothing from TiKV"
         );
         tx.rollback().await.unwrap();
-        assert_eq!(clear_lock(&engine, expiry, &primary, &row).await, None);
+        assert_eq!(clear_lock(&engine, &primary, &row).await, None);
 
         assert_eq!(read(&engine, &records, &record.id).await.unwrap(), None);
         create(&engine, &records, &record).await.unwrap();
@@ -437,7 +442,7 @@ async fn native_an_update_sends_no_read_while_a_lock_sits_on_its_row() {
             "The update must finish while the lock on its row is alive, so it read nothing from TiKV"
         );
         tx.rollback().await.unwrap();
-        let left = clear_lock(&engine, expiry, &primary, &row)
+        let left = clear_lock(&engine, &primary, &row)
             .await
             .expect("The committed record outlives the abandoned lock");
         assert_eq!(

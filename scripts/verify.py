@@ -36,31 +36,7 @@ max-open-files = 1024
 purge-threshold = "256MB"
 target-file-size = "32MB"
 """
-NATIVE_CASE = "pd::retry::native_recovery_tests::actual_pd_leadership_transfer_recovers_the_same_closed_oracle_client_with_monotonic_timestamps"
-PROTOCOL_CASES = {
-    "pd::retry::reconnect_regression_tests::a_closed_request_channel_waits_for_replacement_instead_of_exhausting_retries",
-    "pd::retry::reconnect_regression_tests::a_stream_error_waits_for_replacement_instead_of_exhausting_retries",
-    "pd::retry::reconnect_regression_tests::a_stream_eof_waits_for_replacement_instead_of_exhausting_retries",
-    "pd::retry::reconnect_regression_tests::concurrent_failed_requests_share_one_replacement",
-    "pd::retry::reconnect_regression_tests::a_throttled_wait_releases_the_lock_and_rechecks_a_concurrent_replacement",
-    "pd::retry::reconnect_regression_tests::healthy_idleness_does_not_replace_the_connection",
-    "pd::retry::reconnect_regression_tests::a_continued_stream_outage_keeps_the_existing_request_budget",
-    "pd::retry::reconnect_regression_tests::a_continued_connection_outage_keeps_the_existing_connection_budget",
-    "pd::retry::test::test_reconnect",
-    "pd::retry::test::test_retry",
-}
-BUFFER_CASES = {
-    "transaction::buffer::tests::set_and_get_from_buffer",
-    "transaction::buffer::tests::insert_and_get_from_buffer",
-    "transaction::buffer::tests::repeat_reads_are_cached",
-    "transaction::buffer::tests::a_batch_read_remembers_the_keys_it_did_not_find",
-    "transaction::buffer::tests::a_batch_read_keeps_the_writes_and_locks_of_its_transaction",
-    "transaction::buffer::tests::scan_and_fetch_redundant_limit_does_not_overflow",
-    "transaction::buffer::tests::scan_and_fetch_overlays_insert_and_check_not_exist",
-    "transaction::buffer::tests::state_machine",
-}
 TITO_NATIVE_CASES = {
-    "expired_secondary_without_a_primary_heals_through_normal_tito_reads",
     "native_reads_forty_one_mib_records_through_byte_bounded_requests",
     "native_index_entries_of_a_large_record_hold_full_copies_keys_only_and_parts",
     "native_a_save_under_the_bound_commits_its_copies_and_a_larger_one_is_refused_before_writing",
@@ -97,7 +73,7 @@ def write_json(path, value):
     temporary.replace(path)
 
 
-def require_cases(output, cases, expected_count=None):
+def require_cases(output, cases):
     passed = set(re.findall(r"^test (\S+) \.\.\. ok$", output, re.MULTILINE))
     if not cases <= passed:
         raise RuntimeError(f"Mandatory cases did not pass: {sorted(cases - passed)}")
@@ -108,8 +84,6 @@ def require_cases(output, cases, expected_count=None):
     )
     if not results or any(int(failed) or int(ignored) for _, failed, ignored in results):
         raise RuntimeError("Verification requires every selected case with zero failures and zero ignored")
-    if expected_count is not None and sum(int(count) for count, _, _ in results) != expected_count:
-        raise RuntimeError("Executed case count differs from the exact mandatory discovery")
 
 
 def runtime_binary(path, name):
@@ -140,16 +114,14 @@ def source_hashes(root):
     paths = {
         root / "Cargo.toml",
         root / "Cargo.lock",
-        root / "vendor/tikv-client/Cargo.toml",
-        root / "vendor/tikv-client/Cargo.lock",
         root / "scripts/verify.py",
     }
-    for directory in ["src", "tests", "examples", "vendor/tikv-client"]:
+    for directory in ["src", "tests", "examples"]:
         paths.update(
             path
             for path in (root / directory).rglob("*")
             if path.is_file()
-            and path.suffix in {".rs", ".proto", ".toml"}
+            and path.suffix in {".rs", ".toml"}
             and "target" not in path.relative_to(root).parts
         )
     return {
@@ -167,14 +139,13 @@ def cargo_target(root):
 
 
 class OwnedRuntime:
-    def __init__(self, artifacts, run_id, member_count, binaries):
+    def __init__(self, artifacts, run_id, binaries):
         self.artifacts = artifacts
         self.run_id = run_id
-        self.member_count = member_count
         self.binaries = binaries
         self.processes = []
         self.data = None
-        self.endpoints = []
+        self.endpoint = None
         self.cleanup_attempts = []
         self.artifacts.mkdir(mode=0o700)
         self.persist()
@@ -184,14 +155,13 @@ class OwnedRuntime:
             self.artifacts / "runtime.json",
             {
                 "run_id": self.run_id,
-                "member_count": self.member_count,
                 "binaries": {name: str(path) for name, path in self.binaries.items()},
                 "data": str(self.data) if self.data else None,
                 "processes": [
                     {key: value for key, value in entry.items() if key != "process"}
                     for entry in self.processes
                 ],
-                "endpoints": self.endpoints,
+                "endpoint": self.endpoint,
                 "cleanup_attempts": self.cleanup_attempts,
                 **extra,
             },
@@ -217,53 +187,46 @@ class OwnedRuntime:
     def start(self):
         self.data = Path(tempfile.mkdtemp(prefix=f"{self.run_id}-"))
         self.persist()
-        with_tikv = "tikv" in self.binaries
         with contextlib.ExitStack() as reservations:
             ports = []
-            for _ in range(self.member_count * 2 + (2 if with_tikv else 0)):
+            for _ in range(4):
                 listener = reservations.enter_context(socket.socket())
                 listener.bind(("127.0.0.1", 0))
                 ports.append(listener.getsockname()[1])
-        clients = ports[: self.member_count]
-        peers = ports[self.member_count : self.member_count * 2]
-        self.endpoints = [f"http://127.0.0.1:{port}" for port in clients]
-        members = [f"{self.run_id}-pd{index + 1}" for index in range(self.member_count)]
-        initial_cluster = ",".join(
-            f"{name}=http://127.0.0.1:{port}" for name, port in zip(members, peers)
-        )
+        client, peer, store, status = ports
+        self.endpoint = f"http://127.0.0.1:{client}"
+        name = f"{self.run_id}-pd"
         self.persist()
-        for index, name in enumerate(members):
-            self.start_process(
-                name,
-                self.binaries["pd"],
-                [
-                    f"--name={name}",
-                    f"--data-dir={self.data / name}",
-                    f"--client-urls={self.endpoints[index]}",
-                    f"--advertise-client-urls={self.endpoints[index]}",
-                    f"--peer-urls=http://127.0.0.1:{peers[index]}",
-                    f"--advertise-peer-urls=http://127.0.0.1:{peers[index]}",
-                    f"--initial-cluster={initial_cluster}",
-                ],
-            )
-        self.wait_members()
-        if with_tikv:
-            config = self.data / "tikv.toml"
-            config.write_text(TIKV_CONFIG)
-            self.start_process(
-                f"{self.run_id}-tikv",
-                self.binaries["tikv"],
-                [
-                    f"--config={config}",
-                    f"--pd={','.join(self.endpoints)}",
-                    f"--addr=127.0.0.1:{ports[-2]}",
-                    f"--advertise-addr=127.0.0.1:{ports[-2]}",
-                    f"--status-addr=127.0.0.1:{ports[-1]}",
-                    f"--advertise-status-addr=127.0.0.1:{ports[-1]}",
-                    f"--data-dir={self.data / 'tikv'}",
-                ],
-            )
-            self.wait_store(f"127.0.0.1:{ports[-2]}")
+        self.start_process(
+            name,
+            self.binaries["pd"],
+            [
+                f"--name={name}",
+                f"--data-dir={self.data / name}",
+                f"--client-urls={self.endpoint}",
+                f"--advertise-client-urls={self.endpoint}",
+                f"--peer-urls=http://127.0.0.1:{peer}",
+                f"--advertise-peer-urls=http://127.0.0.1:{peer}",
+                f"--initial-cluster={name}=http://127.0.0.1:{peer}",
+            ],
+        )
+        self.wait_member(name)
+        config = self.data / "tikv.toml"
+        config.write_text(TIKV_CONFIG)
+        self.start_process(
+            f"{self.run_id}-tikv",
+            self.binaries["tikv"],
+            [
+                f"--config={config}",
+                f"--pd={self.endpoint}",
+                f"--addr=127.0.0.1:{store}",
+                f"--advertise-addr=127.0.0.1:{store}",
+                f"--status-addr=127.0.0.1:{status}",
+                f"--advertise-status-addr=127.0.0.1:{status}",
+                f"--data-dir={self.data / 'tikv'}",
+            ],
+        )
+        self.wait_store(f"127.0.0.1:{store}")
 
     def exited(self):
         return [
@@ -272,7 +235,7 @@ class OwnedRuntime:
             if "process" in entry and entry["process"].poll() is not None
         ]
 
-    def wait(self, path, predicate, all_members=False):
+    def wait(self, path, predicate):
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline:
@@ -280,22 +243,16 @@ class OwnedRuntime:
             if stopped:
                 raise RuntimeError(f"Owned {self.run_id} process exited before it was ready: {stopped}")
             try:
-                ready = True
-                for endpoint in (self.endpoints if all_members else self.endpoints[:1]):
-                    with opener.open(endpoint + path, timeout=2) as response:
-                        data = json.loads(response.read(65537))
-                    if not predicate(data):
-                        ready = False
-                        break
-                if ready:
+                with opener.open(self.endpoint + path, timeout=2) as response:
+                    data = json.loads(response.read(65537))
+                if predicate(data):
                     return
             except (OSError, ValueError, KeyError, TypeError):
                 pass
             time.sleep(0.2)
         raise RuntimeError(f"Owned {self.run_id} did not become ready for {path}")
 
-    def wait_members(self):
-        expected = {f"{self.run_id}-pd{index + 1}" for index in range(self.member_count)}
+    def wait_member(self, name):
         cluster_id = None
 
         def ready(data):
@@ -304,14 +261,13 @@ class OwnedRuntime:
                 cluster_id = data["header"]["cluster_id"]
             return (
                 data["header"]["cluster_id"] == cluster_id
-                and {member["name"] for member in data["members"]} == expected
-                and len(data["members"]) == self.member_count
+                and [member["name"] for member in data["members"]] == [name]
                 and data["leader"]["member_id"] == data["etcd_leader"]["member_id"]
-                and {url for member in data["members"] for url in member["client_urls"]}
-                == set(self.endpoints)
+                and [url for member in data["members"] for url in member["client_urls"]]
+                == [self.endpoint]
             )
 
-        self.wait("/pd/api/v1/members", ready, all_members=True)
+        self.wait("/pd/api/v1/members", ready)
 
     def wait_store(self, address):
         self.wait(
@@ -380,7 +336,7 @@ class Verification:
         self.environment = os.environ.copy()
         for key in list(self.environment):
             if key.startswith(("CARGO_MANIFEST_", "CARGO_PKG_")) or key in {
-                "PD_ADDRS", "TITO_NATIVE_PD_URI", "TITO_NATIVE_RUN_ID"
+                "TITO_NATIVE_PD_URI", "TITO_NATIVE_RUN_ID"
             }:
                 self.environment.pop(key)
         self.environment["CARGO_BUILD_JOBS"] = "4"
@@ -434,54 +390,17 @@ class Verification:
         return path.read_text()
 
     def verify(self):
-        vendor = [
-            "cargo", "test", "--locked", "--offline", "--manifest-path", "vendor/tikv-client/Cargo.toml",
-            "--no-default-features", "--features", "integration-tests", "--lib",
-        ]
         self.command("tito-build", ["cargo", "test", "--locked", "--offline", "--all-targets", "--no-run"])
-        self.command("vendor-build", vendor + ["--no-run"])
-        listing = self.command("vendor-discovery", vendor + ["pd::retry::", "--", "--list"])
-        discovered = {line.removesuffix(": test") for line in listing.splitlines() if line.endswith(": test")}
-        if discovered != PROTOCOL_CASES | {NATIVE_CASE}:
-            raise RuntimeError("Vendor discovery differs from the exact mandatory ten protocols and native case")
-        for phase, selector, count in [
-            ("vendor-reconnect", "pd::retry::reconnect_regression_tests::", 8),
-            ("vendor-retained", "pd::retry::test::", 2),
-        ]:
-            output = self.command(phase, vendor + [selector])
-            require_cases(output, {case for case in PROTOCOL_CASES if case.startswith(selector)}, count)
-        output = self.command("vendor-buffer", vendor + ["transaction::buffer::tests::"])
-        require_cases(output, BUFFER_CASES, len(BUFFER_CASES))
-        self.runtime = OwnedRuntime(
-            self.artifacts / "ordinary", self.run_id + "-ordinary", 1, self.binaries
-        )
+        self.runtime = OwnedRuntime(self.artifacts / "runtime", self.run_id, self.binaries)
         try:
             self.runtime.start()
             environment = {
                 **self.environment,
-                "TITO_NATIVE_PD_URI": self.runtime.endpoints[0].removeprefix("http://"),
+                "TITO_NATIVE_PD_URI": self.runtime.endpoint.removeprefix("http://"),
                 "TITO_NATIVE_RUN_ID": self.runtime.run_id,
             }
             output = self.command("tito-all-targets", ["cargo", "test", "--locked", "--offline", "--all-targets"], environment)
             require_cases(output, TITO_NATIVE_CASES)
-        finally:
-            self.runtime.close()
-            self.runtime = None
-        self.runtime = OwnedRuntime(
-            self.artifacts / "leadership",
-            self.run_id + "-transfer",
-            3,
-            {"pd": self.binaries["pd"]},
-        )
-        try:
-            self.runtime.start()
-            environment = {
-                **self.environment,
-                "PD_ADDRS": ",".join(self.runtime.endpoints),
-                "TITO_NATIVE_RUN_ID": self.runtime.run_id,
-            }
-            output = self.command("vendor-native", vendor + [NATIVE_CASE, "--", "--exact"], environment, 90)
-            require_cases(output, {NATIVE_CASE}, 1)
         finally:
             self.runtime.close()
             self.runtime = None

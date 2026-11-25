@@ -7,7 +7,8 @@ A database layer on TiKV with indexing, transactions, and a built-in partitioned
 - **Models**: `create`, `update` and `remove` write a record with its index entries in the caller's transaction,
   and read nothing
 - **Reads are notes**: a `Read<T>` names what it reads and its guard; `tx.batch_get` sends a tuple of up to eight of
-  them, or a `Vec` of any number, keys and index pages together, in one trip, and answers in the order asked
+  them, or a `Vec` of any number, every key in one TiKV batch read and then each index page, and answers in the order
+  asked
 - **One kind of index**: `indexes()` returns the record's `TitoIndex { name, fields, value, unique }` entries, which
   hold the whole record (`Full`), nothing (`KeysOnly`) or named fields (`Part`)
 - **Guards**: a read for share or for update in a writing transaction conflicts with any save of its record; a plain
@@ -22,32 +23,21 @@ record versions) can't be read. Writers with different declarations must not run
 
 ## TiKV client dependency
 
-Tito vendors its TiKV client in `vendor/tikv-client` and depends on it by path with default features
-disabled. The vendored tree is [getwyrd/client-rust
-55cd29b2ec9ad9f04d312e18a5ed8f6393fe219e](https://github.com/getwyrd/client-rust/commit/55cd29b2ec9ad9f04d312e18a5ed8f6393fe219e)
-with five changed files and one added test file: `src/pd/retry.rs` (a failed PD request waits for a replaced
-connection after the reconnect throttle while keeping the existing request and connection budgets);
-`src/transaction/buffer.rs` (a batch read remembers the keys it did not find, as a single read does, and leaves
-every key its transaction wrote or locked as it was); and `src/transaction/transaction.rs` with its exports in
-`src/transaction/mod.rs` and `src/lib.rs` (`batch_get_and_scan`: a batch read of keys and the first page of several
-scans, sent at the same moment and each answered through the transaction's buffer as a lone batch read or scan is).
-`vendor/tikv-client/UPSTREAM-PROVENANCE.json` records every file hash. The base merge
-retains both [upstream primary-commit
-ambiguity handling](https://github.com/tikv/client-rust/commit/337c710451e4078b8014dd6661fb84f2335c5eec)
-and [expired missing-primary lock recovery](https://github.com/getwyrd/client-rust/commit/a7fba928e5712922fa95a497c52552e141afbd41),
-including both native per-key error wrappers. The client uses Tonic 0.12 and the HTTP/2 0.4
-dependency chain. A consumer receives the vendored client through Tito's own path dependency,
-including when it patches Tito to a local checkout; it needs no separate client patch.
+Tito depends on [`tikv-client`](https://crates.io/crates/tikv-client) 0.4.0 from crates.io, unmodified, with default
+features disabled. What Tito needs beyond the client lives in Tito's own transaction: it remembers the keys a batch
+read did not find, and a scan of a range the transaction wrote in reads the stored rows as of the transaction's start
+and lays the transaction's own writes over them (the client's own scan leaves out a key its transaction inserted).
 
-Primary-commit transport/status loss and native undetermined region responses remain ambiguous.
-Tito returns `CommitOutcomeUnknown` without replaying or rolling back that transaction. An expired
-secondary whose transaction primary was never written is resolved by a normal native read; it
-does not require an application repair command.
+A commit that fails with a gRPC error, a failed connection or a gRPC status, ends in `CommitOutcomeUnknown`: Tito
+neither rolls it back nor retries it. When the reply to the primary commit is lost, the client resends the commit and
+then gives up with such an error, which doesn't say whether TiKV applied the commit, and a rollback of a committed
+transaction would remove the locks, and so the writes, its other keys still hold. A gRPC error before the primary
+commit ends the same way; that transaction's locks stay until a reader meets them after their TTL and rolls the
+transaction back through its primary.
 
-This dependency is distributed through an immutable Tito Git release. [Cargo registry
-publication](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html#multiple-locations)
-would replace a Git dependency with its declared registry version, so no registry fallback is
-declared for an older client that lacks these fixes.
+A read that meets the lock of a transaction whose primary was never written (a prewrite that failed on its primary)
+fails, also after the lock's TTL has passed; `garbage_collect` rolls that transaction back once the lock is older
+than its retention window.
 
 ## Connection
 
@@ -189,9 +179,9 @@ fails is corrupt storage and returns `TitoError::DeserializationFailed`.
 A `Vec<B>` answers `Vec<B::Output>` with `B::Error`, for a list whose length the request decides (one
 `read_unique_maybe` note per audience or per stock location); an empty `Vec` answers an empty `Vec` and adds nothing,
 so a batch of nothing else makes no trip. A `Vec` can sit inside a tuple and hold tuples. Every key of every note goes
-in one TiKV batch read, and the first request of every index page goes out at the same moment, so a batch costs one
-trip. A key this transaction already read or wrote is answered from its memory, so a batch whose keys are
-all known sends nothing, and a key a batch read did not find stays known as missing. A read that depends on another
+in one TiKV batch read, then each index page is read in turn, so a batch costs one trip for its keys and one for each
+index page. A key this transaction already read or wrote is answered from its memory, so keys that are all known send
+nothing, and a key a batch read did not find stays known as missing. A read that depends on another
 goes in the next call. A tuple's error is its first element's, and every other element's error converts into it
 (`B::Error: Into<A::Error>`). The `Batch` trait (`requests`, `answer`) lets an application type be one element of a
 batch: its `requests` add its own notes, and its `answer` reads them and may make a second trip of its own.
@@ -570,7 +560,7 @@ saturating instead of wrapping. Exact supplied due instants are never rounded.
 
 ### Transaction retry safety
 
-Tito may replay a transaction closure after an explicitly retryable, determined datastore failure. TiKV's `UndeterminedError` is different: the commit may already be durable. Tito returns `TitoError::CommitOutcomeUnknown` and never replays that closure. The caller reconciles against authoritative domain state; an acknowledgement either committed or the unchanged Pending invocation is delivered again.
+Tito may replay a transaction closure after an explicitly retryable, determined datastore failure. TiKV's `UndeterminedError` and a gRPC error at commit are different: the commit may already be durable. Tito returns `TitoError::CommitOutcomeUnknown` and never replays that closure. The caller reconciles against authoritative domain state; an acknowledgement either committed or the unchanged Pending invocation is delivered again.
 
 Cancellation removes a transaction from the active registry. Before native commit starts, cleanup
 rolls back pending work. Once native commit has started, cancellation only releases the retained
@@ -605,10 +595,9 @@ python3 scripts/verify.py --pd /path/to/pd-server --tikv /path/to/tikv-server
 ```
 
 `TITO_VERIFY_PD` and `TITO_VERIFY_TIKV` name the binaries instead of the arguments. A missing,
-non-executable or other-version binary refuses the run before anything starts. The wrapper runs the
-complete `cargo test --locked --all-targets` phase, the vendored PD owner's eight reconnect
-regressions and two retained controls, the vendored transaction buffer's eight cases, and the actual
-three-member PD leadership transfer witness. Every phase is required. See
+non-executable or other-version binary refuses the run before anything starts. The wrapper builds
+every target, then runs the complete `cargo test --locked --all-targets` phase, where every native
+case in `tests/` is required. See
 [complete verification](docs/verification.md) for prerequisites, the cases, source holds, native ownership, cleanup
 and retained evidence.
 
@@ -619,13 +608,11 @@ value carries a fresh UUID, every test file declares table, index and queue name
 whole table or rebuilds an index uses a model of its own. Examples are compiled but not run against a live database.
 
 Application-level primary-commit response loss, provider effects, backup and restore remain the
-application's complete-suite responsibility against the exact released Tito revision. The native
-client proof must cover both connection loss and gRPC status loss after an actual primary
-acknowledgement, with an unknown outcome, no rollback, and all accepted domain writes intact.
+application's complete-suite responsibility against the exact released Tito version.
 
 ## Release notes
 
-The revision after 0.18.8 keeps its version number; the Server pins Tito's Git revision. It replaces the read and
+0.19.0 depends on `tikv-client` 0.4.0 from crates.io. It replaces the read and
 write surface: notes and `tx.batch_get` replace `get`, `get_for_share`, `get_for_update`, `get_many*`, `find*`,
 `unique_key`, `save_keys` and the raw key batch read; `create`, `update` and `remove(&record)` replace `set`,
 `create_many`, `replace_many` and `remove(id)`; one `TitoIndex` list with `Full`, `KeysOnly` or `Part` entries replaces

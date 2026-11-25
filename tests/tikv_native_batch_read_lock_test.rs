@@ -55,6 +55,17 @@ async fn locks(engine: &TiKVBackend, primary: &[u8], secondary: &[u8]) -> Vec<Pr
         .expect("Inspect only the native locks in this case's UUID scope")
 }
 
+async fn held_locks(engine: &TiKVBackend, primary: &[u8], secondary: &[u8]) -> Vec<ProtoLockInfo> {
+    for _ in 0..100 {
+        let observed = locks(engine, primary, secondary).await;
+        if observed.len() == 2 {
+            return observed;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("The failed prewrite must leave the locks of its primary and of the record row");
+}
+
 async fn pd_millis(engine: &TiKVBackend) -> i64 {
     engine
         .client
@@ -83,52 +94,58 @@ async fn native_a_note_whose_key_holds_a_live_lock_waits_for_it_like_a_single_re
         };
         let primary = records.key(&format!("{scope}-0")).into_bytes();
         let secondary = records.key(&record.id).into_bytes();
+        let blocker = records.key(&format!("{scope}-3")).into_bytes();
         assert!(primary < secondary);
         create(&engine, &records, &neighbor).await.unwrap();
 
-        let orphan = engine
+        let abandoned = engine
             .begin_transaction()
             .await
-            .expect("Begin the two-key transaction that leaves the lock");
-        let orphan_start = orphan.start_version();
-        orphan
+            .expect("Begin the three-key transaction that leaves its locks");
+        let abandoned_start = abandoned.start_version();
+        abandoned
             .put(&primary, vec![b'p'; 17 * 1024])
             .await
-            .expect("Buffer the primary before its secondary");
-        orphan
+            .expect("Buffer the primary in a prewrite batch of its own");
+        abandoned
             .put(&secondary, b"abandoned secondary")
             .await
-            .expect("Buffer the record row as the secondary of a separate prewrite batch");
+            .expect("Buffer the record row as a secondary");
+        abandoned
+            .put(&blocker, vec![b'b'; 17 * 1024])
+            .await
+            .expect("Buffer the key whose prewrite will conflict, in a batch of its own");
         let winner = engine
             .begin_transaction()
             .await
-            .expect("Begin the later primary writer");
+            .expect("Begin the later writer of the blocking key");
         winner
-            .put(&primary, b"native winner")
+            .put(&blocker, b"native winner")
             .await
-            .expect("Write only the primary");
+            .expect("Write only the blocking key");
         winner
             .commit()
             .await
-            .expect("Commit the primary before the older prewrite");
+            .expect("Commit the blocking key before the older prewrite");
         assert!(
-            matches!(orphan.commit().await, Err(TitoError::Retryable(_))),
-            "The older primary prewrite must conflict"
+            matches!(abandoned.commit().await, Err(TitoError::Retryable(_))),
+            "The older prewrite of the blocking key must conflict"
         );
 
-        let observed = locks(&engine, &primary, &secondary).await;
-        assert_eq!(
-            observed.len(),
-            1,
-            "The failed prewrite must leave exactly the lock on the record row"
-        );
-        let lock = &observed[0];
+        let observed = held_locks(&engine, &primary, &secondary).await;
         assert!(
-            lock.key == secondary
-                && lock.primary_lock == primary
-                && lock.lock_version == orphan_start
-                && lock.lock_ttl > 0,
-            "The lock must sit on the record row and name the absent transaction primary"
+            observed
+                .iter()
+                .any(|lock| lock.key == primary && lock.lock_version == abandoned_start),
+            "The primary keeps its lock, so a reader finds the transaction and rolls it back once its TTL passed"
+        );
+        let lock = observed
+            .iter()
+            .find(|lock| lock.key == secondary)
+            .expect("The failed prewrite must leave a lock on the record row");
+        assert!(
+            lock.primary_lock == primary && lock.lock_version == abandoned_start && lock.lock_ttl > 0,
+            "The lock must sit on the record row and name the transaction's primary"
         );
         let expiry = Timestamp::from_version(lock.lock_version)
             .physical
@@ -230,12 +247,15 @@ async fn native_a_note_whose_key_holds_a_live_lock_waits_for_it_like_a_single_re
         let cleanup = engine
             .begin_transaction()
             .await
-            .expect("Begin the primary cleanup");
+            .expect("Begin the blocking key cleanup");
         cleanup
-            .delete(&primary)
+            .delete(&blocker)
             .await
-            .expect("Delete only this case's primary");
-        cleanup.commit().await.expect("Commit the primary cleanup");
+            .expect("Delete only this case's blocking key");
+        cleanup
+            .commit()
+            .await
+            .expect("Commit the blocking key cleanup");
     })
     .await
     .expect("The native lock wait case must finish within its deadline");

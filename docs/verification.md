@@ -6,11 +6,9 @@ From the Tito checkout, run:
 python3 scripts/verify.py --pd /path/to/pd-server --tikv /path/to/tikv-server
 ```
 
-This is one verification command. It builds and runs all Tito targets, explicitly discovers and
-runs the vendored PD owner's eight reconnect regressions and two retained retry controls and the
-vendored transaction buffer's eight cases, then runs the actual three-member PD leadership-transfer
-witness. Cargo does not run dependency unit tests as part of Tito's `--all-targets`; the explicit
-owner phases are required.
+This is one verification command. It builds all Tito targets, then runs every Tito test on a PD
+and a TiKV of its own. Tito depends on `tikv-client` 0.4.0 from crates.io, whose own tests are not
+part of this command.
 
 The command needs Python 3, the existing Rust toolchain through the normal `cargo` proxy, all locked
 Cargo dependencies already cached, and the PD and TiKV v7.1.6 binaries of this machine, named by
@@ -20,15 +18,14 @@ builds anything. On the owner's laptop the Server's test runner keeps checksum-v
 under `server/target/host-tools/pd-v7.1.6-darwin-arm64/pd-server` and
 `server/target/host-tools/tikv-v7.1.6-darwin-arm64/tikv-server`; the wrapper downloads nothing.
 
-Both the Tito lock and the standalone vendored owner lock are required. Every Cargo phase uses
-the same checkout, four build jobs and `--locked --offline`. The wrapper does not resolve new
-dependency versions or select a replacement toolchain. Missing prerequisites fail.
-Both Cargo packages share the existing Tito `target/` cache. An explicitly declared absolute
-`CARGO_TARGET_DIR` is honored for a reviewed private diagnostic assembly; the wrapper never
-creates a separate vendor target cache or silently changes the Cargo test profile.
+Tito's `Cargo.lock` is required. Every Cargo phase uses the same checkout, four build jobs and
+`--locked --offline`. The wrapper does not resolve new dependency versions or select a replacement
+toolchain. Missing prerequisites fail. Cargo uses the existing Tito `target/` cache. An explicitly
+declared absolute `CARGO_TARGET_DIR` is honored for a reviewed private diagnostic assembly; the
+wrapper never silently changes the Cargo test profile.
 
 The wrapper raises its open-file limit to 16,384 when the hard limit allows, as the Server's test
-runner does, and builds before starting a database. Its first runtime is one PD and one TiKV
+runner does, and builds before starting a database. Its runtime is one PD and one TiKV
 process on loopback ports it reserves, with their data in a new temporary folder and TiKV started
 with the small settings the Server's host tests use (no reserved space, a 512 MiB block cache, 1,024
 open raft files and small raft-engine files). It supplies the existing `TITO_NATIVE_PD_URI` and
@@ -38,7 +35,6 @@ every Tito test runs on that PD and TiKV: the library tests of models, indexes a
 and a test checks results by reading TiKV after the commit, never trips or the keys a path read.
 Every native case is mandatory:
 
-- the actual secondary-lock recovery case;
 - 40 records of 1 MiB, more than the client's 32 MiB decoding budget, read through `scan_records`,
   index pages in both directions and `read_many`, and 16 queue events of almost 1 MiB pulled and
   acknowledged, their rows gone;
@@ -69,31 +65,17 @@ Every native case is mandatory:
 - two concurrent creates of one unique value: one commits and the other ends in
   `UniqueViolation`, while values that differ only by case or spacing coexist and are found
   exactly;
-- a key a batch read did not find is answered from memory while a live lock sits on that key and a
-  fresh read meets the lock; a batch read leaves its transaction's own writes, deletes and locks as
-  they were; a `create` and an `update` send no read: each returns while another transaction's live
-  lock sits on its row;
-- a note whose key holds a live lock waits for it as a single read does: with a real secondary lock
-  left on the record key by a failed prewrite, a plain client batch read gives up while the lock
-  lives, and the note is answered only after the lock's TTL has passed.
+- a key a batch read did not find is answered from memory while the lock of a prewrite that failed
+  on its primary sits on that key and a fresh read meets the lock; a batch read leaves its
+  transaction's own writes, deletes and locks as they were; a `create` and an `update` send no
+  read: each returns while such a lock sits on its row; each case then removes the lock with the
+  client's lock cleanup;
+- a note whose key holds a live lock waits for it as a single read does: with the locks of a
+  prewrite that failed on a third key left on its primary and on the record key, a plain client
+  batch read gives up while the lock lives, and the note is answered only after the lock's TTL has
+  passed and the transaction was rolled back.
 
-After stopping that runtime and removing its folder, the wrapper starts three PD processes with
-distinct loopback client and peer ports in a new temporary folder. Their advertised addresses are
-the actual loopback addresses; no response rewriting or transport fault simulator is involved.
-Separate phases keep the maximum database footprint lower than running TiKV alongside all three PD
-members.
-
-The PD case reads actual membership and its current leader, selects a different live member,
-and performs the native named leadership transfer. It first proves healthy idle does not replace
-the connection. It then creates a real fresh connection on the same retained client and requires
-the original timestamp worker's exact closed-channel failure inside the unchanged one-second
-throttle. Its first recovery request must also begin inside that interval. A missed interval or
-worker that stays open fails the case. The same client must return 256 distinct real timestamps
-above every earlier observed timestamp, followed by another strictly greater timestamp. The
-native membership must retain the same cluster identity and show the selected member as both PD
-and etcd leader. No application transaction callback or business write is replayed by this proof.
-
-Each invocation owns a unique `run-tito-...` identity, its processes, its temporary data folders and
+Each invocation owns a unique `run-tito-...` identity, its processes, its temporary data folder and
 its dynamically reserved loopback ports. It never reads application environment files, prepares a
 retained Server runtime or touches a process it did not start; it starts every database process
 with an empty environment. On success, refusal, failure or interruption it stops the active test
@@ -103,6 +85,6 @@ process's log, source hashes, phase results and cleanup receipts stay under
 `target/native-test-runs/<run>/`. New run directories are private `0700`, and generated artifacts
 are private `0600`.
 
-All source, manifests and locks must remain held for the entire command. This verifies Tito and
-its vendored PD owner; application recovery, Linux release artifacts and consumer browser suites
+All source, manifests and locks must remain held for the entire command. This verifies Tito;
+application recovery, Linux release artifacts and consumer browser suites
 remain their own complete canonical gates against the exact reviewed Tito revision.

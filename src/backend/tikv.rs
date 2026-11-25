@@ -1,7 +1,7 @@
 use crate::error::TitoError;
 use crate::fence::{guard_keys, note_guard, note_write, Guards};
 use crate::index::RememberedEntry;
-use crate::read::{Noted, Request, Rows, ScanRequest};
+use crate::read::{Noted, Request, Rows};
 use crate::types::{
     validate_delete_range, DBUuid, Guard, Sealed, TitoEngine, TitoKvPair, TitoTransaction,
     TitoValue,
@@ -10,14 +10,14 @@ use crate::utils::key_after_bytes;
 use async_trait::async_trait;
 use futures::lock::Mutex;
 use rand::Rng;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tikv_client::{
-    KvPair, Timestamp, TimestampExt, Transaction, TransactionClient, TransactionScan,
+    Snapshot, Timestamp, TimestampExt, Transaction, TransactionClient, TransactionOptions,
 };
 use tokio::time::sleep;
 
@@ -54,6 +54,15 @@ fn contains_undetermined_error(error: &tikv_client::Error) -> bool {
         | tikv_client::Error::ExtractedErrors(errors) => {
             errors.iter().any(contains_undetermined_error)
         }
+        _ => false,
+    }
+}
+
+fn contains_grpc_error(error: &tikv_client::Error) -> bool {
+    match error {
+        tikv_client::Error::Grpc(_) | tikv_client::Error::GrpcAPI(_) => true,
+        tikv_client::Error::MultipleKeyErrors(errors)
+        | tikv_client::Error::ExtractedErrors(errors) => errors.iter().any(contains_grpc_error),
         _ => false,
     }
 }
@@ -189,14 +198,20 @@ impl TitoEngine for TiKVBackend {
             .await
             .map_err(|e| classify_tikv_error(e, "Failed to begin transaction", &no_flag))?;
         let start_version = tx.start_timestamp().version();
+        let snapshot = self
+            .client
+            .snapshot(tx.start_timestamp(), TransactionOptions::new_optimistic());
         Ok(TiKVTransaction {
             id: DBUuid::new_v4().to_string(),
             inner: Arc::new(tokio::sync::Mutex::new(tx)),
+            snapshot: Arc::new(tokio::sync::Mutex::new(snapshot)),
             had_retryable_error: Arc::new(AtomicBool::new(false)),
             commit_started: Arc::new(AtomicBool::new(false)),
             wrote: Arc::new(AtomicBool::new(false)),
             guards: Arc::new(tokio::sync::Mutex::new(Guards::default())),
             records: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            written: Arc::new(std::sync::Mutex::new(BTreeSet::new())),
+            missing: Arc::new(std::sync::Mutex::new(HashSet::new())),
             inserts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             refused: Arc::new(std::sync::Mutex::new(None)),
             start_version,
@@ -426,11 +441,14 @@ mod tests {
 pub struct TiKVTransaction {
     pub id: String,
     pub inner: Arc<tokio::sync::Mutex<Transaction>>,
+    snapshot: Arc<tokio::sync::Mutex<Snapshot>>,
     pub had_retryable_error: Arc<AtomicBool>,
     commit_started: Arc<AtomicBool>,
     wrote: Arc<AtomicBool>,
     guards: Arc<tokio::sync::Mutex<Guards>>,
     records: Arc<std::sync::Mutex<HashMap<String, Vec<RememberedEntry>>>>,
+    written: Arc<std::sync::Mutex<BTreeSet<Vec<u8>>>>,
+    missing: Arc<std::sync::Mutex<HashSet<Vec<u8>>>>,
     inserts: Arc<std::sync::Mutex<HashMap<Vec<u8>, TitoError>>>,
     refused: Arc<std::sync::Mutex<Option<TitoError>>>,
     start_version: u64,
@@ -462,24 +480,93 @@ impl TiKVTransaction {
         r#type: ScanType,
     ) -> Result<Vec<TitoKvPair>, tikv_client::Error> {
         let range: tikv_client::BoundRange = (start.to_vec()..end.to_vec()).into();
-        let mut transaction = self.inner.lock().await;
-        match r#type {
-            ScanType::Keys => Ok(transaction
-                .scan_keys(range, limit)
-                .await?
-                .map(|key| (key.into(), Vec::new()))
-                .collect()),
-            ScanType::Forward => Ok(transaction
-                .scan(range, limit)
-                .await?
-                .map(|kv| (kv.0.into(), kv.1))
-                .collect()),
-            ScanType::Reverse => Ok(transaction
-                .scan_reverse(range, limit)
-                .await?
-                .map(|kv| (kv.0.into(), kv.1))
-                .collect()),
+        let written = self.written_between(start, end);
+        if written.is_empty() {
+            let mut transaction = self.inner.lock().await;
+            return match r#type {
+                ScanType::Keys => Ok(transaction
+                    .scan_keys(range, limit)
+                    .await?
+                    .map(|key| (key.into(), Vec::new()))
+                    .collect()),
+                ScanType::Forward => Ok(transaction
+                    .scan(range, limit)
+                    .await?
+                    .map(|kv| (kv.0.into(), kv.1))
+                    .collect()),
+                ScanType::Reverse => Ok(transaction
+                    .scan_reverse(range, limit)
+                    .await?
+                    .map(|kv| (kv.0.into(), kv.1))
+                    .collect()),
+            };
         }
+        let visible: BTreeMap<Vec<u8>, Vec<u8>> = self
+            .inner
+            .lock()
+            .await
+            .batch_get(written.iter().cloned().collect::<Vec<_>>())
+            .await?
+            .map(|kv| (kv.0.into(), kv.1))
+            .collect();
+        let hidden = u32::try_from(written.len() - visible.len()).unwrap_or(u32::MAX);
+        let fetch = limit.saturating_add(hidden);
+        let stored: Vec<TitoKvPair> = {
+            let mut snapshot = self.snapshot.lock().await;
+            match r#type {
+                ScanType::Keys => snapshot
+                    .scan_keys(range, fetch)
+                    .await?
+                    .map(|key| (key.into(), Vec::new()))
+                    .collect(),
+                ScanType::Forward => snapshot
+                    .scan(range, fetch)
+                    .await?
+                    .map(|kv| (kv.0.into(), kv.1))
+                    .collect(),
+                ScanType::Reverse => snapshot
+                    .scan_reverse(range, fetch)
+                    .await?
+                    .map(|kv| (kv.0.into(), kv.1))
+                    .collect(),
+            }
+        };
+        let mut rows: BTreeMap<Vec<u8>, Vec<u8>> = stored
+            .into_iter()
+            .filter(|(key, _)| !written.contains(key))
+            .collect();
+        for (key, value) in visible {
+            let value = match r#type {
+                ScanType::Keys => Vec::new(),
+                ScanType::Forward | ScanType::Reverse => value,
+            };
+            rows.insert(key, value);
+        }
+        let limit = limit as usize;
+        Ok(match r#type {
+            ScanType::Reverse => rows.into_iter().rev().take(limit).collect(),
+            ScanType::Forward | ScanType::Keys => rows.into_iter().take(limit).collect(),
+        })
+    }
+
+    fn written_between(&self, start: &[u8], end: &[u8]) -> BTreeSet<Vec<u8>> {
+        self.written
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .range(start.to_vec()..end.to_vec())
+            .cloned()
+            .collect()
+    }
+
+    fn note_key(&self, key: &[u8]) {
+        self.written
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key.to_vec());
+        self.missing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(key);
     }
 
     async fn scan_pages(
@@ -599,6 +686,7 @@ impl TiKVTransaction {
             }
         }
         note_write(&mut *self.guards.lock().await, &key);
+        self.note_key(&key);
         self.wrote.store(true, Ordering::Release);
         self.inserts
             .lock()
@@ -635,11 +723,25 @@ impl TiKVTransaction {
                 }
             }
         }
-        let (found, pages) = if keys.is_empty() && scans.is_empty() {
-            (HashMap::new(), Vec::new())
-        } else {
-            self.first_trip(keys, &scans).await?
-        };
+        let found: HashMap<Vec<u8>, Vec<u8>> = self.read_keys(keys).await?.into_iter().collect();
+        let mut pages = Vec::with_capacity(scans.len());
+        for scan in scans {
+            let r#type = if scan.reverse {
+                ScanType::Reverse
+            } else {
+                ScanType::Forward
+            };
+            pages.push(
+                self.scan_pages(
+                    scan.start,
+                    scan.end,
+                    scan.limit,
+                    r#type,
+                    SCAN_RPC_FIRST_ROWS,
+                )
+                .await?,
+            );
+        }
         let mut pages = pages.into_iter();
         let mut rows = Vec::with_capacity(requests.len());
         for request in requests {
@@ -656,124 +758,20 @@ impl TiKVTransaction {
         Ok(rows)
     }
 
-    async fn first_trip(
-        &self,
-        keys: Vec<Vec<u8>>,
-        scans: &[ScanRequest],
-    ) -> Result<(HashMap<Vec<u8>, Vec<u8>>, Vec<Vec<TitoKvPair>>), TitoError> {
-        let first_rows = scans
-            .iter()
-            .map(|scan| scan.limit.min(SCAN_RPC_FIRST_ROWS))
-            .collect::<Vec<_>>();
-        let requests = scans
-            .iter()
-            .zip(&first_rows)
-            .map(|(scan, rows)| TransactionScan {
-                range: (scan.start.clone()..scan.end.clone()).into(),
-                limit: *rows,
-                reverse: scan.reverse,
-            })
-            .collect();
-        let outcome = self
-            .inner
-            .lock()
-            .await
-            .batch_get_and_scan(keys.iter().cloned().map(Into::into).collect(), requests)
-            .await;
-        let (key_outcome, scan_outcomes) = outcome.map_err(|error| {
-            classify_tikv_error(error, "Batch read failed", &self.had_retryable_error)
-        })?;
-        let found: HashMap<Vec<u8>, Vec<u8>> = match key_outcome {
-            Ok(pairs) => pairs
-                .into_iter()
-                .map(|pair| (pair.0.into(), pair.1))
-                .collect(),
-            Err(error) => self.retry_keys(keys, error).await?,
-        };
-        let mut pages = Vec::with_capacity(scans.len());
-        for ((scan, rows), outcome) in scans.iter().zip(&first_rows).zip(scan_outcomes) {
-            pages.push(self.finish_scan(scan, *rows, outcome).await?);
-        }
-        Ok((found, pages))
-    }
-
-    async fn retry_keys(
-        &self,
-        keys: Vec<Vec<u8>>,
-        error: tikv_client::Error,
-    ) -> Result<HashMap<Vec<u8>, Vec<u8>>, TitoError> {
-        if !exceeds_message_limit(&error) {
-            let pending = AtomicBool::new(false);
-            let error = classify_tikv_error(error, "Batch get operation failed", &pending);
-            if !error.is_retryable() {
-                return Err(error);
-            }
-            sleep(READ_LOCK_RESOLUTION_BACKOFF).await;
-        }
-        Ok(self.read_keys(keys).await?.into_iter().collect())
-    }
-
-    async fn finish_scan(
-        &self,
-        scan: &ScanRequest,
-        requested: u32,
-        outcome: Result<Vec<KvPair>, tikv_client::Error>,
-    ) -> Result<Vec<TitoKvPair>, TitoError> {
-        let r#type = if scan.reverse {
-            ScanType::Reverse
-        } else {
-            ScanType::Forward
-        };
-        let page: Vec<TitoKvPair> = match outcome {
-            Ok(pairs) => pairs
-                .into_iter()
-                .map(|pair| (pair.0.into(), pair.1))
-                .collect(),
-            Err(error) if requested > 1 && exceeds_message_limit(&error) => {
-                return self
-                    .scan_pages(
-                        scan.start.clone(),
-                        scan.end.clone(),
-                        scan.limit,
-                        r#type,
-                        requested / 2,
-                    )
-                    .await;
-            }
-            Err(error) => {
-                return Err(classify_tikv_error(
-                    error,
-                    r#type.failure(),
-                    &self.had_retryable_error,
-                ))
-            }
-        };
-        if page.len() < requested as usize || page.len() >= scan.limit as usize {
-            return Ok(page);
-        }
-        let Some((last, _)) = page.last() else {
-            return Ok(page);
-        };
-        let (start, end) = match r#type {
-            ScanType::Reverse => (scan.start.clone(), last.clone()),
-            ScanType::Forward | ScanType::Keys => (key_after_bytes(last), scan.end.clone()),
-        };
-        let rpc_rows = scan_rows_for(
-            page.iter()
-                .map(|(key, value)| key.len() + value.len())
-                .fold(0, usize::max),
-        );
-        let remaining = scan.limit - page.len() as u32;
-        let mut rows = page;
-        rows.extend(
-            self.scan_pages(start, end, remaining, r#type, rpc_rows)
-                .await?,
-        );
-        Ok(rows)
-    }
-
     async fn read_keys(&self, keys: Vec<Vec<u8>>) -> Result<Vec<TitoKvPair>, TitoError> {
-        let mut chunks = vec![keys];
+        let asked = {
+            let missing = self
+                .missing
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            keys.into_iter()
+                .filter(|key| !missing.contains(key))
+                .collect::<Vec<_>>()
+        };
+        if asked.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut chunks = vec![asked.clone()];
         let mut found = Vec::new();
         let mut attempt = 0;
         while let Some(mut chunk) = chunks.pop() {
@@ -811,6 +809,13 @@ impl TiKVTransaction {
                 }
             }
         }
+        {
+            let present = found.iter().map(|(key, _)| key).collect::<HashSet<_>>();
+            self.missing
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend(asked.into_iter().filter(|key| !present.contains(key)));
+        }
         Ok(found)
     }
 }
@@ -822,6 +827,14 @@ impl TitoTransaction for TiKVTransaction {
     }
 
     async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<TitoValue>, TitoError> {
+        let known_missing = self
+            .missing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(key.as_ref());
+        if known_missing {
+            return Ok(None);
+        }
         let tikv_key: tikv_client::Key = key.as_ref().to_vec().into();
         let mut attempt = 0;
         loop {
@@ -865,6 +878,7 @@ impl TitoTransaction for TiKVTransaction {
                 classify_tikv_error(e, "Put operation failed", &self.had_retryable_error)
             })?;
         note_write(&mut *self.guards.lock().await, key.as_ref());
+        self.note_key(key.as_ref());
         self.wrote.store(true, Ordering::Release);
         Ok(())
     }
@@ -880,6 +894,7 @@ impl TitoTransaction for TiKVTransaction {
                 classify_tikv_error(e, "Delete operation failed", &self.had_retryable_error)
             })?;
         note_write(&mut *self.guards.lock().await, key.as_ref());
+        self.note_key(key.as_ref());
         self.wrote.store(true, Ordering::Release);
         Ok(())
     }
@@ -969,6 +984,12 @@ impl TitoTransaction for TiKVTransaction {
             Err(error) => {
                 if let Some(taken) = already_exist_key(&error).and_then(|key| self.taken(&key)) {
                     return Err(taken);
+                }
+                if contains_grpc_error(&error) {
+                    return Err(TitoError::CommitOutcomeUnknown(format!(
+                        "Transaction commit failed: {}",
+                        error
+                    )));
                 }
                 Err(classify_tikv_error(
                     error,

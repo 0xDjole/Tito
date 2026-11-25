@@ -1888,6 +1888,60 @@ async fn a_transaction_reads_its_own_writes_through_notes_and_index_pages() {
 }
 
 #[tokio::test]
+async fn an_index_page_shows_the_inserts_of_its_transaction_and_an_insert_of_a_taken_value_ends_at_commit(
+) {
+    let engine = &native_engine().await;
+    let members = &engine.clone().model::<Member>();
+    let scope = &fresh_scope();
+    let first = &member(scope, "ada@example.com", "ada");
+    let second = &member(scope, "grace@example.com", "grace");
+    create_one(members, first).await.unwrap();
+
+    let listed = engine
+        .transaction(|tx| async move {
+            members.create(second, &tx).await?;
+            members
+                .query_by_index("lib-model-member-by-email")
+                .value(text(scope))
+                .execute(Some(&tx))
+                .await
+        })
+        .await
+        .unwrap();
+    assert_eq!(listed.items, vec![first.clone(), second.clone()]);
+
+    let taken = &member(scope, "ada@example.com", "lovelace");
+    let tx = engine.begin_transaction().await.unwrap();
+    members.create(taken, &tx).await.unwrap();
+    let listed = members
+        .query_by_index("lib-model-member-by-email")
+        .value(text(scope))
+        .execute(Some(&tx))
+        .await
+        .unwrap();
+    assert_eq!(listed.items, vec![taken.clone(), second.clone()]);
+    let kept = tx.clone();
+    assert_eq!(
+        tx.commit().await,
+        Err(TitoError::UniqueViolation {
+            model: "lib-model-members".to_string(),
+            index: "lib-model-member-by-email".to_string(),
+            values: vec![text(scope), text("ada@example.com")],
+        })
+    );
+    let _ = kept.rollback().await;
+    assert_eq!(read_one(members, &taken.id).await.unwrap(), None);
+    assert_eq!(
+        read_one(members, &first.id).await.unwrap(),
+        Some(first.clone())
+    );
+    assert_eq!(
+        read_one(members, &second.id).await.unwrap(),
+        Some(second.clone())
+    );
+}
+
+#[tokio::test]
 async fn an_update_moves_only_the_unique_value_it_changes_and_a_remove_frees_them_all() {
     let engine = &native_engine().await;
     let members = &engine.clone().model::<Member>();
