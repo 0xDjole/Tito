@@ -1,5 +1,5 @@
 use crate::key_encoder::encode_index_string;
-use crate::types::TitoGuard;
+use crate::types::Guard;
 use std::collections::{BTreeMap, HashSet};
 
 pub(crate) const FENCE_KEY_PREFIX: &str = "fence:";
@@ -8,7 +8,7 @@ pub(crate) const SHARED_FENCE_KEYS: u16 = 16;
 
 #[derive(Default)]
 pub(crate) struct Guards {
-    records: BTreeMap<(String, String), TitoGuard>,
+    records: BTreeMap<(String, String), Guard>,
     written_keys: HashSet<Vec<u8>>,
 }
 
@@ -36,7 +36,10 @@ pub(crate) fn record_fence_keys(table: &str, id: &str) -> Vec<String> {
     keys
 }
 
-pub(crate) fn note_guard(guards: &mut Guards, table: &str, id: &str, guard: TitoGuard) {
+pub(crate) fn note_guard(guards: &mut Guards, table: &str, id: &str, guard: Guard) {
+    if guard == Guard::None {
+        return;
+    }
     let held = guards
         .records
         .entry((table.to_string(), id.to_string()))
@@ -51,10 +54,7 @@ pub(crate) fn note_write(guards: &mut Guards, key: &[u8]) {
 }
 
 pub(crate) fn guard_keys(guards: &Guards, wrote: bool, pick: u64) -> Vec<String> {
-    let exclusive = guards
-        .records
-        .values()
-        .any(|guard| *guard == TitoGuard::Exclusive);
+    let exclusive = guards.records.values().any(|guard| *guard == Guard::Update);
     if !wrote && !exclusive {
         return Vec::new();
     }
@@ -64,8 +64,9 @@ pub(crate) fn guard_keys(guards: &Guards, wrote: bool, pick: u64) -> Vec<String>
         .iter()
         .filter_map(|((table, id), guard)| {
             let key = match guard {
-                TitoGuard::Shared => shared_fence_key(table, id, number),
-                TitoGuard::Exclusive => exclusive_fence_key(table, id),
+                Guard::None => return None,
+                Guard::Share => shared_fence_key(table, id, number),
+                Guard::Update => exclusive_fence_key(table, id),
             };
             (!guards.written_keys.contains(key.as_bytes())).then_some(key)
         })

@@ -87,7 +87,8 @@ pub(crate) async fn apply_handler_outcome<E, T>(
     storage_key: &str,
     event: &QueueEvent<T>,
     outcome: QueueHandlerOutcome<T>,
-) where
+) -> bool
+where
     E: TitoEngine,
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
@@ -96,12 +97,16 @@ pub(crate) async fn apply_handler_outcome<E, T>(
         QueueHandlerOutcome::Reschedule(next) => queue.reschedule(storage_key, next).await,
         QueueHandlerOutcome::Advance(next) => queue.advance(storage_key, next).await,
     };
-    if let Err(error) = result {
-        log::error!(
-            "Failed to apply queue outcome for event {} at {}: {}",
-            event.id,
-            storage_key,
-            error
-        );
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            log::error!(
+                "Failed to apply queue outcome for event {} at {}: {}",
+                event.id,
+                storage_key,
+                error
+            );
+            false
+        }
     }
 }

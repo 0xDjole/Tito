@@ -1,38 +1,39 @@
 use serde::{Deserialize, Serialize};
 use tito::{
-    types::{
-        DBUuid, TitoEngine, TitoIndexConfig, TitoIndexField, TitoIndexFieldType, TitoModelTrait,
-    },
-    TiKV, TitoError, TitoModelOptions,
+    types::{DBUuid, TitoEngine, TitoModelTrait},
+    Guard, TiKV, TitoError, TitoIndex, TitoIndexField, TitoIndexValue,
 };
 
-#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Tag {
     id: String,
     name: String,
     description: String,
 }
 
-#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Post {
     id: String,
     title: String,
     content: String,
     author: String,
     tag_ids: Vec<String>,
-    #[serde(default)]
-    tags: Vec<Tag>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PostTitle {
+    id: String,
+    title: String,
 }
 
 impl TitoModelTrait for Tag {
-    fn indexes(&self) -> Vec<TitoIndexConfig> {
-        vec![TitoIndexConfig {
-            condition: true,
-            name: "tag-by-name".to_string(),
-            fields: vec![TitoIndexField {
-                name: "name".to_string(),
-                r#type: TitoIndexFieldType::String,
-            }],
+    fn indexes(&self) -> Vec<TitoIndex> {
+        vec![TitoIndex {
+            name: "tag-by-name",
+            fields: vec![TitoIndexField::Text(self.name.clone())],
+            value: TitoIndexValue::Full,
+            unique: true,
         }]
     }
 
@@ -46,25 +47,30 @@ impl TitoModelTrait for Tag {
 }
 
 impl TitoModelTrait for Post {
-    fn indexes(&self) -> Vec<TitoIndexConfig> {
-        vec![
-            TitoIndexConfig {
-                condition: true,
-                name: "post-by-author".to_string(),
-                fields: vec![TitoIndexField {
-                    name: "author".to_string(),
-                    r#type: TitoIndexFieldType::String,
-                }],
+    fn indexes(&self) -> Vec<TitoIndex> {
+        let mut indexes = vec![
+            TitoIndex {
+                name: "post-by-author",
+                fields: vec![TitoIndexField::Text(self.author.clone())],
+                value: TitoIndexValue::Full,
+                unique: false,
             },
-            TitoIndexConfig {
-                condition: true,
-                name: "post-by-tag".to_string(),
-                fields: vec![TitoIndexField {
-                    name: "tag_ids".to_string(),
-                    r#type: TitoIndexFieldType::String,
-                }],
+            TitoIndex {
+                name: "post-title-by-author",
+                fields: vec![TitoIndexField::Text(self.author.clone())],
+                value: TitoIndexValue::Part(&["id", "title"]),
+                unique: false,
             },
-        ]
+        ];
+        for tag_id in &self.tag_ids {
+            indexes.push(TitoIndex {
+                name: "post-by-tag",
+                fields: vec![TitoIndexField::Text(tag_id.clone())],
+                value: TitoIndexValue::KeysOnly,
+                unique: false,
+            });
+        }
+        indexes
     }
 
     fn table() -> String {
@@ -79,129 +85,111 @@ impl TitoModelTrait for Post {
 #[tokio::main]
 async fn main() -> Result<(), TitoError> {
     let tito_db = TiKV::connect(vec!["127.0.0.1:2379"]).await?;
+    let posts = tito_db.clone().model::<Post>();
+    let tags = tito_db.clone().model::<Tag>();
 
-    let post_model = tito_db.clone().model::<Post>(TitoModelOptions::default());
-    let tag_model = tito_db.clone().model::<Tag>(TitoModelOptions::default());
-
-    let tech_tag = tito_db
+    let tech = Tag {
+        id: DBUuid::new_v4().to_string(),
+        name: "Technology".to_string(),
+        description: "All about tech".to_string(),
+    };
+    let rust = Tag {
+        id: DBUuid::new_v4().to_string(),
+        name: "Rust".to_string(),
+        description: "Rust programming".to_string(),
+    };
+    tito_db
         .transaction(|tx| {
-            let tag_model = tag_model.clone();
-            let tag = Tag {
-                id: DBUuid::new_v4().to_string(),
-                name: "Technology".to_string(),
-                description: "All about tech".to_string(),
-            };
-            let tag_clone = tag.clone();
+            let tags = tags.clone();
+            let tech = tech.clone();
+            let rust = rust.clone();
             async move {
-                tag_model.set(tag_clone).execute(&tx).await?;
-                Ok::<_, TitoError>(tag)
+                tags.create(&tech, &tx).await?;
+                tags.create(&rust, &tx).await
             }
         })
         .await?;
+    println!("Created tags: {}, {}", tech.name, rust.name);
 
-    let rust_tag = tito_db
+    let post = Post {
+        id: DBUuid::new_v4().to_string(),
+        title: "Using Rust with TiKV".to_string(),
+        content: "Examples of using Rust with TiKV...".to_string(),
+        author: "Alice".to_string(),
+        tag_ids: vec![tech.id.clone(), rust.id.clone()],
+    };
+    tito_db
         .transaction(|tx| {
-            let tag_model = tag_model.clone();
-            let tag = Tag {
-                id: DBUuid::new_v4().to_string(),
-                name: "Rust".to_string(),
-                description: "Rust programming".to_string(),
-            };
-            let tag_clone = tag.clone();
+            let posts = posts.clone();
+            let tags = tags.clone();
+            let post = post.clone();
             async move {
-                tag_model.set(tag_clone).execute(&tx).await?;
-                Ok::<_, TitoError>(tag)
-            }
-        })
-        .await?;
-
-    println!("Created tags: {}, {}", tech_tag.name, rust_tag.name);
-
-    let post = tito_db
-        .transaction(|tx| {
-            let post_model = post_model.clone();
-            let tag_model = tag_model.clone();
-            let post = Post {
-                id: DBUuid::new_v4().to_string(),
-                title: "Using Rust with TiKV".to_string(),
-                content: "Examples of using Rust with TiKV...".to_string(),
-                author: "Alice".to_string(),
-                tag_ids: vec![tech_tag.id.clone(), rust_tag.id.clone()],
-                tags: Vec::new(),
-            };
-            let post_clone = post.clone();
-            async move {
-                let tags = tag_model
-                    .get_many_for_share(post_clone.tag_ids.clone(), Some(&tx))
+                let found = tx
+                    .batch_get(tags.read_many(post.tag_ids.clone(), Guard::Share))
                     .await?;
-                if tags.len() != post_clone.tag_ids.len() {
+                if found.len() != post.tag_ids.len() {
                     return Err(TitoError::NotFound(
                         "A post names a tag that does not exist".to_string(),
                     ));
                 }
-                post_model.set(post_clone).execute(&tx).await?;
-                Ok::<_, TitoError>(post)
+                posts.create(&post, &tx).await
             }
         })
         .await?;
-
     println!("Created post: {}", post.title);
 
     let holder = tito_db
         .transaction(|tx| {
-            let post_model = post_model.clone();
-            let tag_model = tag_model.clone();
-            let rust_tag_id = rust_tag.id.clone();
+            let posts = posts.clone();
+            let tags = tags.clone();
+            let rust_id = rust.id.clone();
             async move {
-                let mut query = post_model.query_by_index("post-by-tag");
-                query.value(rust_tag_id.clone()).limit(Some(1));
-                let holder = query.execute_ids(Some(&tx)).await?.items.into_iter().next();
+                let mut used = posts.query_by_index("post-by-tag");
+                used.value(TitoIndexField::Text(rust_id.clone()))
+                    .limit(Some(1));
+                let (holders, tag) = tx
+                    .batch_get((used.read_ids(), tags.read(&rust_id, Guard::None)))
+                    .await?;
+                let holder = holders.items.into_iter().next();
                 if holder.is_none() {
-                    tag_model.remove(&rust_tag_id, &tx).await?;
+                    tags.remove(&tag, &tx).await?;
                 }
                 Ok::<_, TitoError>(holder)
             }
         })
         .await?;
     if let Some(holder) = holder {
-        println!("Tag {} stays: post {} uses it", rust_tag.name, holder);
+        println!("Tag {} stays: post {} uses it", rust.name, holder);
     }
 
-    let mut used_by = post_model.query_by_index("post-by-tag");
-    used_by.value(tech_tag.id.clone()).limit(Some(20));
-    for holder in used_by.execute(None).await?.items {
-        println!(
-            "Tag {} is used by post {} ({})",
-            tech_tag.name, holder.id, holder.title
-        );
-    }
-
-    let mut post_with_tags = post_model.get(&post.id, None).await?;
-    post_with_tags.tags = tag_model
-        .get_many(post_with_tags.tag_ids.clone(), None)
+    let (found, post_tags) = tito_db
+        .transaction(|tx| {
+            let posts = posts.clone();
+            let tags = tags.clone();
+            let post_id = post.id.clone();
+            async move {
+                let post = tx.batch_get(posts.read(&post_id, Guard::None)).await?;
+                let tags = tx
+                    .batch_get(tags.read_many(post.tag_ids.clone(), Guard::None))
+                    .await?;
+                Ok::<_, TitoError>((post, tags))
+            }
+        })
         .await?;
-
-    println!("Post: {}", post_with_tags.title);
+    println!("Post: {} ({})", found.title, found.content);
     println!("Tags:");
-    for tag in &post_with_tags.tags {
-        println!("- {}", tag.name);
+    for tag in &post_tags {
+        println!("- {} ({})", tag.name, tag.description);
     }
 
-    let mut query = post_model.query_by_index("post-by-author");
-    let results = query.value("Alice".to_string()).execute(None).await?;
-
+    let titles = posts
+        .query_by_index("post-title-by-author")
+        .value(TitoIndexField::Text("Alice".to_string()))
+        .execute_part::<PostTitle>(None)
+        .await?;
     println!("\nAlice's posts:");
-    for mut p in results.items {
-        p.tags = tag_model.get_many(p.tag_ids.clone(), None).await?;
-        println!(
-            "- {} (tags: {})",
-            p.title,
-            p.tags
-                .iter()
-                .map(|t| t.name.clone())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+    for title in titles.items {
+        println!("- {} ({})", title.title, title.id);
     }
 
     Ok(())

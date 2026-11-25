@@ -1,40 +1,8 @@
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::time::Duration;
 
 use crate::TitoError;
 
 pub const MAX_QUEUE_OWNER_COMPONENT_BYTES: usize = 512;
-
-#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum QueueEventStatus {
-    #[default]
-    Pending,
-    Completed,
-}
-
-impl<'de> Deserialize<'de> for QueueEventStatus {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct StatusWire {
-            r#type: String,
-        }
-
-        let wire = StatusWire::deserialize(deserializer)?;
-        match wire.r#type.as_str() {
-            "pending" => Ok(Self::Pending),
-            "completed" => Ok(Self::Completed),
-            value => Err(serde::de::Error::unknown_variant(
-                value,
-                &["pending", "completed"],
-            )),
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueueHandlerOutcome<T> {
@@ -89,9 +57,6 @@ pub struct QueueEvent<T> {
     pub owner: Option<QueueOwner>,
     pub payload: T,
     pub timestamp: i64,
-    pub status: QueueEventStatus,
-    #[serde(default)]
-    pub processed_at: Option<i64>,
     #[serde(skip)]
     pub pending_key: Option<String>,
 }
@@ -129,8 +94,6 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent
             owner: None,
             payload,
             timestamp,
-            status: QueueEventStatus::Pending,
-            processed_at: None,
             pending_key: None,
         }
     }
@@ -167,8 +130,6 @@ impl<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> QueueEvent
             owner: self.owner.clone(),
             payload: self.payload.clone(),
             timestamp,
-            status: QueueEventStatus::Pending,
-            processed_at: None,
             pending_key: None,
         }
     }
@@ -183,15 +144,13 @@ fn queue_event_id() -> String {
 pub struct QueueConfig {
     name: String,
     pub partition_count: u32,
-    pub completed_retention: Duration,
 }
 
 impl QueueConfig {
-    pub fn new(partition_count: u32, completed_retention: Duration) -> Self {
+    pub fn new(partition_count: u32) -> Self {
         Self {
             name: "queue".to_string(),
             partition_count,
-            completed_retention,
         }
     }
 

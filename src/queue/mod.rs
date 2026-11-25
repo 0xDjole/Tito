@@ -5,16 +5,17 @@ mod worker;
 
 #[cfg(test)]
 mod named_tests;
+#[cfg(test)]
+pub(crate) mod test_engine;
 
 pub use cluster::{
-    run_cluster_worker, ClusterCoordinatorLease, ClusterPartitionAssignment, ClusterWorkerConfig,
+    run_cluster_worker, ClusterPartitionAssignment, ClusterPartitions, ClusterWorkerConfig,
     ClusterWorkerNode,
 };
 pub use partition::queue_partition_for_key;
 pub use types::{
-    QueueConfig, QueueDeletePage, QueueEvent, QueueEventStatus, QueueHandlerOutcome,
-    QueueHandlerResult, QueueOwner, QueuePullCursor, QueuePullPage, QueueScanPage,
-    MAX_QUEUE_OWNER_COMPONENT_BYTES,
+    QueueConfig, QueueDeletePage, QueueEvent, QueueHandlerOutcome, QueueHandlerResult, QueueOwner,
+    QueuePullCursor, QueuePullPage, QueueScanPage, MAX_QUEUE_OWNER_COMPONENT_BYTES,
 };
 
 use std::collections::HashMap;
@@ -26,12 +27,9 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::types::{TitoEngine, TitoKvPair, TitoTransaction, PARTITION_DIGITS};
+use crate::types::{Sealed, TitoEngine, TitoKvPair, TitoTransaction, PARTITION_DIGITS};
 use crate::{encode_index_integer, TitoError};
 
-pub(crate) const COMPLETED_EVENT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
-pub(crate) const COMPLETED_EVENT_MAINTENANCE_BATCH_SIZE: u32 = 1_000;
-pub(crate) const COMPLETED_EVENT_MAINTENANCE_MAX_BATCHES: usize = 4;
 pub const MAX_QUEUE_EVENT_BYTES: usize = 1024 * 1024;
 pub(crate) const QUEUE_SCAN_RPC_LIMIT: u32 = 16;
 const KEY_NUMBER_DIGITS: usize = 20;
@@ -61,13 +59,6 @@ impl QueueReplacementType {
         }
     }
 
-    fn completion_error(self) -> &'static str {
-        match self {
-            Self::Reschedule => "Complete rescheduled queue event",
-            Self::Advance => "Complete advanced queue event",
-        }
-    }
-
     fn validate_payload(self, current: &Value, next: &Value) -> Result<(), TitoError> {
         match self {
             Self::Reschedule if current != next => Err(TitoError::InvalidInput(
@@ -84,7 +75,6 @@ impl QueueReplacementType {
 struct PendingQueueEntry {
     value: Value,
     id: String,
-    timestamp: i64,
     owner: Option<QueueOwner>,
 }
 
@@ -170,51 +160,28 @@ impl<E: TitoEngine> Queue<E> {
         Self::prefix_end(&prefix)
     }
 
-    fn completed_key(&self, processed_at: i64, event_timestamp: i64, event_id: &str) -> String {
-        format!(
-            "{}:completed:{}:{}:{}",
-            self.config.name(),
-            encode_index_integer(processed_at),
-            encode_index_integer(event_timestamp),
-            event_id,
-        )
+    pub(crate) fn pending_prefix(&self) -> String {
+        format!("{}:pending:", self.config.name())
     }
 
-    fn status_prefix(&self, status: QueueEventStatus) -> String {
-        format!("{}:{}:", self.config.name(), Self::status_value(status))
-    }
-
-    fn status_value(status: QueueEventStatus) -> &'static str {
-        match status {
-            QueueEventStatus::Pending => "pending",
-            QueueEventStatus::Completed => "completed",
-        }
-    }
-
-    fn owner_status_prefix(
-        &self,
-        owner: &QueueOwner,
-        status: QueueEventStatus,
-    ) -> Result<String, TitoError> {
+    pub(crate) fn owner_prefix(&self, owner: &QueueOwner) -> Result<String, TitoError> {
         owner.validate()?;
         Ok(format!(
-            "{}:owner:{}:{}:{}:",
+            "{}:owner:{}:{}:",
             self.config.name(),
             URL_SAFE_NO_PAD.encode(owner.r#type.as_bytes()),
             URL_SAFE_NO_PAD.encode(owner.id.as_bytes()),
-            Self::status_value(status),
         ))
     }
 
-    fn owner_index_key(
+    pub(crate) fn owner_index_key(
         &self,
         owner: &QueueOwner,
-        status: QueueEventStatus,
         storage_key: &[u8],
     ) -> Result<String, TitoError> {
         Ok(format!(
             "{}{}",
-            self.owner_status_prefix(owner, status)?,
+            self.owner_prefix(owner)?,
             URL_SAFE_NO_PAD.encode(storage_key),
         ))
     }
@@ -235,30 +202,16 @@ impl<E: TitoEngine> Queue<E> {
         })
     }
 
-    fn owner_from_value(event: &Value) -> Result<Option<QueueOwner>, TitoError> {
-        let Some(owner) = event.get("owner") else {
-            return Ok(None);
-        };
-        if owner.is_null() {
-            return Ok(None);
-        }
-        let owner = serde_json::from_value::<QueueOwner>(owner.clone())
-            .map_err(|error| TitoError::DeserializationFailed(error.to_string()))?;
-        owner.validate()?;
-        Ok(Some(owner))
-    }
-
     async fn put_owner_index(
         &self,
         tx: &E::Transaction,
         owner: Option<&QueueOwner>,
-        status: QueueEventStatus,
         storage_key: &[u8],
     ) -> Result<(), TitoError> {
         let Some(owner) = owner else {
             return Ok(());
         };
-        let index_key = self.owner_index_key(owner, status, storage_key)?;
+        let index_key = self.owner_index_key(owner, storage_key)?;
         tx.put(index_key.as_bytes(), Vec::new())
             .await
             .map_err(|error| TitoError::CreateFailed(format!("Create queue owner index: {error}")))
@@ -268,13 +221,12 @@ impl<E: TitoEngine> Queue<E> {
         &self,
         tx: &E::Transaction,
         owner: Option<&QueueOwner>,
-        status: QueueEventStatus,
         storage_key: &[u8],
     ) -> Result<(), TitoError> {
         let Some(owner) = owner else {
             return Ok(());
         };
-        let index_key = self.owner_index_key(owner, status, storage_key)?;
+        let index_key = self.owner_index_key(owner, storage_key)?;
         tx.delete(index_key.as_bytes())
             .await
             .map_err(|error| TitoError::DeleteFailed(format!("Delete queue owner index: {error}")))
@@ -293,35 +245,19 @@ impl<E: TitoEngine> Queue<E> {
             .map_err(|e| TitoError::DeserializationFailed(e.to_string()))
     }
 
-    fn read_value_from_entry(value: &[u8]) -> Result<Value, TitoError> {
-        if let Ok(event) = serde_json::from_slice::<Value>(value) {
-            if event.get("id").is_some() && event.get("key").is_some() {
-                return Ok(event);
-            }
-        }
-
-        Err(TitoError::DeserializationFailed(
-            "Invalid queue event bytes".to_string(),
-        ))
-    }
-
-    fn read_pending_entry(value: &[u8]) -> Result<Option<PendingQueueEntry>, TitoError> {
+    fn read_pending_entry(value: &[u8]) -> Result<PendingQueueEntry, TitoError> {
         let event = Self::read_event_from_value::<Value>(value)?;
-        if event.status != QueueEventStatus::Pending {
-            return Ok(None);
-        }
         if let Some(owner) = &event.owner {
             owner.validate()?;
         }
         let value = serde_json::to_value(&event)
             .map_err(|error| TitoError::SerializationFailed(error.to_string()))?;
 
-        Ok(Some(PendingQueueEntry {
+        Ok(PendingQueueEntry {
             value,
             id: event.id,
-            timestamp: event.timestamp,
             owner: event.owner,
-        }))
+        })
     }
 
     fn serialize_new_event<T: Serialize>(event: &QueueEvent<T>) -> Result<Vec<u8>, TitoError> {
@@ -377,44 +313,19 @@ impl<E: TitoEngine> Queue<E> {
             .map_err(|e| TitoError::DeleteFailed(format!("Delete queue event: {}", e)))
     }
 
-    async fn complete_pending_entry(
+    async fn delete_pending_entry(
         &self,
         tx: &E::Transaction,
         storage_key: &[u8],
-        mut current: PendingQueueEntry,
-        completion_error: &str,
+        owner: Option<&QueueOwner>,
     ) -> Result<(), TitoError> {
-        let processed_at = Utc::now().timestamp_millis();
-        current.value["status"] = serde_json::to_value(QueueEventStatus::Completed)
-            .map_err(|error| TitoError::SerializationFailed(error.to_string()))?;
-        current.value["processedAt"] = Value::Number(processed_at.into());
-        let completed_key = self.completed_key(processed_at, current.timestamp, &current.id);
-        let completed_bytes = serde_json::to_vec(&current.value)
-            .map_err(|error| TitoError::SerializationFailed(error.to_string()))?;
-
         Self::delete_entry(tx, storage_key).await?;
-        self.delete_owner_index(
-            tx,
-            current.owner.as_ref(),
-            QueueEventStatus::Pending,
-            storage_key,
-        )
-        .await?;
-        tx.put(completed_key.as_bytes(), completed_bytes)
-            .await
-            .map_err(|error| TitoError::UpdateFailed(format!("{completion_error}: {error}")))?;
-        self.put_owner_index(
-            tx,
-            current.owner.as_ref(),
-            QueueEventStatus::Completed,
-            completed_key.as_bytes(),
-        )
-        .await
+        self.delete_owner_index(tx, owner, storage_key).await
     }
 
     pub async fn publish_in_tx<T: Serialize + Clone + Send + Sync + 'static>(
         &self,
-        mut event: QueueEvent<T>,
+        event: QueueEvent<T>,
         tx: &E::Transaction,
     ) -> Result<(), TitoError> {
         if let Some(owner) = event.owner.as_ref() {
@@ -424,21 +335,13 @@ impl<E: TitoEngine> Queue<E> {
         let pending_key =
             self.pending_key(partition, event.timestamp, tx.start_version(), &event.id);
 
-        event.status = QueueEventStatus::Pending;
-        event.processed_at = None;
-
         let bytes = Self::serialize_new_event(&event)?;
 
         tx.put(pending_key.as_bytes(), bytes)
             .await
             .map_err(|e| TitoError::CreateFailed(e.to_string()))?;
-        self.put_owner_index(
-            tx,
-            event.owner.as_ref(),
-            QueueEventStatus::Pending,
-            pending_key.as_bytes(),
-        )
-        .await?;
+        self.put_owner_index(tx, event.owner.as_ref(), pending_key.as_bytes())
+            .await?;
 
         Ok(())
     }
@@ -544,7 +447,7 @@ impl<E: TitoEngine> Queue<E> {
                         }
                     };
 
-                    if event.status == QueueEventStatus::Pending && event.timestamp <= now {
+                    if event.timestamp <= now {
                         let key = match String::from_utf8(storage_key) {
                             Ok(key) => key,
                             Err(error) => {
@@ -578,7 +481,7 @@ impl<E: TitoEngine> Queue<E> {
     }
 
     pub async fn ack(&self, key: &str) -> Result<(), TitoError> {
-        if !key.starts_with(&self.status_prefix(QueueEventStatus::Pending)) {
+        if !key.starts_with(&self.pending_prefix()) {
             return Err(TitoError::InvalidInput(
                 "Only pending queue events can be acknowledged".to_string(),
             ));
@@ -596,17 +499,9 @@ impl<E: TitoEngine> Queue<E> {
                         return Ok::<_, TitoError>(());
                     };
 
-                    let Some(current) = Self::read_pending_entry(&bytes)? else {
-                        return Ok::<_, TitoError>(());
-                    };
-
-                    self.complete_pending_entry(
-                        &tx,
-                        key.as_bytes(),
-                        current,
-                        "Create completed event",
-                    )
-                    .await
+                    let current = Self::read_pending_entry(&bytes)?;
+                    self.delete_pending_entry(&tx, key.as_bytes(), current.owner.as_ref())
+                        .await
                 }
             })
             .await
@@ -623,7 +518,7 @@ impl<E: TitoEngine> Queue<E> {
                     .to_string(),
             )
         })?;
-        if !storage_key.starts_with(&self.status_prefix(QueueEventStatus::Pending)) {
+        if !storage_key.starts_with(&self.pending_prefix()) {
             return Err(TitoError::InvalidInput(
                 "Only pending queue events can be acknowledged".to_string(),
             ));
@@ -636,22 +531,15 @@ impl<E: TitoEngine> Queue<E> {
         else {
             return Ok(false);
         };
-        let Some(current) = Self::read_pending_entry(&bytes)? else {
-            return Ok(false);
-        };
+        let current = Self::read_pending_entry(&bytes)?;
         if current.id != event.id {
             return Err(TitoError::InvalidInput(
                 "A pending queue row can only be acknowledged by its own event".to_string(),
             ));
         }
 
-        self.complete_pending_entry(
-            tx,
-            storage_key.as_bytes(),
-            current,
-            "Create completed event",
-        )
-        .await?;
+        self.delete_pending_entry(tx, storage_key.as_bytes(), current.owner.as_ref())
+            .await?;
         Ok(true)
     }
 
@@ -676,21 +564,19 @@ impl<E: TitoEngine> Queue<E> {
     async fn replace_pending<T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static>(
         &self,
         storage_key: &str,
-        mut next: QueueEvent<T>,
+        next: QueueEvent<T>,
         replacement_type: QueueReplacementType,
     ) -> Result<(), TitoError> {
         if let Some(owner) = next.owner.as_ref() {
             owner.validate()?;
         }
-        if !storage_key.starts_with(&self.status_prefix(QueueEventStatus::Pending)) {
+        if !storage_key.starts_with(&self.pending_prefix()) {
             return Err(TitoError::InvalidInput(format!(
                 "Only pending queue events can be {}",
                 replacement_type.replacement()
             )));
         }
 
-        next.status = QueueEventStatus::Pending;
-        next.processed_at = None;
         let storage_key = storage_key.to_string();
 
         self.engine
@@ -708,9 +594,7 @@ impl<E: TitoEngine> Queue<E> {
                         return Ok::<_, TitoError>(());
                     };
 
-                    let Some(current) = Self::read_pending_entry(&bytes)? else {
-                        return Ok(());
-                    };
+                    let current = Self::read_pending_entry(&bytes)?;
 
                     if current.id != next.id {
                         return Err(TitoError::InvalidInput(format!(
@@ -751,23 +635,13 @@ impl<E: TitoEngine> Queue<E> {
                         self.pending_key(partition, next.timestamp, tx.start_version(), &next.id);
                     let pending_bytes = Self::serialize_new_event(&next)?;
 
-                    self.complete_pending_entry(
-                        &tx,
-                        storage_key.as_bytes(),
-                        current,
-                        replacement_type.completion_error(),
-                    )
-                    .await?;
+                    self.delete_pending_entry(&tx, storage_key.as_bytes(), current.owner.as_ref())
+                        .await?;
                     tx.put(pending_key.as_bytes(), pending_bytes)
                         .await
                         .map_err(|error| TitoError::CreateFailed(error.to_string()))?;
-                    self.put_owner_index(
-                        &tx,
-                        next.owner.as_ref(),
-                        QueueEventStatus::Pending,
-                        pending_key.as_bytes(),
-                    )
-                    .await?;
+                    self.put_owner_index(&tx, next.owner.as_ref(), pending_key.as_bytes())
+                        .await?;
                     Ok(())
                 }
             })
@@ -776,8 +650,7 @@ impl<E: TitoEngine> Queue<E> {
 
     pub async fn clear(&self) -> Result<(), TitoError> {
         for prefix in [
-            self.status_prefix(QueueEventStatus::Pending),
-            self.status_prefix(QueueEventStatus::Completed),
+            self.pending_prefix(),
             format!("{}:owner:", self.config.name()),
         ] {
             let prefix = prefix.as_str();
@@ -813,83 +686,12 @@ impl<E: TitoEngine> Queue<E> {
         Ok(())
     }
 
-    pub async fn delete_by_status_before(
-        &self,
-        status: QueueEventStatus,
-        cutoff: i64,
-        limit: u32,
-    ) -> Result<usize, TitoError> {
-        if status == QueueEventStatus::Pending {
-            return Err(TitoError::InvalidInput(format!(
-                "Refusing to delete non-terminal queue status {}",
-                Self::status_value(status)
-            )));
-        }
-
-        self.engine
-            .transaction(|tx| async move {
-                let end = Self::prefix_end(&format!(
-                    "{}{}:",
-                    self.status_prefix(QueueEventStatus::Completed),
-                    encode_index_integer(cutoff),
-                ));
-                let entries = Self::scan_queue_entries(
-                    &tx,
-                    self.status_prefix(QueueEventStatus::Completed)
-                        .as_bytes()
-                        .to_vec(),
-                    end,
-                    limit,
-                )
-                .await
-                .map_err(|e| TitoError::QueryFailed(format!("Scan completed queue: {}", e)))?;
-
-                let deleted = entries.len();
-                for (storage_key, value) in entries {
-                    if let Ok(event) = Self::read_value_from_entry(&value) {
-                        if let Ok(owner) = Self::owner_from_value(&event) {
-                            self.delete_owner_index(&tx, owner.as_ref(), status, &storage_key)
-                                .await?;
-                        }
-                    }
-                    Self::delete_entry(&tx, storage_key.as_slice()).await?;
-                }
-
-                Ok::<_, TitoError>(deleted)
-            })
-            .await
-    }
-
-    pub(crate) async fn maintain_completed_event_retention(
-        &self,
-        now: i64,
-    ) -> Result<bool, TitoError> {
-        let retention_ms = duration_millis(self.config.completed_retention);
-        let cutoff = now.saturating_sub(retention_ms);
-
-        for _ in 0..COMPLETED_EVENT_MAINTENANCE_MAX_BATCHES {
-            let batch = self
-                .delete_by_status_before(
-                    QueueEventStatus::Completed,
-                    cutoff,
-                    COMPLETED_EVENT_MAINTENANCE_BATCH_SIZE,
-                )
-                .await?;
-            if batch < COMPLETED_EVENT_MAINTENANCE_BATCH_SIZE as usize {
-                return Ok(false);
-            }
-        }
-
-        Ok(true)
-    }
-
     pub async fn scan_by_status<T: DeserializeOwned + Clone + Send + Sync + 'static>(
         &self,
-        status: QueueEventStatus,
         cursor: Option<Vec<u8>>,
         limit: u32,
     ) -> Result<QueueScanPage<T>, TitoError> {
-        let prefix = self.status_prefix(status);
+        let prefix = self.pending_prefix();
         Self::validate_scan_cursor(&prefix, cursor.as_deref())?;
         let limit = limit.max(1);
 
@@ -916,13 +718,10 @@ impl<E: TitoEngine> Queue<E> {
                     let mut events = Vec::new();
                     for (storage_key, value) in entries {
                         let event = Self::read_event_from_value::<T>(&value)?;
-
-                        if event.status == status {
-                            let key = String::from_utf8(storage_key).map_err(|_| {
-                                TitoError::DeserializationFailed("Invalid queue key".to_string())
-                            })?;
-                            events.push((key, event));
-                        }
+                        let key = String::from_utf8(storage_key).map_err(|_| {
+                            TitoError::DeserializationFailed("Invalid queue key".to_string())
+                        })?;
+                        events.push((key, event));
                     }
 
                     Ok::<_, TitoError>(QueueScanPage {
@@ -937,17 +736,16 @@ impl<E: TitoEngine> Queue<E> {
     pub async fn scan_by_owner<T: DeserializeOwned + Clone + Send + Sync + 'static>(
         &self,
         owner: &QueueOwner,
-        status: QueueEventStatus,
         cursor: Option<Vec<u8>>,
         limit: u32,
     ) -> Result<QueueScanPage<T>, TitoError> {
-        let prefix = self.owner_status_prefix(owner, status)?;
+        let prefix = self.owner_prefix(owner)?;
         if cursor
             .as_ref()
             .is_some_and(|value| !value.starts_with(prefix.as_bytes()))
         {
             return Err(TitoError::InvalidInput(
-                "Queue cursor belongs to another owner or status".into(),
+                "Queue cursor belongs to another owner".into(),
             ));
         }
         let limit = limit.max(1);
@@ -972,11 +770,11 @@ impl<E: TitoEngine> Queue<E> {
                     for (index_key, _) in &entries {
                         let storage_key =
                             Self::indexed_storage_key(index_key, &prefix).and_then(|storage_key| {
-                                if storage_key.starts_with(self.status_prefix(status).as_bytes()) {
+                                if storage_key.starts_with(self.pending_prefix().as_bytes()) {
                                     Ok(storage_key)
                                 } else {
                                     Err(TitoError::DeserializationFailed(
-                                        "Queue owner index points outside its status".into(),
+                                        "Queue owner index points outside its queue".into(),
                                     ))
                                 }
                             });
@@ -993,7 +791,7 @@ impl<E: TitoEngine> Queue<E> {
                     let found: HashMap<_, _> = if readable.is_empty() {
                         HashMap::new()
                     } else {
-                        tx.batch_get(readable).await?.into_iter().collect()
+                        tx.get_keys(readable, Sealed).await?.into_iter().collect()
                     };
                     let mut events = Vec::with_capacity(storage_keys.len());
                     for storage_key in storage_keys {
@@ -1004,7 +802,7 @@ impl<E: TitoEngine> Queue<E> {
                             )
                         })?;
                         let event = Self::read_event_from_value::<T>(value)?;
-                        if event.status != status || event.owner.as_ref() != Some(owner) {
+                        if event.owner.as_ref() != Some(owner) {
                             return Err(TitoError::DeserializationFailed(
                                 "Queue owner index conflicts with its event".into(),
                             ));
@@ -1025,7 +823,6 @@ impl<E: TitoEngine> Queue<E> {
 
     pub async fn delete_matching_in_tx<T, F>(
         &self,
-        status: QueueEventStatus,
         cursor: Option<Vec<u8>>,
         limit: u32,
         tx: &E::Transaction,
@@ -1035,7 +832,7 @@ impl<E: TitoEngine> Queue<E> {
         T: DeserializeOwned + Clone + Send + Sync + 'static,
         F: Fn(&QueueEvent<T>) -> Result<bool, TitoError> + Send + Sync,
     {
-        let prefix = self.status_prefix(status);
+        let prefix = self.pending_prefix();
         Self::validate_scan_cursor(&prefix, cursor.as_deref())?;
         let limit = limit.max(1);
         let start = cursor.unwrap_or_else(|| prefix.as_bytes().to_vec());
@@ -1054,11 +851,10 @@ impl<E: TitoEngine> Queue<E> {
         let mut deleted_event_ids = Vec::new();
         for (storage_key, value) in entries {
             let event = Self::read_event_from_value::<T>(&value)?;
-            if event.status == status && matches(&event)? {
-                deleted_event_ids.push(event.id);
-                self.delete_owner_index(tx, event.owner.as_ref(), status, &storage_key)
+            if matches(&event)? {
+                self.delete_pending_entry(tx, &storage_key, event.owner.as_ref())
                     .await?;
-                Self::delete_entry(tx, &storage_key).await?;
+                deleted_event_ids.push(event.id);
             }
         }
         deleted_event_ids.sort();
@@ -1072,7 +868,7 @@ impl<E: TitoEngine> Queue<E> {
     fn validate_scan_cursor(prefix: &str, cursor: Option<&[u8]>) -> Result<(), TitoError> {
         if cursor.is_some_and(|value| !value.starts_with(prefix.as_bytes())) {
             return Err(TitoError::InvalidInput(
-                "Queue cursor belongs to another queue or status".into(),
+                "Queue cursor belongs to another queue".into(),
             ));
         }
         Ok(())
@@ -1081,19 +877,25 @@ impl<E: TitoEngine> Queue<E> {
 
 #[cfg(test)]
 mod tests {
+    use super::test_engine::{
+        get_raw, keys_with_prefix, native_engine, put_raw, unique_queue_name,
+    };
     use super::*;
-    use crate::test_support::MemoryEngine;
+    use crate::backend::tikv::TiKVBackend;
     use serde::{Deserialize, Serialize};
+    use std::collections::{BTreeSet, HashSet};
 
     #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
     struct Payload {
         name: String,
     }
 
-    fn queue(engine: MemoryEngine) -> Queue<MemoryEngine> {
+    async fn test_queue() -> Queue<TiKVBackend> {
         Queue::new(
-            engine,
-            QueueConfig::new(1, Duration::from_secs(3 * 24 * 60 * 60)),
+            native_engine().await,
+            QueueConfig::new(1)
+                .with_name(unique_queue_name("queue-test"))
+                .unwrap(),
         )
     }
 
@@ -1103,35 +905,13 @@ mod tests {
         }
     }
 
-    fn event(
-        id: &str,
-        key: &str,
-        status: QueueEventStatus,
-        timestamp: i64,
-        processed_at: Option<i64>,
-    ) -> QueueEvent<Payload> {
-        QueueEvent {
-            id: id.to_string(),
-            key: key.to_string(),
-            owner: None,
-            payload: payload(id),
-            timestamp,
-            status,
-            processed_at,
-            pending_key: None,
-        }
-    }
-
-    async fn put_event(engine: &MemoryEngine, storage_key: &str, event: QueueEvent<Payload>) {
-        engine
-            .put_raw(storage_key, serde_json::to_vec(&event).unwrap())
-            .await;
+    fn queue_prefix(queue: &Queue<TiKVBackend>) -> String {
+        format!("{}:", queue.config.name())
     }
 
     #[tokio::test]
     async fn publish_and_pull_keeps_pending_rows_until_ack() {
-        let engine = MemoryEngine::default();
-        let queue = queue(engine);
+        let queue = test_queue().await;
         let now = chrono::Utc::now().timestamp_millis();
 
         queue
@@ -1150,40 +930,95 @@ mod tests {
         let jobs = queue.pull::<Payload>(0, None, 10).await.unwrap().events;
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].1.key, "entry:due");
-        assert_eq!(jobs[0].1.status, QueueEventStatus::Pending);
 
-        let pending_before_ack = queue
-            .scan_by_status::<Payload>(QueueEventStatus::Pending, None, 10)
-            .await
-            .unwrap();
+        let pending_before_ack = queue.scan_by_status::<Payload>(None, 10).await.unwrap();
         assert_eq!(pending_before_ack.events.len(), 2);
 
         queue.ack(&jobs[0].0).await.unwrap();
 
-        let pending_after_ack = queue
-            .scan_by_status::<Payload>(QueueEventStatus::Pending, None, 10)
-            .await
-            .unwrap();
+        let pending_after_ack = queue.scan_by_status::<Payload>(None, 10).await.unwrap();
         assert_eq!(pending_after_ack.events.len(), 1);
         assert_eq!(pending_after_ack.events[0].1.key, "entry:future");
+        assert_eq!(
+            keys_with_prefix(&queue.engine, &queue_prefix(&queue)).await,
+            vec![pending_after_ack.events[0].0.clone()]
+        );
+        let stored: Value = serde_json::from_slice(
+            &get_raw(&queue.engine, &pending_after_ack.events[0].0)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(stored.get("status").is_none());
+        assert!(stored.get("processedAt").is_none());
+    }
 
-        let completed = queue
-            .scan_by_status::<Payload>(QueueEventStatus::Completed, None, 10)
+    #[tokio::test]
+    async fn acknowledged_rescheduled_and_advanced_rows_leave_no_finished_row() {
+        let queue = test_queue().await;
+        let owner = QueueOwner::new("store", "finished").unwrap();
+        let now = Utc::now().timestamp_millis();
+        for name in ["ack", "reschedule", "advance"] {
+            queue
+                .publish(
+                    QueueEvent::new(format!("entry:{name}"), payload(name), now - 1_000)
+                        .with_owner(owner.clone()),
+                )
+                .await
+                .unwrap();
+        }
+
+        let jobs = queue.pull::<Payload>(0, None, 10).await.unwrap().events;
+        assert_eq!(jobs.len(), 3);
+        for (storage_key, event) in &jobs {
+            match event.payload.name.as_str() {
+                "ack" => queue.ack(storage_key).await.unwrap(),
+                "reschedule" => queue
+                    .reschedule(storage_key, event.rescheduled(now + 60_000))
+                    .await
+                    .unwrap(),
+                _ => {
+                    let mut next = event.rescheduled(now + 60_000);
+                    next.payload = payload("advanced");
+                    queue.advance(storage_key, next).await.unwrap();
+                }
+            }
+        }
+
+        let remaining = queue
+            .scan_by_owner::<Payload>(&owner, None, 10)
             .await
             .unwrap();
-        assert_eq!(completed.events.len(), 1);
-        assert_eq!(completed.events[0].1.key, "entry:due");
-        assert_eq!(completed.events[0].1.status, QueueEventStatus::Completed);
-        assert!(completed.events[0].1.processed_at.is_some());
-        assert!(
-            serde_json::to_value(&completed.events[0].1).unwrap()["completionReason"].is_null()
+        assert_eq!(
+            remaining
+                .events
+                .iter()
+                .map(|(_, event)| event.payload.name.clone())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["advanced".to_string(), "reschedule".to_string()])
+        );
+        let mut expected = remaining
+            .events
+            .iter()
+            .map(|(storage_key, _)| storage_key.clone())
+            .collect::<Vec<_>>();
+        for (storage_key, _) in &remaining.events {
+            expected.push(
+                queue
+                    .owner_index_key(&owner, storage_key.as_bytes())
+                    .unwrap(),
+            );
+        }
+        expected.sort();
+        assert_eq!(
+            keys_with_prefix(&queue.engine, &queue_prefix(&queue)).await,
+            expected
         );
     }
 
     #[tokio::test]
     async fn publish_rejects_an_invocation_larger_than_the_transport_safe_limit() {
-        let engine = MemoryEngine::default();
-        let queue = queue(engine.clone());
+        let queue = test_queue().await;
         let oversized = Payload {
             name: "x".repeat(MAX_QUEUE_EVENT_BYTES),
         };
@@ -1199,16 +1034,14 @@ mod tests {
 
         assert!(matches!(error, TitoError::InvalidInput(message)
             if message.contains(&MAX_QUEUE_EVENT_BYTES.to_string())));
-        assert!(engine
-            .keys_with_prefix(&queue.status_prefix(QueueEventStatus::Pending))
+        assert!(keys_with_prefix(&queue.engine, &queue.pending_prefix())
             .await
             .is_empty());
     }
 
     #[tokio::test]
     async fn queue_reads_fulfill_logical_limits_through_bounded_rpc_pages() {
-        let engine = MemoryEngine::default();
-        let queue = queue(engine.clone());
+        let queue = test_queue().await;
         let now = Utc::now().timestamp_millis();
 
         for index in 0..18 {
@@ -1223,23 +1056,22 @@ mod tests {
         }
 
         let page = queue.pull::<Payload>(0, None, 17).await.unwrap();
-
         assert_eq!(page.events.len(), 17);
         assert!(page.next_cursor.is_some());
-        assert_eq!(engine.pending_queue_scan_count(), 2);
-
-        let scanned = queue
-            .scan_by_status::<Payload>(QueueEventStatus::Pending, None, 17)
+        let rest = queue
+            .pull::<Payload>(0, page.next_cursor, 17)
             .await
             .unwrap();
+        assert_eq!(rest.events.len(), 1);
+
+        let scanned = queue.scan_by_status::<Payload>(None, 17).await.unwrap();
         assert_eq!(scanned.events.len(), 17);
         assert!(scanned.next_cursor.is_some());
-        assert_eq!(engine.pending_queue_scan_count(), 4);
     }
 
     #[tokio::test]
     async fn pull_reaches_event_timestamps_with_fewer_decimal_digits_than_now() {
-        let queue = queue(MemoryEngine::default());
+        let queue = test_queue().await;
         let old_timestamp = 999_999_999;
 
         queue
@@ -1259,48 +1091,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_by_status_pages_completed_queue_rows() {
-        let queue = queue(MemoryEngine::default());
-
-        for name in ["one", "two", "three"] {
-            queue
-                .publish(QueueEvent::new(
-                    format!("entry:{name}"),
-                    payload(name),
-                    Utc::now().timestamp_millis(),
-                ))
-                .await
-                .unwrap();
-        }
-
-        let jobs = queue.pull::<Payload>(0, None, 10).await.unwrap().events;
-        assert_eq!(jobs.len(), 3);
-        for (storage_key, _) in jobs {
-            queue.ack(&storage_key).await.unwrap();
-        }
-
-        let first = queue
-            .scan_by_status::<Payload>(QueueEventStatus::Completed, None, 2)
-            .await
-            .unwrap();
-        assert_eq!(first.events.len(), 2);
-        assert!(first.next_cursor.is_some());
-
-        let second = queue
-            .scan_by_status::<Payload>(QueueEventStatus::Completed, first.next_cursor, 2)
-            .await
-            .unwrap();
-        assert_eq!(second.events.len(), 1);
-        assert!(second.next_cursor.is_none());
-        assert!(second
-            .events
-            .iter()
-            .all(|(_, event)| event.status == QueueEventStatus::Completed));
-    }
-
-    #[tokio::test]
     async fn scan_by_status_pages_pending_queue_rows() {
-        let queue = queue(MemoryEngine::default());
+        let queue = test_queue().await;
 
         for name in ["one", "two", "three"] {
             queue
@@ -1313,101 +1105,49 @@ mod tests {
                 .unwrap();
         }
 
-        let first = queue
-            .scan_by_status::<Payload>(QueueEventStatus::Pending, None, 2)
-            .await
-            .unwrap();
+        let first = queue.scan_by_status::<Payload>(None, 2).await.unwrap();
         assert_eq!(first.events.len(), 2);
         assert!(first.next_cursor.is_some());
 
         let second = queue
-            .scan_by_status::<Payload>(QueueEventStatus::Pending, first.next_cursor, 2)
+            .scan_by_status::<Payload>(first.next_cursor, 2)
             .await
             .unwrap();
         assert_eq!(second.events.len(), 1);
         assert!(second.next_cursor.is_none());
-        assert!(second
-            .events
-            .iter()
-            .all(|(_, event)| event.status == QueueEventStatus::Pending));
     }
 
     #[tokio::test]
     async fn scan_by_status_surfaces_and_preserves_malformed_rows() {
-        let engine = MemoryEngine::default();
-        let queue = queue(engine.clone());
-        let orphan_key = "queue:completed:00000000000000000009:orphan";
-        let valid_key = queue.completed_key(10, 1, "valid");
-        put_event(
-            &engine,
-            &valid_key,
-            event(
-                "valid",
-                "entry:valid",
-                QueueEventStatus::Completed,
-                1,
-                Some(10),
-            ),
-        )
-        .await;
-        engine.put_raw(orphan_key, b"not-json".to_vec()).await;
-
-        let error = queue
-            .scan_by_status::<Payload>(QueueEventStatus::Completed, None, 10)
-            .await
-            .unwrap_err();
-
-        assert!(matches!(error, TitoError::DeserializationFailed(_)));
-        assert!(engine.contains_key(orphan_key).await);
-        assert!(engine.contains_key(&valid_key).await);
-    }
-
-    #[tokio::test]
-    async fn delete_by_status_before_removes_only_terminal_rows_at_or_before_cutoff() {
-        let engine = MemoryEngine::default();
-        let queue = queue(engine.clone());
-        let old_key = queue.completed_key(10, 1, "old");
-        let fresh_key = queue.completed_key(20, 1, "fresh");
-
-        put_event(
-            &engine,
-            &old_key,
-            event("old", "entry:old", QueueEventStatus::Completed, 1, Some(10)),
-        )
-        .await;
-        put_event(
-            &engine,
-            &fresh_key,
-            event(
-                "fresh",
-                "entry:fresh",
-                QueueEventStatus::Completed,
-                1,
-                Some(20),
-            ),
-        )
-        .await;
-
-        let deleted = queue
-            .delete_by_status_before(QueueEventStatus::Completed, 10, 10)
+        let queue = test_queue().await;
+        queue
+            .publish(QueueEvent::new("entry:valid", payload("valid"), 1))
             .await
             .unwrap();
-
-        assert_eq!(deleted, 1);
-        assert!(!engine.contains_key(&old_key).await);
-        assert!(engine.contains_key(&fresh_key).await);
-
-        let error = queue
-            .delete_by_status_before(QueueEventStatus::Pending, 10, 10)
+        let valid_key = queue
+            .scan_by_status::<Payload>(None, 10)
             .await
-            .unwrap_err();
-        assert!(matches!(error, TitoError::InvalidInput(_)));
+            .unwrap()
+            .events[0]
+            .0
+            .clone();
+        let orphan_key = queue.pending_key(0, 9, 0, "orphan");
+        put_raw(&queue.engine, &orphan_key, b"not-json".to_vec()).await;
+
+        let error = queue.scan_by_status::<Payload>(None, 10).await.unwrap_err();
+
+        assert!(matches!(error, TitoError::DeserializationFailed(_)));
+        assert_eq!(
+            get_raw(&queue.engine, &orphan_key).await,
+            Some(b"not-json".to_vec())
+        );
+        assert!(get_raw(&queue.engine, &valid_key).await.is_some());
     }
 
     #[tokio::test]
     async fn delete_matching_in_tx_is_bounded_selective_and_owner_aware() {
-        let engine = MemoryEngine::default();
-        let queue = queue(engine.clone());
+        let queue = test_queue().await;
+        let engine = queue.engine.clone();
         let now = Utc::now().timestamp_millis();
         let target = QueueOwner::new("store", "target").unwrap();
         let foreign = QueueOwner::new("store", "foreign").unwrap();
@@ -1442,13 +1182,9 @@ mod tests {
                     let queue = queue_for_tx.clone();
                     async move {
                         queue
-                            .delete_matching_in_tx::<Payload, _>(
-                                QueueEventStatus::Pending,
-                                cursor,
-                                2,
-                                &tx,
-                                |event| Ok(event.owner.as_ref() == Some(&target)),
-                            )
+                            .delete_matching_in_tx::<Payload, _>(cursor, 2, &tx, |event| {
+                                Ok(event.owner.as_ref() == Some(&target))
+                            })
                             .await
                     }
                 })
@@ -1460,21 +1196,22 @@ mod tests {
         }
 
         assert_eq!(deleted.len(), 3);
-        let remaining = queue
-            .scan_by_status::<Payload>(QueueEventStatus::Pending, None, 10)
-            .await
-            .unwrap();
+        let remaining = queue.scan_by_status::<Payload>(None, 10).await.unwrap();
         assert_eq!(remaining.events.len(), 2);
         assert!(remaining
             .events
             .iter()
             .all(|(_, event)| event.owner.as_ref() == Some(&foreign)));
+        assert!(
+            keys_with_prefix(&engine, &queue.owner_prefix(&target).unwrap())
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn owner_reader_pages_only_its_index_and_preserves_queue_transitions() {
-        let engine = MemoryEngine::default();
-        let queue = queue(engine.clone());
+        let queue = test_queue().await;
         let owner = QueueOwner::new("store", "a:with/slashes").unwrap();
         let foreign = QueueOwner::new("store", "a:with/slashes/other").unwrap();
         for i in 0..35 {
@@ -1493,21 +1230,23 @@ mod tests {
             .await
             .unwrap();
         let foreign_key = queue
-            .scan_by_owner::<Payload>(&foreign, QueueEventStatus::Pending, None, 1)
+            .scan_by_owner::<Payload>(&foreign, None, 1)
             .await
             .unwrap()
             .events[0]
             .0
             .clone();
-        engine
-            .put_raw(&foreign_key, b"invalid unrelated payload".to_vec())
-            .await;
-        engine.start_recording_reads().await;
+        put_raw(
+            &queue.engine,
+            &foreign_key,
+            b"invalid unrelated payload".to_vec(),
+        )
+        .await;
         let mut cursor = None;
         let mut rows = Vec::new();
         loop {
             let page = queue
-                .scan_by_owner::<Payload>(&owner, QueueEventStatus::Pending, cursor.clone(), 17)
+                .scan_by_owner::<Payload>(&owner, cursor.clone(), 17)
                 .await
                 .unwrap();
             assert!(page.events.len() <= 17);
@@ -1524,29 +1263,17 @@ mod tests {
         assert_eq!(
             rows.iter()
                 .map(|(_, event)| &event.id)
-                .collect::<std::collections::HashSet<_>>()
+                .collect::<HashSet<_>>()
                 .len(),
             35
         );
-        let prefix = queue
-            .owner_status_prefix(&owner, QueueEventStatus::Pending)
-            .unwrap();
-        let reads = engine.take_recorded_reads().await;
-        assert!(reads
-            .iter()
-            .filter_map(|read| read.strip_prefix(b"scan:"))
-            .all(|start| start.starts_with(prefix.as_bytes())));
-        assert!(!reads
-            .iter()
-            .any(|read| read.ends_with(foreign_key.as_bytes())));
-        assert_eq!(engine.pending_queue_scan_count(), 0);
         queue.ack(&rows[0].0).await.unwrap();
         queue
             .reschedule(&rows[1].0, rows[1].1.rescheduled(60_000))
             .await
             .unwrap();
         let pending = queue
-            .scan_by_owner::<Payload>(&owner, QueueEventStatus::Pending, None, 100)
+            .scan_by_owner::<Payload>(&owner, None, 100)
             .await
             .unwrap();
         assert_eq!(pending.events.len(), 34);
@@ -1554,43 +1281,34 @@ mod tests {
             .events
             .iter()
             .any(|(_, event)| event.id == rows[1].1.id && event.timestamp == 60_000));
-        let completed = queue
-            .scan_by_owner::<Payload>(&owner, QueueEventStatus::Completed, None, 100)
+        for (storage_key, _) in &rows[..2] {
+            assert!(get_raw(&queue.engine, storage_key).await.is_none());
+            assert!(get_raw(
+                &queue.engine,
+                &queue
+                    .owner_index_key(&owner, storage_key.as_bytes())
+                    .unwrap()
+            )
             .await
-            .unwrap();
-        assert_eq!(completed.events.len(), 2);
-        assert!(completed
-            .events
-            .iter()
-            .all(|(_, event)| event.owner.as_ref() == Some(&owner)));
+            .is_none());
+        }
     }
 
     #[tokio::test]
     async fn owner_reader_rejects_foreign_cursor_and_corrupt_index_without_writes() {
-        let engine = MemoryEngine::default();
-        let queue = queue(engine.clone());
+        let queue = test_queue().await;
         let owner = QueueOwner::new("store", "target").unwrap();
         let foreign = QueueOwner::new("store", "foreign").unwrap();
-        for wrong_prefix in [
+        assert!(matches!(
             queue
-                .owner_status_prefix(&foreign, QueueEventStatus::Pending)
-                .unwrap(),
-            queue
-                .owner_status_prefix(&owner, QueueEventStatus::Completed)
-                .unwrap(),
-        ] {
-            assert!(matches!(
-                queue
-                    .scan_by_owner::<Payload>(
-                        &owner,
-                        QueueEventStatus::Pending,
-                        Some(wrong_prefix.into_bytes()),
-                        10
-                    )
-                    .await,
-                Err(TitoError::InvalidInput(_))
-            ));
-        }
+                .scan_by_owner::<Payload>(
+                    &owner,
+                    Some(queue.owner_prefix(&foreign).unwrap().into_bytes()),
+                    10
+                )
+                .await,
+            Err(TitoError::InvalidInput(_))
+        ));
         queue
             .publish(
                 QueueEvent::new("entry:target", payload("target"), 0).with_owner(owner.clone()),
@@ -1598,7 +1316,7 @@ mod tests {
             .await
             .unwrap();
         let row = queue
-            .scan_by_owner::<Payload>(&owner, QueueEventStatus::Pending, None, 10)
+            .scan_by_owner::<Payload>(&owner, None, 10)
             .await
             .unwrap()
             .events
@@ -1607,38 +1325,28 @@ mod tests {
         let mut mismatched = row.1;
         mismatched.owner = Some(foreign);
         let bytes = serde_json::to_vec(&mismatched).unwrap();
-        engine.put_raw(&row.0, bytes.clone()).await;
+        put_raw(&queue.engine, &row.0, bytes.clone()).await;
         assert!(matches!(
-            queue
-                .scan_by_owner::<Payload>(&owner, QueueEventStatus::Pending, None, 10)
-                .await,
+            queue.scan_by_owner::<Payload>(&owner, None, 10).await,
             Err(TitoError::DeserializationFailed(_))
         ));
-        assert_eq!(engine.raw_bytes(&row.0).await, Some(bytes));
-        for missing_key in ["queue:completed:missing", "queue:pending:missing"] {
-            let isolated_engine = MemoryEngine::default();
-            let isolated_queue = Queue::new(
-                isolated_engine.clone(),
-                QueueConfig::new(1, Duration::from_secs(3 * 24 * 60 * 60)),
-            );
-            let dangling_index = queue
-                .owner_index_key(&owner, QueueEventStatus::Completed, missing_key.as_bytes())
-                .unwrap();
-            isolated_engine.put_raw(&dangling_index, vec![]).await;
-            assert!(matches!(
-                isolated_queue
-                    .scan_by_owner::<Payload>(&owner, QueueEventStatus::Completed, None, 10)
-                    .await,
-                Err(TitoError::DeserializationFailed(_))
-            ));
-            assert!(isolated_engine.contains_key(&dangling_index).await);
-        }
+        assert_eq!(get_raw(&queue.engine, &row.0).await, Some(bytes));
+
+        let isolated = test_queue().await;
+        let dangling_index = isolated
+            .owner_index_key(&owner, isolated.pending_key(0, 0, 0, "missing").as_bytes())
+            .unwrap();
+        put_raw(&isolated.engine, &dangling_index, Vec::new()).await;
+        assert!(matches!(
+            isolated.scan_by_owner::<Payload>(&owner, None, 10).await,
+            Err(TitoError::DeserializationFailed(_))
+        ));
+        assert!(get_raw(&isolated.engine, &dangling_index).await.is_some());
     }
 
     #[tokio::test]
-    async fn owner_reader_reads_the_events_of_a_page_in_one_batch_after_its_scan() {
-        let engine = MemoryEngine::default();
-        let queue = queue(engine.clone());
+    async fn owner_reader_returns_every_event_its_index_names() {
+        let queue = test_queue().await;
         let owner = QueueOwner::new("store", "target").unwrap();
         for i in 0..3 {
             queue
@@ -1650,17 +1358,15 @@ mod tests {
                 .unwrap();
         }
 
-        let before = engine.read_round_trips();
         let page = queue
-            .scan_by_owner::<Payload>(&owner, QueueEventStatus::Pending, None, 10)
+            .scan_by_owner::<Payload>(&owner, None, 10)
             .await
             .unwrap();
-        assert_eq!(engine.read_round_trips() - before, 2);
         assert_eq!(
             page.events
                 .iter()
                 .map(|(_, event)| event.payload.name.clone())
-                .collect::<std::collections::HashSet<_>>()
+                .collect::<HashSet<_>>()
                 .len(),
             3
         );
@@ -1668,39 +1374,33 @@ mod tests {
 
     #[tokio::test]
     async fn owner_reader_reports_the_first_corrupt_entry_in_index_order() {
-        let engine = MemoryEngine::default();
-        let queue = queue(engine.clone());
+        let queue = test_queue().await;
         let owner = QueueOwner::new("store", "target").unwrap();
         let missing = queue
-            .owner_index_key(
-                &owner,
-                QueueEventStatus::Completed,
-                b"queue:completed:missing",
-            )
+            .owner_index_key(&owner, queue.pending_key(0, 0, 0, "missing").as_bytes())
             .unwrap();
         let outside = queue
             .owner_index_key(
                 &owner,
-                QueueEventStatus::Completed,
-                b"queue:pending:outside",
+                format!("{}:other:outside", queue.config.name()).as_bytes(),
             )
             .unwrap();
-        engine.put_raw(&missing, vec![]).await;
-        engine.put_raw(&outside, vec![]).await;
+        put_raw(&queue.engine, &missing, Vec::new()).await;
+        put_raw(&queue.engine, &outside, Vec::new()).await;
         let first = if missing < outside {
             "Queue owner index points to a missing event"
         } else {
-            "Queue owner index points outside its status"
+            "Queue owner index points outside its queue"
         };
 
         assert_eq!(
             queue
-                .scan_by_owner::<Payload>(&owner, QueueEventStatus::Completed, None, 10)
+                .scan_by_owner::<Payload>(&owner, None, 10)
                 .await
                 .unwrap_err(),
             TitoError::DeserializationFailed(first.to_string())
         );
-        assert!(engine.contains_key(&missing).await);
-        assert!(engine.contains_key(&outside).await);
+        assert!(get_raw(&queue.engine, &missing).await.is_some());
+        assert!(get_raw(&queue.engine, &outside).await.is_some());
     }
 }

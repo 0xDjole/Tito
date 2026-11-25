@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use tito::backend::tikv::{TiKV, TiKVBackend};
 use tito::types::TitoModelConstraints;
-use tito::{TitoEngine, TitoError, TitoModel};
+use tito::{Guard, TitoEngine, TitoError, TitoModel};
 
 pub fn native_endpoint() -> (String, String) {
     let endpoint = std::env::var("TITO_NATIVE_PD_URI").expect(
@@ -34,17 +34,28 @@ pub async fn native_engine(endpoint: String) -> TiKVBackend {
         .expect("Connect to the declared test-owned native PD and TiKV")
 }
 
-pub async fn save<T: TitoModelConstraints>(
+pub async fn create<T: TitoModelConstraints>(
     engine: &TiKVBackend,
     model: &TitoModel<TiKVBackend, T>,
-    value: T,
-) -> Result<T, TitoError> {
+    record: &T,
+) -> Result<(), TitoError> {
     engine
         .transaction(|tx| {
             let model = model.clone();
-            let value = value.clone();
-            async move { model.set(value).timestamps(false).execute(&tx).await }
+            let record = record.clone();
+            async move { model.create(&record, &tx).await }
         })
+        .await
+}
+
+pub async fn read<T: TitoModelConstraints>(
+    engine: &TiKVBackend,
+    model: &TitoModel<TiKVBackend, T>,
+    id: &str,
+) -> Result<Option<T>, TitoError> {
+    let note = model.read_maybe(id, Guard::None);
+    engine
+        .transaction(|tx| async move { tx.batch_get(note).await })
         .await
 }
 
@@ -52,12 +63,16 @@ pub async fn remove<T: TitoModelConstraints>(
     engine: &TiKVBackend,
     model: &TitoModel<TiKVBackend, T>,
     id: &str,
-) -> Result<bool, TitoError> {
+) -> Result<(), TitoError> {
+    let note = model.read(id, Guard::None);
     engine
         .transaction(|tx| {
             let model = model.clone();
-            let id = id.to_string();
-            async move { model.remove(&id, &tx).await }
+            let note = note.clone();
+            async move {
+                let record = tx.batch_get(note).await?;
+                model.remove(&record, &tx).await
+            }
         })
         .await
 }

@@ -1,19 +1,24 @@
 mod native;
 
-use native::{native_endpoint, native_engine, remove, save};
+use native::{create, native_endpoint, native_engine, read, remove};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tito::backend::tikv::{TiKVBackend, TiKVTransaction};
-use tito::types::{
-    TitoFindByIndexPayload, TitoFindOneByIndexPayload, TitoIndexConfig, TitoIndexField,
-    TitoIndexFieldType, TitoRecordVersion, TitoScanPayload, TitoTransaction,
+use tito::types::TitoTransaction;
+use tito::{
+    Guard, TitoEngine, TitoError, TitoIndex, TitoIndexField, TitoIndexValue, TitoModel,
+    TitoModelTrait,
 };
-use tito::{TitoEngine, TitoError, TitoGuard, TitoModel, TitoModelOptions, TitoModelTrait};
 use uuid::Uuid;
 
-#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+const BY_SCOPE: &str = "native-fence-record-by-scope";
+const BY_VALUE: &str = "native-fence-record-value";
+const HOLDER_BY_RECORD: &str = "native-fence-holder-by-record";
+const CLAIM_VALUE: &str = "native-fence-claim-value";
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct NativeRecord {
     id: String,
     scope: String,
@@ -22,36 +27,28 @@ struct NativeRecord {
 }
 
 impl TitoModelTrait for NativeRecord {
-    fn indexes(&self) -> Vec<TitoIndexConfig> {
-        vec![TitoIndexConfig {
-            condition: true,
-            name: "native-guard-record-by-scope".into(),
-            fields: vec![TitoIndexField {
-                name: "scope".into(),
-                r#type: TitoIndexFieldType::String,
-            }],
-        }]
-    }
-
-    fn unique_indexes(&self) -> Vec<TitoIndexConfig> {
-        vec![TitoIndexConfig {
-            condition: true,
-            name: "native-guard-record-value".into(),
-            fields: vec![
-                TitoIndexField {
-                    name: "scope".into(),
-                    r#type: TitoIndexFieldType::String,
-                },
-                TitoIndexField {
-                    name: "value".into(),
-                    r#type: TitoIndexFieldType::String,
-                },
-            ],
-        }]
+    fn indexes(&self) -> Vec<TitoIndex> {
+        vec![
+            TitoIndex {
+                name: BY_SCOPE,
+                fields: vec![TitoIndexField::Text(self.scope.clone())],
+                value: TitoIndexValue::Full,
+                unique: false,
+            },
+            TitoIndex {
+                name: BY_VALUE,
+                fields: vec![
+                    TitoIndexField::Text(self.scope.clone()),
+                    TitoIndexField::Text(self.value.clone()),
+                ],
+                value: TitoIndexValue::Full,
+                unique: true,
+            },
+        ]
     }
 
     fn table() -> String {
-        "native-guard-records".into()
+        "native-fence-records".into()
     }
 
     fn id(&self) -> String {
@@ -59,26 +56,24 @@ impl TitoModelTrait for NativeRecord {
     }
 }
 
-#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct NativeHolder {
     id: String,
     record_id: String,
 }
 
 impl TitoModelTrait for NativeHolder {
-    fn indexes(&self) -> Vec<TitoIndexConfig> {
-        vec![TitoIndexConfig {
-            condition: true,
-            name: "native-guard-holder-by-record".into(),
-            fields: vec![TitoIndexField {
-                name: "record_id".into(),
-                r#type: TitoIndexFieldType::String,
-            }],
+    fn indexes(&self) -> Vec<TitoIndex> {
+        vec![TitoIndex {
+            name: HOLDER_BY_RECORD,
+            fields: vec![TitoIndexField::Text(self.record_id.clone())],
+            value: TitoIndexValue::KeysOnly,
+            unique: false,
         }]
     }
 
     fn table() -> String {
-        "native-guard-holders".into()
+        "native-fence-holders".into()
     }
 
     fn id(&self) -> String {
@@ -86,7 +81,7 @@ impl TitoModelTrait for NativeHolder {
     }
 }
 
-#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct NativeClaim {
     id: String,
     scope: String,
@@ -94,24 +89,15 @@ struct NativeClaim {
 }
 
 impl TitoModelTrait for NativeClaim {
-    fn indexes(&self) -> Vec<TitoIndexConfig> {
-        Vec::new()
-    }
-
-    fn unique_indexes(&self) -> Vec<TitoIndexConfig> {
-        vec![TitoIndexConfig {
-            condition: true,
-            name: "native-claim-value".into(),
+    fn indexes(&self) -> Vec<TitoIndex> {
+        vec![TitoIndex {
+            name: CLAIM_VALUE,
             fields: vec![
-                TitoIndexField {
-                    name: "scope".into(),
-                    r#type: TitoIndexFieldType::String,
-                },
-                TitoIndexField {
-                    name: "value".into(),
-                    r#type: TitoIndexFieldType::String,
-                },
+                TitoIndexField::Text(self.scope.clone()),
+                TitoIndexField::Text(self.value.clone()),
             ],
+            value: TitoIndexValue::Full,
+            unique: true,
         }]
     }
 
@@ -144,21 +130,68 @@ fn with_name(record: &NativeRecord, name: &str) -> NativeRecord {
     }
 }
 
-fn by_value(record: &NativeRecord) -> TitoFindOneByIndexPayload {
-    TitoFindOneByIndexPayload {
-        index: "native-guard-record-value".into(),
-        values: vec![record.scope.clone(), record.value.clone()],
-    }
+fn value_of(record: &NativeRecord) -> Vec<TitoIndexField> {
+    vec![
+        TitoIndexField::Text(record.scope.clone()),
+        TitoIndexField::Text(record.value.clone()),
+    ]
+}
+
+fn claim_value(scope: &str, value: &str) -> Vec<TitoIndexField> {
+    vec![
+        TitoIndexField::Text(scope.to_string()),
+        TitoIndexField::Text(value.to_string()),
+    ]
 }
 
 fn records_of(engine: &TiKVBackend) -> TitoModel<TiKVBackend, NativeRecord> {
+    engine.clone().model::<NativeRecord>()
+}
+
+async fn created(
+    engine: &TiKVBackend,
+    records: &TitoModel<TiKVBackend, NativeRecord>,
+    record: NativeRecord,
+) -> NativeRecord {
+    create(engine, records, &record).await.unwrap();
+    record
+}
+
+async fn rename(
+    engine: &TiKVBackend,
+    records: &TitoModel<TiKVBackend, NativeRecord>,
+    id: &str,
+    name: &str,
+) -> Result<NativeRecord, TitoError> {
+    let note = records.read(id, Guard::None);
     engine
-        .clone()
-        .model::<NativeRecord>(TitoModelOptions::default())
+        .transaction(|tx| {
+            let records = records.clone();
+            let note = note.clone();
+            async move {
+                let old = tx.batch_get(note).await?;
+                let new = with_name(&old, name);
+                records.update(&old, &new, &tx).await?;
+                Ok::<_, TitoError>(new)
+            }
+        })
+        .await
+}
+
+async fn unique_claim(
+    engine: &TiKVBackend,
+    claims: &TitoModel<TiKVBackend, NativeClaim>,
+    scope: &str,
+    value: &str,
+) -> Result<NativeClaim, TitoError> {
+    let note = claims.read_unique(CLAIM_VALUE, claim_value(scope, value), Guard::None);
+    engine
+        .transaction(|tx| async move { tx.batch_get(note).await })
+        .await
 }
 
 async fn write_scratch(tx: &TiKVTransaction, run_id: &str) {
-    tx.delete(format!("native-guard-scratch:{}", record_id(run_id)))
+    tx.delete(format!("native-fence-scratch:{}", record_id(run_id)))
         .await
         .unwrap();
 }
@@ -177,104 +210,65 @@ async fn committed(tx: TiKVTransaction) -> bool {
 
 #[derive(Clone, Copy, Debug)]
 enum NativeRead {
-    GetForShare,
-    GetManyForShare,
-    GetVersionedForShare,
-    UniqueHitForShare,
-    GetForUpdate,
+    ById,
+    MaybeById,
+    Many,
+    Unique,
+    MaybeUnique,
 }
 
-async fn read_by_id(
-    records: &TitoModel<TiKVBackend, NativeRecord>,
-    read: NativeRead,
-    record: &NativeRecord,
-    tx: &TiKVTransaction,
-) -> Option<TitoRecordVersion> {
-    match read {
-        NativeRead::GetForShare => {
-            assert_eq!(
-                records.get_for_share(&record.id, Some(tx)).await.unwrap(),
-                *record
-            );
-            None
-        }
-        NativeRead::GetManyForShare => {
-            assert_eq!(
-                records
-                    .get_many_for_share(vec![record.id.clone()], Some(tx))
-                    .await
-                    .unwrap(),
-                vec![record.clone()]
-            );
-            None
-        }
-        NativeRead::GetVersionedForShare => {
-            let versioned = records
-                .get_versioned_for_share(&record.id, Some(tx))
-                .await
-                .unwrap();
-            assert_eq!(versioned.value, *record);
-            Some(versioned.version)
-        }
-        NativeRead::UniqueHitForShare => {
-            assert_eq!(
-                records
-                    .find_one_by_unique_index_for_share(by_value(record), Some(tx))
-                    .await
-                    .unwrap(),
-                *record
-            );
-            None
-        }
-        NativeRead::GetForUpdate => {
-            assert_eq!(
-                records.get_for_update(&record.id, tx).await.unwrap(),
-                *record
-            );
-            None
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum NativePlainRead {
-    Get,
-    GetMany,
-    UniqueHit,
-}
-
-const NATIVE_PLAIN_READS: [NativePlainRead; 3] = [
-    NativePlainRead::Get,
-    NativePlainRead::GetMany,
-    NativePlainRead::UniqueHit,
+const NATIVE_READS: [NativeRead; 5] = [
+    NativeRead::ById,
+    NativeRead::MaybeById,
+    NativeRead::Many,
+    NativeRead::Unique,
+    NativeRead::MaybeUnique,
 ];
 
-async fn read_plainly(
+async fn read_with(
     records: &TitoModel<TiKVBackend, NativeRecord>,
-    read: NativePlainRead,
+    form: NativeRead,
+    guard: Guard,
     record: &NativeRecord,
     tx: &TiKVTransaction,
 ) {
-    match read {
-        NativePlainRead::Get => {
-            assert_eq!(records.get(&record.id, Some(tx)).await.unwrap(), *record);
-        }
-        NativePlainRead::GetMany => {
+    match form {
+        NativeRead::ById => {
             assert_eq!(
-                records
-                    .get_many(vec![record.id.clone()], Some(tx))
+                tx.batch_get(records.read(&record.id, guard)).await.unwrap(),
+                *record
+            );
+        }
+        NativeRead::MaybeById => {
+            assert_eq!(
+                tx.batch_get(records.read_maybe(&record.id, guard))
+                    .await
+                    .unwrap(),
+                Some(record.clone())
+            );
+        }
+        NativeRead::Many => {
+            assert_eq!(
+                tx.batch_get(records.read_many(vec![record.id.clone()], guard))
                     .await
                     .unwrap(),
                 vec![record.clone()]
             );
         }
-        NativePlainRead::UniqueHit => {
+        NativeRead::Unique => {
             assert_eq!(
-                records
-                    .find_one_by_unique_index(by_value(record), Some(tx))
+                tx.batch_get(records.read_unique(BY_VALUE, value_of(record), guard))
                     .await
                     .unwrap(),
                 *record
+            );
+        }
+        NativeRead::MaybeUnique => {
+            assert_eq!(
+                tx.batch_get(records.read_unique_maybe(BY_VALUE, value_of(record), guard))
+                    .await
+                    .unwrap(),
+                Some(record.clone())
             );
         }
     }
@@ -282,7 +276,7 @@ async fn read_plainly(
 
 #[derive(Clone, Copy, Debug)]
 enum NativeWriter {
-    Rename,
+    Update,
     Remove,
 }
 
@@ -292,17 +286,19 @@ async fn stage_writer(
     record: &NativeRecord,
     tx: &TiKVTransaction,
 ) {
+    let old = tx
+        .batch_get(records.read(&record.id, Guard::None))
+        .await
+        .unwrap();
     match writer {
-        NativeWriter::Rename => {
+        NativeWriter::Update => {
             records
-                .set(with_name(record, "renamed by a writer"))
-                .timestamps(false)
-                .execute(tx)
+                .update(&old, &with_name(&old, "updated by a writer"), tx)
                 .await
                 .unwrap();
         }
         NativeWriter::Remove => {
-            assert!(records.remove(&record.id, tx).await.unwrap());
+            records.remove(&old, tx).await.unwrap();
         }
     }
 }
@@ -313,114 +309,55 @@ async fn delete_unless_held(
     id: &str,
     tx: &TiKVTransaction,
 ) -> Result<Vec<String>, TitoError> {
-    let held = holders
-        .find_by_index(
-            TitoFindByIndexPayload {
-                index: "native-guard-holder-by-record".into(),
-                values: vec![id.to_string()],
-                limit: Some(20),
-                cursor: None,
-            },
-            Some(tx),
-        )
-        .await?
-        .items
-        .into_iter()
-        .map(|holder| holder.id)
-        .collect::<Vec<_>>();
-    if held.is_empty() {
-        records.remove(id, tx).await?;
+    let mut query = holders.query_by_index(HOLDER_BY_RECORD);
+    query
+        .value(TitoIndexField::Text(id.to_string()))
+        .limit(Some(20));
+    let (held, record) = tx
+        .batch_get((query.read_ids(), records.read(id, Guard::None)))
+        .await?;
+    if held.items.is_empty() {
+        records.remove(&record, tx).await?;
     }
-    Ok(held)
+    Ok(held.items)
 }
 
 #[tokio::test]
-async fn native_public_guard_modes_cannot_cancel_a_read_guard() {
-    let (endpoint, run_id) = native_endpoint();
-    let engine = native_engine(endpoint).await;
-    let model = records_of(&engine);
-
-    for guard in [TitoGuard::Shared, TitoGuard::Exclusive] {
-        let record = new_record(&run_id, &record_id(&run_id));
-        save(&engine, &model, record.clone()).await.unwrap();
-        let reader = engine.begin_transaction().await.unwrap();
-        let read = match guard {
-            TitoGuard::Shared => model.get_for_share(&record.id, Some(&reader)).await,
-            TitoGuard::Exclusive => model.get_for_update(&record.id, &reader).await,
-        }
-        .unwrap();
-        assert_eq!(read, record);
-        reader
-            .guard(&NativeRecord::table(), &record.id, guard)
-            .await;
-        reader
-            .guard(&NativeRecord::table(), &record.id, TitoGuard::Shared)
-            .await;
-        write_scratch(&reader, &run_id).await;
-
-        save(&engine, &model, with_name(&record, "changed"))
-            .await
-            .unwrap();
-        assert!(!committed(reader).await);
-        assert_eq!(
-            model.get_for_share(&record.id, None).await.unwrap().name,
-            "changed"
-        );
-        remove(&engine, &model, &record.id).await.unwrap();
-    }
-}
-
-#[tokio::test]
-async fn native_every_read_for_share_or_for_update_in_a_writing_transaction_conflicts_with_a_save_of_its_record(
+async fn native_every_read_for_share_or_for_update_in_a_writing_transaction_conflicts_with_an_update_of_its_record(
 ) {
     let (endpoint, run_id) = native_endpoint();
     tokio::time::timeout(Duration::from_secs(60), async move {
         let engine = native_engine(endpoint).await;
         let records = records_of(&engine);
         let scope = record_id(&run_id);
-        for read in [
-            NativeRead::GetForShare,
-            NativeRead::GetManyForShare,
-            NativeRead::GetVersionedForShare,
-            NativeRead::UniqueHitForShare,
-            NativeRead::GetForUpdate,
-        ] {
-            let record = save(&engine, &records, new_record(&run_id, &scope))
+        for guard in [Guard::Share, Guard::Update] {
+            for form in NATIVE_READS {
+                let record = created(&engine, &records, new_record(&run_id, &scope)).await;
+                let reader = engine.begin_transaction().await.unwrap();
+                read_with(&records, form, guard, &record, &reader).await;
+                write_scratch(&reader, &run_id).await;
+                let renamed = rename(
+                    &engine,
+                    &records,
+                    &record.id,
+                    "renamed by a committed writer",
+                )
                 .await
                 .unwrap();
-            let reader = engine.begin_transaction().await.unwrap();
-            let version = read_by_id(&records, read, &record, &reader).await;
-            write_scratch(&reader, &run_id).await;
-            let renamed = save(
-                &engine,
-                &records,
-                with_name(&record, "renamed by a committed writer"),
-            )
-            .await
-            .unwrap();
-            assert!(
-                !committed(reader).await,
-                "{read:?} in a writing transaction must conflict with a save of its record"
-            );
-            if let Some(version) = version {
-                assert_ne!(
-                    records
-                        .get_versioned_for_share(&record.id, None)
-                        .await
-                        .unwrap()
-                        .version,
-                    version
+                assert!(
+                    !committed(reader).await,
+                    "{form:?} with {guard:?} in a writing transaction must conflict with an update of its record"
                 );
+                assert_eq!(
+                    read(&engine, &records, &record.id).await.unwrap(),
+                    Some(renamed)
+                );
+                remove(&engine, &records, &record.id).await.unwrap();
             }
-            assert_eq!(
-                records.get_for_share(&record.id, None).await.unwrap(),
-                renamed
-            );
-            assert!(remove(&engine, &records, &record.id).await.unwrap());
         }
     })
     .await
-    .expect("The native reads by id must finish within their owned run");
+    .expect("The native guarded reads must finish within their owned run");
 }
 
 #[tokio::test]
@@ -430,96 +367,90 @@ async fn native_index_reads_scans_and_misses_add_no_guard() {
         let engine = native_engine(endpoint).await;
         let records = records_of(&engine);
         let scope = record_id(&run_id);
-        let record = save(&engine, &records, new_record(&run_id, &scope))
-            .await
-            .unwrap();
+        let record = created(&engine, &records, new_record(&run_id, &scope)).await;
 
         let reader = engine.begin_transaction().await.unwrap();
+        let mut query = records.query_by_index(BY_SCOPE);
+        query
+            .value(TitoIndexField::Text(scope.clone()))
+            .limit(Some(10));
         assert_eq!(
-            records
-                .find_by_index(
-                    TitoFindByIndexPayload {
-                        index: "native-guard-record-by-scope".into(),
-                        values: vec![scope.clone()],
-                        limit: Some(10),
-                        cursor: None,
-                    },
-                    Some(&reader),
-                )
-                .await
-                .unwrap()
-                .items,
-            vec![record.clone()]
-        );
-        let mut query = records.query_by_index("native-guard-record-by-scope");
-        query.value(scope.clone());
-        assert_eq!(
-            query.execute_reverse(Some(&reader)).await.unwrap().items,
+            query.execute(Some(&reader)).await.unwrap().items,
             vec![record.clone()]
         );
         assert_eq!(
             query.execute_ids(Some(&reader)).await.unwrap().items,
             vec![record.id.clone()]
         );
-        assert_eq!(
-            records
-                .find_one_by_index(
-                    TitoFindOneByIndexPayload {
-                        index: "native-guard-record-by-scope".into(),
-                        values: vec![scope.clone()],
-                    },
-                    Some(&reader),
-                )
-                .await
-                .unwrap(),
-            record
-        );
-        let (scanned, _) = records
-            .scan(
-                TitoScanPayload {
-                    start: format!("table:native-guard-records:{}", record.id),
-                    end: None,
-                    limit: Some(10),
-                    cursor: None,
-                },
-                &reader,
-            )
+        let (page, ids) = reader
+            .batch_get((query.read(), query.read_ids()))
             .await
             .unwrap();
-        assert_eq!(scanned.len(), 1);
-        assert!(matches!(
-            records
-                .get_for_share(&record_id(&run_id), Some(&reader))
-                .await,
-            Err(TitoError::NotFound(_))
-        ));
-        assert!(matches!(
-            records
-                .find_one_by_unique_index_for_share(
-                    TitoFindOneByIndexPayload {
-                        index: "native-guard-record-value".into(),
-                        values: vec![scope.clone(), "missing".into()],
-                    },
-                    Some(&reader),
-                )
-                .await,
-            Err(TitoError::NotFound(_))
-        ));
+        assert_eq!(page.items, vec![record.clone()]);
+        assert_eq!(ids.items, vec![record.id.clone()]);
+        query.descending();
+        assert_eq!(
+            query.execute(Some(&reader)).await.unwrap().items,
+            vec![record.clone()]
+        );
+        let scanned = records.scan_records(1_000, None, &reader).await.unwrap();
+        assert!(scanned.items.contains(&record));
+        let missing = record_id(&run_id);
+        for guard in [Guard::Share, Guard::Update] {
+            assert_eq!(
+                reader
+                    .batch_get(records.read_maybe(&missing, guard))
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert!(matches!(
+                reader.batch_get(records.read(&missing, guard)).await,
+                Err(TitoError::NotFound(_))
+            ));
+            assert_eq!(
+                reader
+                    .batch_get(records.read_many(vec![missing.clone()], guard))
+                    .await
+                    .unwrap(),
+                Vec::new()
+            );
+            assert_eq!(
+                reader
+                    .batch_get(records.read_unique_maybe(
+                        BY_VALUE,
+                        claim_value(&scope, "missing"),
+                        guard
+                    ))
+                    .await
+                    .unwrap(),
+                None
+            );
+        }
+        let late = NativeRecord {
+            id: missing.clone(),
+            scope: scope.clone(),
+            value: "missing".into(),
+            name: "created after the misses".into(),
+        };
+        create(&engine, &records, &late).await.unwrap();
         write_scratch(&reader, &run_id).await;
-        let renamed = save(
+        let renamed = rename(
             &engine,
             &records,
-            with_name(&record, "renamed by a committed writer"),
+            &record.id,
+            "renamed by a committed writer",
         )
         .await
         .unwrap();
         assert!(committed(reader).await);
 
         assert_eq!(
-            records.get_for_share(&record.id, None).await.unwrap(),
-            renamed
+            read(&engine, &records, &record.id).await.unwrap(),
+            Some(renamed)
         );
-        assert!(remove(&engine, &records, &record.id).await.unwrap());
+        remove(&engine, &records, &record.id).await.unwrap();
+        remove(&engine, &records, &late.id).await.unwrap();
     })
     .await
     .expect("The native index reads, scans and misses must finish within their owned run");
@@ -536,9 +467,8 @@ async fn native_two_transactions_reading_the_same_twenty_records_conflict_about_
         let mut ids = Vec::new();
         for _ in 0..20 {
             ids.push(
-                save(&engine, &records, new_record(&run_id, &scope))
+                created(&engine, &records, new_record(&run_id, &scope))
                     .await
-                    .unwrap()
                     .id,
             );
         }
@@ -549,8 +479,7 @@ async fn native_two_transactions_reading_the_same_twenty_records_conflict_about_
             let second = engine.begin_transaction().await.unwrap();
             for tx in [&first, &second] {
                 assert_eq!(
-                    records
-                        .get_many_for_share(ids.clone(), Some(tx))
+                    tx.batch_get(records.read_many(ids.clone(), Guard::Share))
                         .await
                         .unwrap()
                         .len(),
@@ -569,7 +498,7 @@ async fn native_two_transactions_reading_the_same_twenty_records_conflict_about_
         );
 
         for id in &ids {
-            assert!(remove(&engine, &records, id).await.unwrap());
+            remove(&engine, &records, id).await.unwrap();
         }
     })
     .await
@@ -583,16 +512,16 @@ async fn native_two_reads_for_update_of_one_record_always_conflict_and_the_retry
         let engine = native_engine(endpoint).await;
         let records = records_of(&engine);
         let scope = record_id(&run_id);
-        let record = save(&engine, &records, new_record(&run_id, &scope))
-            .await
-            .unwrap();
+        let record = created(&engine, &records, new_record(&run_id, &scope)).await;
 
         for _ in 0..16 {
             let first = engine.begin_transaction().await.unwrap();
             let second = engine.begin_transaction().await.unwrap();
             for tx in [&first, &second] {
                 assert_eq!(
-                    records.get_for_update(&record.id, tx).await.unwrap(),
+                    tx.batch_get(records.read(&record.id, Guard::Update))
+                        .await
+                        .unwrap(),
                     record
                 );
                 write_scratch(tx, &run_id).await;
@@ -601,21 +530,21 @@ async fn native_two_reads_for_update_of_one_record_always_conflict_and_the_retry
             assert!(!committed(second).await);
         }
 
-        let read = engine
+        let note = records.read(&record.id, Guard::Update);
+        let found = engine
             .transaction(|tx| {
-                let records = records.clone();
-                let id = record.id.clone();
+                let note = note.clone();
                 let run_id = run_id.clone();
                 async move {
-                    let read = records.get_for_update(&id, &tx).await?;
+                    let found = tx.batch_get(note).await?;
                     write_scratch(&tx, &run_id).await;
-                    Ok::<_, TitoError>(read)
+                    Ok::<_, TitoError>(found)
                 }
             })
             .await
             .unwrap();
-        assert_eq!(read, record);
-        assert!(remove(&engine, &records, &record.id).await.unwrap());
+        assert_eq!(found, record);
+        remove(&engine, &records, &record.id).await.unwrap();
     })
     .await
     .expect("The native exclusive read pairs must finish within their owned run");
@@ -629,27 +558,20 @@ async fn native_a_read_for_share_and_a_read_for_update_of_one_record_commit_toge
         let engine = native_engine(endpoint).await;
         let records = records_of(&engine);
         let scope = record_id(&run_id);
-        let record = save(&engine, &records, new_record(&run_id, &scope))
-            .await
-            .unwrap();
+        let record = created(&engine, &records, new_record(&run_id, &scope)).await;
 
         for pair in 0..16 {
             let shared = engine.begin_transaction().await.unwrap();
             let exclusive = engine.begin_transaction().await.unwrap();
-            assert_eq!(
-                records
-                    .get_for_share(&record.id, Some(&shared))
-                    .await
-                    .unwrap(),
-                record
-            );
-            assert_eq!(
-                records
-                    .get_for_update(&record.id, &exclusive)
-                    .await
-                    .unwrap(),
-                record
-            );
+            read_with(&records, NativeRead::ById, Guard::Share, &record, &shared).await;
+            read_with(
+                &records,
+                NativeRead::ById,
+                Guard::Update,
+                &record,
+                &exclusive,
+            )
+            .await;
             write_scratch(&shared, &run_id).await;
             write_scratch(&exclusive, &run_id).await;
             if pair < 8 {
@@ -661,7 +583,7 @@ async fn native_a_read_for_share_and_a_read_for_update_of_one_record_commit_toge
             }
         }
 
-        assert!(remove(&engine, &records, &record.id).await.unwrap());
+        remove(&engine, &records, &record.id).await.unwrap();
     })
     .await
     .expect("The native shared and exclusive read pairs must finish within their owned run");
@@ -674,64 +596,59 @@ async fn native_writers_that_read_one_record_unguarded_never_conflict() {
         let engine = native_engine(endpoint).await;
         let records = records_of(&engine);
         let scope = record_id(&run_id);
-        let record = save(&engine, &records, new_record(&run_id, &scope))
-            .await
-            .unwrap();
+        let record = created(&engine, &records, new_record(&run_id, &scope)).await;
 
         for round in 0..128 {
-            let read = NATIVE_PLAIN_READS[round % NATIVE_PLAIN_READS.len()];
+            let form = NATIVE_READS[round % NATIVE_READS.len()];
             let first = engine.begin_transaction().await.unwrap();
             let second = engine.begin_transaction().await.unwrap();
             for tx in [&first, &second] {
-                read_plainly(&records, read, &record, tx).await;
+                read_with(&records, form, Guard::None, &record, tx).await;
                 write_scratch(tx, &run_id).await;
             }
             assert!(committed(first).await);
             assert!(
                 committed(second).await,
-                "Two writers that read one record with {read:?} must never conflict"
+                "Two writers that read one record with {form:?} and no guard must never conflict"
             );
         }
 
-        assert!(remove(&engine, &records, &record.id).await.unwrap());
+        remove(&engine, &records, &record.id).await.unwrap();
     })
     .await
     .expect("The native unguarded read pairs must finish within their owned run");
 }
 
 #[tokio::test]
-async fn native_an_unguarded_read_conflicts_with_no_save_or_remove_of_its_record() {
+async fn native_an_unguarded_read_conflicts_with_no_update_or_remove_of_its_record() {
     let (endpoint, run_id) = native_endpoint();
     tokio::time::timeout(Duration::from_secs(60), async move {
         let engine = native_engine(endpoint).await;
         let records = records_of(&engine);
         let scope = record_id(&run_id);
-        for read in NATIVE_PLAIN_READS {
-            for writer in [NativeWriter::Rename, NativeWriter::Remove] {
-                let record = save(&engine, &records, new_record(&run_id, &scope))
-                    .await
-                    .unwrap();
+        for form in NATIVE_READS {
+            for writer in [NativeWriter::Update, NativeWriter::Remove] {
+                let record = created(&engine, &records, new_record(&run_id, &scope)).await;
                 let looking = engine.begin_transaction().await.unwrap();
-                read_plainly(&records, read, &record, &looking).await;
+                read_with(&records, form, Guard::None, &record, &looking).await;
                 write_scratch(&looking, &run_id).await;
                 let writing = engine.begin_transaction().await.unwrap();
                 stage_writer(&records, writer, &record, &writing).await;
                 assert!(committed(writing).await);
                 assert!(
                     committed(looking).await,
-                    "A {read:?} read must not conflict with a committed {writer:?} of its record"
+                    "A {form:?} read with no guard must not conflict with a committed {writer:?} of its record"
                 );
                 match writer {
-                    NativeWriter::Rename => {
-                        assert!(remove(&engine, &records, &record.id).await.unwrap());
+                    NativeWriter::Update => {
+                        assert_eq!(
+                            read(&engine, &records, &record.id).await.unwrap(),
+                            Some(with_name(&record, "updated by a writer"))
+                        );
+                        remove(&engine, &records, &record.id).await.unwrap();
                     }
                     NativeWriter::Remove => {
-                        let missing = engine.begin_transaction().await.unwrap();
-                        assert!(matches!(
-                            records.get(&record.id, Some(&missing)).await,
-                            Err(TitoError::NotFound(_))
-                        ));
-                        missing.rollback().await.unwrap();
+                        assert_eq!(read(&engine, &records, &record.id).await.unwrap(), None);
                     }
                 }
             }
@@ -748,52 +665,49 @@ async fn native_an_unguarded_read_cancels_no_guard_of_its_transaction() {
         let engine = native_engine(endpoint).await;
         let records = records_of(&engine);
         let scope = record_id(&run_id);
-        for read in NATIVE_PLAIN_READS {
+        for form in NATIVE_READS {
             for plain_first in [true, false] {
-                let record = save(&engine, &records, new_record(&run_id, &scope))
-                    .await
-                    .unwrap();
+                let record = created(&engine, &records, new_record(&run_id, &scope)).await;
                 let reader = engine.begin_transaction().await.unwrap();
                 if plain_first {
-                    read_plainly(&records, read, &record, &reader).await;
-                    records
-                        .get_for_share(&record.id, Some(&reader))
-                        .await
-                        .unwrap();
+                    read_with(&records, form, Guard::None, &record, &reader).await;
+                    read_with(&records, NativeRead::ById, Guard::Share, &record, &reader).await;
                 } else {
-                    records
-                        .get_for_share(&record.id, Some(&reader))
-                        .await
-                        .unwrap();
-                    read_plainly(&records, read, &record, &reader).await;
+                    read_with(&records, NativeRead::ById, Guard::Share, &record, &reader).await;
+                    read_with(&records, form, Guard::None, &record, &reader).await;
                 }
                 write_scratch(&reader, &run_id).await;
-                let renamed = with_name(&record, "renamed while guarded");
-                save(&engine, &records, renamed.clone()).await.unwrap();
+                let renamed = rename(&engine, &records, &record.id, "renamed while guarded")
+                    .await
+                    .unwrap();
                 assert!(
                     !committed(reader).await,
-                    "A record read for share keeps its guard beside a {read:?} read"
+                    "A record read for share keeps its guard beside a {form:?} read with no guard"
                 );
 
                 let held = engine.begin_transaction().await.unwrap();
                 let competing = engine.begin_transaction().await.unwrap();
                 if plain_first {
-                    read_plainly(&records, read, &renamed, &held).await;
-                    records.get_for_update(&record.id, &held).await.unwrap();
+                    read_with(&records, form, Guard::None, &renamed, &held).await;
+                    read_with(&records, NativeRead::ById, Guard::Update, &renamed, &held).await;
                 } else {
-                    records.get_for_update(&record.id, &held).await.unwrap();
-                    read_plainly(&records, read, &renamed, &held).await;
+                    read_with(&records, NativeRead::ById, Guard::Update, &renamed, &held).await;
+                    read_with(&records, form, Guard::None, &renamed, &held).await;
                 }
-                records
-                    .get_for_update(&record.id, &competing)
-                    .await
-                    .unwrap();
+                read_with(
+                    &records,
+                    NativeRead::ById,
+                    Guard::Update,
+                    &renamed,
+                    &competing,
+                )
+                .await;
                 assert!(committed(competing).await);
                 assert!(
                     !committed(held).await,
-                    "A record read for update keeps its guard beside a {read:?} read"
+                    "A record read for update keeps its guard beside a {form:?} read with no guard"
                 );
-                assert!(remove(&engine, &records, &record.id).await.unwrap());
+                remove(&engine, &records, &record.id).await.unwrap();
             }
         }
     })
@@ -802,61 +716,55 @@ async fn native_an_unguarded_read_cancels_no_guard_of_its_transaction() {
 }
 
 #[tokio::test]
-async fn native_a_save_and_a_remove_conflict_with_reads_for_share_and_for_update_in_either_order() {
+async fn native_an_update_and_a_remove_conflict_with_reads_for_share_and_for_update_in_either_order(
+) {
     let (endpoint, run_id) = native_endpoint();
     tokio::time::timeout(Duration::from_secs(60), async move {
         let engine = native_engine(endpoint).await;
         let records = records_of(&engine);
         let scope = record_id(&run_id);
-        for read in [NativeRead::GetForShare, NativeRead::GetForUpdate] {
-            for writer in [NativeWriter::Rename, NativeWriter::Remove] {
-                let record = save(&engine, &records, new_record(&run_id, &scope))
-                    .await
-                    .unwrap();
+        for guard in [Guard::Share, Guard::Update] {
+            for writer in [NativeWriter::Update, NativeWriter::Remove] {
+                let record = created(&engine, &records, new_record(&run_id, &scope)).await;
                 let guarded = engine.begin_transaction().await.unwrap();
-                read_by_id(&records, read, &record, &guarded).await;
+                read_with(&records, NativeRead::ById, guard, &record, &guarded).await;
                 write_scratch(&guarded, &run_id).await;
                 let writing = engine.begin_transaction().await.unwrap();
                 stage_writer(&records, writer, &record, &writing).await;
                 assert!(committed(writing).await);
                 assert!(
                     !committed(guarded).await,
-                    "{read:?} must conflict with a committed {writer:?} of its record"
+                    "A read with {guard:?} must conflict with a committed {writer:?} of its record"
                 );
                 let retried = engine.begin_transaction().await.unwrap();
-                let reread = match read {
-                    NativeRead::GetForUpdate => records.get_for_update(&record.id, &retried).await,
-                    _ => records.get_for_share(&record.id, Some(&retried)).await,
-                };
+                let reread = retried.batch_get(records.read(&record.id, guard)).await;
                 retried.rollback().await.unwrap();
                 match writer {
-                    NativeWriter::Rename => {
-                        assert_eq!(reread.unwrap(), with_name(&record, "renamed by a writer"));
-                        assert!(remove(&engine, &records, &record.id).await.unwrap());
+                    NativeWriter::Update => {
+                        assert_eq!(reread.unwrap(), with_name(&record, "updated by a writer"));
+                        remove(&engine, &records, &record.id).await.unwrap();
                     }
                     NativeWriter::Remove => {
                         assert!(matches!(reread, Err(TitoError::NotFound(_))));
                     }
                 }
 
-                let record = save(&engine, &records, new_record(&run_id, &scope))
-                    .await
-                    .unwrap();
+                let record = created(&engine, &records, new_record(&run_id, &scope)).await;
                 let guarded = engine.begin_transaction().await.unwrap();
-                read_by_id(&records, read, &record, &guarded).await;
+                read_with(&records, NativeRead::ById, guard, &record, &guarded).await;
                 write_scratch(&guarded, &run_id).await;
                 let writing = engine.begin_transaction().await.unwrap();
                 stage_writer(&records, writer, &record, &writing).await;
                 assert!(committed(guarded).await);
                 assert!(
                     !committed(writing).await,
-                    "A {writer:?} must conflict with a committed {read:?} of its record"
+                    "A {writer:?} must conflict with a committed read with {guard:?} of its record"
                 );
                 assert_eq!(
-                    records.get_for_share(&record.id, None).await.unwrap(),
-                    record
+                    read(&engine, &records, &record.id).await.unwrap(),
+                    Some(record.clone())
                 );
-                assert!(remove(&engine, &records, &record.id).await.unwrap());
+                remove(&engine, &records, &record.id).await.unwrap();
             }
         }
     })
@@ -865,7 +773,7 @@ async fn native_a_save_and_a_remove_conflict_with_reads_for_share_and_for_update
 }
 
 #[tokio::test]
-async fn native_a_transaction_that_writes_nothing_adds_no_guard_and_get_for_update_counts_as_a_write(
+async fn native_a_transaction_that_writes_nothing_adds_no_guard_and_a_read_for_update_counts_as_a_write(
 ) {
     let (endpoint, run_id) = native_endpoint();
     tokio::time::timeout(Duration::from_secs(60), async move {
@@ -874,27 +782,23 @@ async fn native_a_transaction_that_writes_nothing_adds_no_guard_and_get_for_upda
         let scope = record_id(&run_id);
         let mut saved = Vec::new();
         for _ in 0..4 {
-            saved.push(
-                save(&engine, &records, new_record(&run_id, &scope))
-                    .await
-                    .unwrap(),
-            );
+            saved.push(created(&engine, &records, new_record(&run_id, &scope)).await);
         }
 
         let reader = engine.begin_transaction().await.unwrap();
-        for (read, record) in [
-            NativeRead::GetForShare,
-            NativeRead::GetVersionedForShare,
-            NativeRead::GetManyForShare,
-            NativeRead::UniqueHitForShare,
+        for (form, record) in [
+            NativeRead::ById,
+            NativeRead::MaybeById,
+            NativeRead::Many,
+            NativeRead::Unique,
         ]
         .into_iter()
         .zip(&saved)
         {
-            read_by_id(&records, read, record, &reader).await;
+            read_with(&records, form, Guard::Share, record, &reader).await;
         }
         for record in &saved {
-            save(&engine, &records, with_name(record, "renamed while read"))
+            rename(&engine, &records, &record.id, "renamed while read")
                 .await
                 .unwrap();
         }
@@ -902,34 +806,32 @@ async fn native_a_transaction_that_writes_nothing_adds_no_guard_and_get_for_upda
 
         let held = engine.begin_transaction().await.unwrap();
         let competing = engine.begin_transaction().await.unwrap();
-        records.get_for_update(&saved[0].id, &held).await.unwrap();
-        records
-            .get_for_update(&saved[0].id, &competing)
+        held.batch_get(records.read(&saved[0].id, Guard::Update))
+            .await
+            .unwrap();
+        competing
+            .batch_get(records.read(&saved[0].id, Guard::Update))
             .await
             .unwrap();
         assert!(committed(competing).await);
         assert!(!committed(held).await);
 
         let exclusive = engine.begin_transaction().await.unwrap();
-        records
-            .get_for_update(&saved[0].id, &exclusive)
+        exclusive
+            .batch_get(records.read(&saved[0].id, Guard::Update))
             .await
             .unwrap();
-        records
-            .get_for_share(&saved[1].id, Some(&exclusive))
+        exclusive
+            .batch_get(records.read(&saved[1].id, Guard::Share))
             .await
             .unwrap();
-        save(
-            &engine,
-            &records,
-            with_name(&saved[1], "renamed while held"),
-        )
-        .await
-        .unwrap();
+        rename(&engine, &records, &saved[1].id, "renamed while held")
+            .await
+            .unwrap();
         assert!(!committed(exclusive).await);
 
         for record in &saved {
-            assert!(remove(&engine, &records, &record.id).await.unwrap());
+            remove(&engine, &records, &record.id).await.unwrap();
         }
     })
     .await
@@ -943,12 +845,8 @@ async fn native_a_retry_starts_without_the_guards_of_the_attempt_before() {
         let engine = native_engine(endpoint).await;
         let records = records_of(&engine);
         let scope = record_id(&run_id);
-        let first = save(&engine, &records, new_record(&run_id, &scope))
-            .await
-            .unwrap();
-        let second = save(&engine, &records, new_record(&run_id, &scope))
-            .await
-            .unwrap();
+        let first = created(&engine, &records, new_record(&run_id, &scope)).await;
+        let second = created(&engine, &records, new_record(&run_id, &scope)).await;
         let attempts = Arc::new(AtomicUsize::new(0));
 
         engine
@@ -961,13 +859,15 @@ async fn native_a_retry_starts_without_the_guards_of_the_attempt_before() {
                 let run_id = run_id.clone();
                 async move {
                     let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
-                    let read = if attempt == 1 { &first } else { &second };
-                    records.get_for_share(&read.id, Some(&tx)).await?;
+                    let guarded = if attempt == 1 { &first } else { &second };
+                    tx.batch_get(records.read(&guarded.id, Guard::Share))
+                        .await?;
                     write_scratch(&tx, &run_id).await;
-                    save(
+                    rename(
                         &engine,
                         &records,
-                        with_name(&first, &format!("renamed during attempt {attempt}")),
+                        &first.id,
+                        &format!("renamed during attempt {attempt}"),
                     )
                     .await?;
                     Ok::<_, TitoError>(())
@@ -978,11 +878,15 @@ async fn native_a_retry_starts_without_the_guards_of_the_attempt_before() {
 
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert_eq!(
-            records.get_for_share(&first.id, None).await.unwrap().name,
+            read(&engine, &records, &first.id)
+                .await
+                .unwrap()
+                .expect("The first record stays")
+                .name,
             "renamed during attempt 2"
         );
-        assert!(remove(&engine, &records, &first.id).await.unwrap());
-        assert!(remove(&engine, &records, &second.id).await.unwrap());
+        remove(&engine, &records, &first.id).await.unwrap();
+        remove(&engine, &records, &second.id).await.unwrap();
     })
     .await
     .expect("The native retried transaction must finish within its owned run");
@@ -994,29 +898,20 @@ async fn native_a_new_holder_and_a_delete_of_the_record_it_names_conflict_in_eit
     tokio::time::timeout(Duration::from_secs(60), async move {
         let engine = native_engine(endpoint).await;
         let records = records_of(&engine);
-        let holders = engine
-            .clone()
-            .model::<NativeHolder>(TitoModelOptions::default());
+        let holders = engine.clone().model::<NativeHolder>();
         let scope = record_id(&run_id);
 
-        let record = save(&engine, &records, new_record(&run_id, &scope))
-            .await
-            .unwrap();
+        let record = created(&engine, &records, new_record(&run_id, &scope)).await;
         let holder = NativeHolder {
             id: record_id(&run_id),
             record_id: record.id.clone(),
         };
         let holding = engine.begin_transaction().await.unwrap();
-        records
-            .get_for_share(&record.id, Some(&holding))
+        holding
+            .batch_get(records.read(&record.id, Guard::Share))
             .await
             .unwrap();
-        holders
-            .set(holder.clone())
-            .timestamps(false)
-            .execute(&holding)
-            .await
-            .unwrap();
+        holders.create(&holder, &holding).await.unwrap();
         let deleting = engine.begin_transaction().await.unwrap();
         assert!(
             delete_unless_held(&records, &holders, &record.id, &deleting)
@@ -1037,28 +932,21 @@ async fn native_a_new_holder_and_a_delete_of_the_record_it_names_conflict_in_eit
             .unwrap();
         assert_eq!(refused, vec![holder.id.clone()]);
         assert_eq!(
-            records.get_for_share(&record.id, None).await.unwrap(),
-            record
+            read(&engine, &records, &record.id).await.unwrap(),
+            Some(record.clone())
         );
 
-        let target = save(&engine, &records, new_record(&run_id, &scope))
-            .await
-            .unwrap();
+        let target = created(&engine, &records, new_record(&run_id, &scope)).await;
         let late = NativeHolder {
             id: record_id(&run_id),
             record_id: target.id.clone(),
         };
         let holding = engine.begin_transaction().await.unwrap();
-        records
-            .get_for_share(&target.id, Some(&holding))
+        holding
+            .batch_get(records.read(&target.id, Guard::Share))
             .await
             .unwrap();
-        holders
-            .set(late.clone())
-            .timestamps(false)
-            .execute(&holding)
-            .await
-            .unwrap();
+        holders.create(&late, &holding).await.unwrap();
         let deleting = engine.begin_transaction().await.unwrap();
         assert!(
             delete_unless_held(&records, &holders, &target.id, &deleting)
@@ -1074,23 +962,21 @@ async fn native_a_new_holder_and_a_delete_of_the_record_it_names_conflict_in_eit
                 let holders = holders.clone();
                 let late = late.clone();
                 async move {
-                    records.get_for_share(&late.record_id, Some(&tx)).await?;
-                    holders.set(late).timestamps(false).execute(&tx).await
+                    tx.batch_get(records.read(&late.record_id, Guard::Share))
+                        .await?;
+                    holders.create(&late, &tx).await
                 }
             })
             .await;
         assert!(matches!(retried, Err(TitoError::NotFound(_))));
-        assert!(matches!(
-            holders.get_for_share(&late.id, None).await,
-            Err(TitoError::NotFound(_))
-        ));
-        assert!(matches!(
-            records.get_for_share(&target.id, None).await,
-            Err(TitoError::NotFound(_))
-        ));
+        assert_eq!(read(&engine, &holders, &late.id).await.unwrap(), None);
+        assert_eq!(read(&engine, &records, &target.id).await.unwrap(), None);
+        let mut held = holders.query_by_index(HOLDER_BY_RECORD);
+        held.value(TitoIndexField::Text(target.id.clone()));
+        assert!(held.execute_ids(None).await.unwrap().items.is_empty());
 
-        assert!(remove(&engine, &holders, &holder.id).await.unwrap());
-        assert!(remove(&engine, &records, &record.id).await.unwrap());
+        remove(&engine, &holders, &holder.id).await.unwrap();
+        remove(&engine, &records, &record.id).await.unwrap();
     })
     .await
     .expect("The native holder and delete races must finish within their owned run");
@@ -1101,63 +987,75 @@ async fn native_concurrent_claims_of_one_unique_value_conflict_and_the_retry_is_
     let (endpoint, run_id) = native_endpoint();
     tokio::time::timeout(Duration::from_secs(60), async move {
         let engine = native_engine(endpoint).await;
-        let claims = engine
-            .clone()
-            .model::<NativeClaim>(TitoModelOptions::default());
+        let claims = engine.clone().model::<NativeClaim>();
         let scope = record_id(&run_id);
-        let first = NativeClaim {
+        let claim = |value: &str| NativeClaim {
             id: record_id(&run_id),
             scope: scope.clone(),
-            value: "asset-7".into(),
+            value: value.into(),
         };
-        let second = NativeClaim {
-            id: record_id(&run_id),
-            scope: scope.clone(),
-            value: "asset-7".into(),
+        let taken = |value: &str| TitoError::UniqueViolation {
+            model: "native-fence-claims".into(),
+            index: CLAIM_VALUE.into(),
+            values: claim_value(&scope, value),
         };
 
+        let first = claim("asset-7");
+        let second = claim("asset-7");
         let first_writer = engine.begin_transaction().await.unwrap();
         let second_writer = engine.begin_transaction().await.unwrap();
-        claims
-            .set(first.clone())
-            .timestamps(false)
-            .execute(&first_writer)
-            .await
-            .unwrap();
-        claims
-            .set(second.clone())
-            .timestamps(false)
-            .execute(&second_writer)
-            .await
-            .unwrap();
+        claims.create(&first, &first_writer).await.unwrap();
+        claims.create(&second, &second_writer).await.unwrap();
         first_writer.commit().await.unwrap();
+        let kept = second_writer.clone();
         assert!(matches!(
             second_writer.commit().await,
             Err(TitoError::Retryable(_))
         ));
-
-        assert!(matches!(
-            save(&engine, &claims, second.clone()).await,
-            Err(TitoError::UniqueViolation { .. })
-        ));
+        let _ = kept.rollback().await;
         assert_eq!(
-            claims
-                .find_one_by_unique_index_for_share(
-                    TitoFindOneByIndexPayload {
-                        index: "native-claim-value".into(),
-                        values: vec![scope.clone(), "asset-7".into()],
-                    },
-                    None,
-                )
+            create(&engine, &claims, &second).await,
+            Err(taken("asset-7"))
+        );
+        assert_eq!(
+            unique_claim(&engine, &claims, &scope, "asset-7")
                 .await
                 .unwrap(),
             first
         );
-        assert!(matches!(
-            claims.get_for_share(&second.id, None).await,
-            Err(TitoError::NotFound(_))
-        ));
-        assert!(remove(&engine, &claims, &first.id).await.unwrap());
+        assert_eq!(read(&engine, &claims, &second.id).await.unwrap(), None);
+
+        let third = claim("asset-8");
+        let fourth = claim("asset-8");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let refused = engine
+            .transaction(|tx| {
+                let engine = engine.clone();
+                let claims = claims.clone();
+                let third = third.clone();
+                let fourth = fourth.clone();
+                let attempts = attempts.clone();
+                async move {
+                    claims.create(&fourth, &tx).await?;
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        create(&engine, &claims, &third).await?;
+                    }
+                    Ok::<_, TitoError>(())
+                }
+            })
+            .await;
+        assert_eq!(refused, Err(taken("asset-8")));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            unique_claim(&engine, &claims, &scope, "asset-8")
+                .await
+                .unwrap(),
+            third
+        );
+        assert_eq!(read(&engine, &claims, &fourth.id).await.unwrap(), None);
+
+        remove(&engine, &claims, &first.id).await.unwrap();
+        remove(&engine, &claims, &third.id).await.unwrap();
     })
     .await
     .expect("The native unique claim race must finish within its owned run");
@@ -1168,9 +1066,7 @@ async fn native_unique_values_differing_only_by_case_or_spacing_coexist_and_are_
     let (endpoint, run_id) = native_endpoint();
     tokio::time::timeout(Duration::from_secs(60), async move {
         let engine = native_engine(endpoint).await;
-        let claims = engine
-            .clone()
-            .model::<NativeClaim>(TitoModelOptions::default());
+        let claims = engine.clone().model::<NativeClaim>();
         let scope = record_id(&run_id);
         let claimed = [
             "Asset-7",
@@ -1188,38 +1084,23 @@ async fn native_unique_values_differing_only_by_case_or_spacing_coexist_and_are_
         })
         .collect::<Vec<_>>();
         for claim in &claimed {
-            save(&engine, &claims, claim.clone()).await.unwrap();
+            create(&engine, &claims, claim).await.unwrap();
         }
 
         for claim in &claimed {
             assert_eq!(
-                claims
-                    .find_one_by_unique_index_for_share(
-                        TitoFindOneByIndexPayload {
-                            index: "native-claim-value".into(),
-                            values: vec![scope.clone(), claim.value.clone()],
-                        },
-                        None,
-                    )
+                unique_claim(&engine, &claims, &scope, &claim.value)
                     .await
                     .unwrap(),
                 *claim
             );
         }
         assert!(matches!(
-            claims
-                .find_one_by_unique_index_for_share(
-                    TitoFindOneByIndexPayload {
-                        index: "native-claim-value".into(),
-                        values: vec![scope.clone(), "aSSET-7".into()],
-                    },
-                    None,
-                )
-                .await,
+            unique_claim(&engine, &claims, &scope, "aSSET-7").await,
             Err(TitoError::NotFound(_))
         ));
         for claim in &claimed {
-            assert!(remove(&engine, &claims, &claim.id).await.unwrap());
+            remove(&engine, &claims, &claim.id).await.unwrap();
         }
     })
     .await

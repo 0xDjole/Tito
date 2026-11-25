@@ -1,6 +1,7 @@
+use crate::types::TitoIndexField;
 use thiserror::Error;
 
-#[derive(Error, Debug, PartialEq, Eq)]
+#[derive(Error, Clone, Debug, PartialEq, Eq)]
 pub enum TitoError {
     #[error("Failed to connect to TiKV: {0}")]
     ConnectionFailed(String),
@@ -42,7 +43,14 @@ pub enum TitoError {
     IndexError(String),
 
     #[error("Unique index '{index}' on model '{model}' is already owned")]
-    UniqueViolation { model: String, index: String },
+    UniqueViolation {
+        model: String,
+        index: String,
+        values: Vec<TitoIndexField>,
+    },
+
+    #[error("Record '{id}' of model '{model}' already exists")]
+    RecordExists { model: String, id: String },
 
     #[error("Lock acquisition failed: {0}")]
     LockError(String),

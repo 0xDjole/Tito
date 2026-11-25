@@ -1,15 +1,19 @@
 mod native;
 
-use native::{native_endpoint, native_engine, remove, save};
+use native::{create, native_endpoint, native_engine, read, remove};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tikv_client::{Key, ProtoLockInfo, Timestamp, TimestampExt};
-use tito::backend::tikv::TiKVBackend;
-use tito::types::{TitoIndexConfig, TitoIndexField, TitoIndexFieldType, TitoTransaction};
-use tito::{TitoEngine, TitoError, TitoModelOptions, TitoModelTrait};
+use tito::backend::tikv::{TiKVBackend, TiKVTransaction};
+use tito::types::TitoTransaction;
+use tito::{
+    Guard, TitoEngine, TitoError, TitoIndex, TitoIndexField, TitoIndexValue, TitoModelTrait,
+};
 use uuid::Uuid;
 
-#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+const CODE: &str = "native-batch-memory-code";
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct NativeMemoryRecord {
     id: String,
     scope: String,
@@ -17,40 +21,40 @@ struct NativeMemoryRecord {
 }
 
 impl TitoModelTrait for NativeMemoryRecord {
-    fn indexes(&self) -> Vec<TitoIndexConfig> {
-        vec![TitoIndexConfig {
-            condition: true,
-            name: "native-memory-by-scope".into(),
-            fields: vec![TitoIndexField {
-                name: "scope".into(),
-                r#type: TitoIndexFieldType::String,
-            }],
-        }]
-    }
-
-    fn unique_indexes(&self) -> Vec<TitoIndexConfig> {
-        vec![TitoIndexConfig {
-            condition: true,
-            name: "native-memory-code".into(),
-            fields: vec![
-                TitoIndexField {
-                    name: "scope".into(),
-                    r#type: TitoIndexFieldType::String,
-                },
-                TitoIndexField {
-                    name: "code".into(),
-                    r#type: TitoIndexFieldType::String,
-                },
-            ],
-        }]
+    fn indexes(&self) -> Vec<TitoIndex> {
+        vec![
+            TitoIndex {
+                name: "native-batch-memory-by-scope",
+                fields: vec![TitoIndexField::Text(self.scope.clone())],
+                value: TitoIndexValue::KeysOnly,
+                unique: false,
+            },
+            TitoIndex {
+                name: CODE,
+                fields: vec![
+                    TitoIndexField::Text(self.scope.clone()),
+                    TitoIndexField::Text(self.code.clone()),
+                ],
+                value: TitoIndexValue::Full,
+                unique: true,
+            },
+        ]
     }
 
     fn table() -> String {
-        "native-memory-records".into()
+        "native-batch-memory-records".into()
     }
 
     fn id(&self) -> String {
         self.id.clone()
+    }
+}
+
+fn memory_record(scope: &str, name: &str) -> NativeMemoryRecord {
+    NativeMemoryRecord {
+        id: format!("{scope}-{name}"),
+        scope: scope.to_string(),
+        code: name.to_string(),
     }
 }
 
@@ -80,7 +84,7 @@ async fn locks(engine: &TiKVBackend, primary: &[u8], secondary: &[u8]) -> Vec<Pr
 
 async fn leave_lock(
     engine: &TiKVBackend,
-    orphan: tito::backend::tikv::TiKVTransaction,
+    orphan: TiKVTransaction,
     primary: &[u8],
     secondary: &[u8],
 ) -> i64 {
@@ -114,7 +118,7 @@ async fn leave_lock(
     let lock = &observed[0];
     assert!(
         lock.key == secondary && lock.lock_version == orphan_start && lock.lock_ttl > 0,
-        "The lock must sit on the key the reader asked for"
+        "The lock must sit on the row the reader asked for"
     );
     Timestamp::from_version(lock.lock_version)
         .physical
@@ -122,7 +126,12 @@ async fn leave_lock(
         .expect("Observed lock expiry fits PD time")
 }
 
-async fn clear_lock(engine: &TiKVBackend, expiry: i64, primary: &[u8], secondary: &[u8]) {
+async fn clear_lock(
+    engine: &TiKVBackend,
+    expiry: i64,
+    primary: &[u8],
+    secondary: &[u8],
+) -> Option<Vec<u8>> {
     while pd_millis(engine).await <= expiry {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -130,10 +139,11 @@ async fn clear_lock(engine: &TiKVBackend, expiry: i64, primary: &[u8], secondary
         .begin_transaction()
         .await
         .expect("Begin the cleanup after the lock expired");
-    assert_eq!(cleanup.get(secondary).await.unwrap(), None);
+    let left = cleanup.get(secondary).await.unwrap();
     cleanup.delete(primary).await.unwrap();
     cleanup.commit().await.expect("Commit the cleanup");
     assert!(locks(engine, primary, secondary).await.is_empty());
+    left
 }
 
 #[tokio::test]
@@ -141,18 +151,26 @@ async fn native_a_key_a_batch_read_did_not_find_is_answered_from_memory_while_a_
     let (endpoint, run_id) = native_endpoint();
     tokio::time::timeout(Duration::from_secs(60), async move {
         let engine = native_engine(endpoint).await;
+        let records = engine.clone().model::<NativeMemoryRecord>();
         let scope = format!("{run_id}-{}", Uuid::new_v4());
-        let primary = format!("native-batch-memory:{scope}:0").into_bytes();
-        let missing = format!("native-batch-memory:{scope}:1").into_bytes();
-        let never = format!("native-batch-memory:{scope}:2").into_bytes();
+        let primary = records.key(&format!("{scope}-0")).into_bytes();
+        let missing_id = format!("{scope}-1");
+        let never_id = format!("{scope}-2");
+        let missing = records.key(&missing_id).into_bytes();
+        assert!(primary < missing);
 
         let orphan = engine.begin_transaction().await.unwrap();
         let reader = engine.begin_transaction().await.unwrap();
-        assert!(reader
-            .batch_get(vec![missing.clone(), never.clone()])
-            .await
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            reader
+                .batch_get((
+                    records.read_maybe(&missing_id, Guard::None),
+                    records.read_maybe(&never_id, Guard::None),
+                ))
+                .await
+                .unwrap(),
+            (None, None)
+        );
         let expiry = leave_lock(&engine, orphan, &primary, &missing).await;
         let started = pd_millis(&engine).await;
         assert!(
@@ -161,11 +179,16 @@ async fn native_a_key_a_batch_read_did_not_find_is_answered_from_memory_while_a_
         );
 
         assert_eq!(reader.get(&missing).await.unwrap(), None);
-        assert!(reader
-            .batch_get(vec![missing.clone(), never.clone()])
-            .await
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            reader
+                .batch_get((
+                    records.read_maybe(&missing_id, Guard::Share),
+                    records.read_many(vec![missing_id.clone(), never_id.clone()], Guard::None),
+                ))
+                .await
+                .unwrap(),
+            (None, Vec::new())
+        );
         let answered = pd_millis(&engine).await;
 
         let fresh = engine.begin_transaction().await.unwrap();
@@ -193,7 +216,8 @@ async fn native_a_key_a_batch_read_did_not_find_is_answered_from_memory_while_a_
         );
         fresh.rollback().await.unwrap();
         reader.rollback().await.unwrap();
-        clear_lock(&engine, expiry, &primary, &missing).await;
+        assert_eq!(clear_lock(&engine, expiry, &primary, &missing).await, None);
+        assert_eq!(read(&engine, &records, &missing_id).await.unwrap(), None);
     })
     .await
     .expect("The native batch memory case must finish within its deadline");
@@ -204,151 +228,229 @@ async fn native_a_batch_read_keeps_the_writes_and_locks_of_its_own_transaction()
     let (endpoint, run_id) = native_endpoint();
     tokio::time::timeout(Duration::from_secs(60), async move {
         let engine = native_engine(endpoint).await;
+        let records = engine.clone().model::<NativeMemoryRecord>();
         let scope = format!("{run_id}-{}", Uuid::new_v4());
-        let key = |name: &str| format!("native-batch-memory:{scope}:{name}").into_bytes();
-        let (written, deleted, locked, missing) = (
-            key("written"),
-            key("deleted"),
-            key("locked"),
-            key("missing"),
-        );
-
-        let before = engine.begin_transaction().await.unwrap();
-        before.put(&deleted, b"before").await.unwrap();
-        before.commit().await.unwrap();
+        let written = memory_record(&scope, "written");
+        let deleted = memory_record(&scope, "deleted");
+        let locked = memory_record(&scope, "locked");
+        let missing = memory_record(&scope, "missing");
+        create(&engine, &records, &deleted).await.unwrap();
 
         let tx = engine.begin_transaction().await.unwrap();
-        tx.put(&written, b"written").await.unwrap();
-        tx.delete(&deleted).await.unwrap();
+        records.create(&written, &tx).await.unwrap();
+        let found = tx
+            .batch_get(records.read(&deleted.id, Guard::None))
+            .await
+            .unwrap();
+        records.remove(&found, &tx).await.unwrap();
         tx.inner
             .lock()
             .await
-            .lock_keys(vec![Key::from(locked.clone())])
+            .lock_keys(vec![Key::from(records.key(&locked.id).into_bytes())])
             .await
             .unwrap();
         assert_eq!(
-            tx.batch_get(vec![
-                written.clone(),
-                deleted.clone(),
-                locked.clone(),
-                missing.clone()
-            ])
+            tx.batch_get((
+                records.read_maybe(&written.id, Guard::None),
+                records.read_maybe(&deleted.id, Guard::None),
+                records.read_maybe(&locked.id, Guard::None),
+                records.read_maybe(&missing.id, Guard::None),
+            ))
             .await
             .unwrap(),
-            vec![(written.clone(), b"written".to_vec())]
+            (Some(written.clone()), None, None, None)
         );
-        assert_eq!(tx.get(&written).await.unwrap(), Some(b"written".to_vec()));
-        assert_eq!(tx.get(&deleted).await.unwrap(), None);
-        assert_eq!(tx.get(&locked).await.unwrap(), None);
-        assert_eq!(tx.get(&missing).await.unwrap(), None);
+        let stored = tx
+            .get(records.key(&written.id))
+            .await
+            .unwrap()
+            .expect("The row written in this transaction is read from its own buffer");
+        assert_eq!(
+            serde_json::from_slice::<NativeMemoryRecord>(&stored).unwrap(),
+            written
+        );
+        assert_eq!(tx.get(records.key(&deleted.id)).await.unwrap(), None);
+        assert_eq!(tx.get(records.key(&locked.id)).await.unwrap(), None);
+        assert_eq!(tx.get(records.key(&missing.id)).await.unwrap(), None);
 
-        let other = engine.begin_transaction().await.unwrap();
-        other.put(&locked, b"other writer").await.unwrap();
-        other.commit().await.unwrap();
+        create(&engine, &records, &locked).await.unwrap();
+        let kept_tx = tx.clone();
         assert!(
             matches!(tx.commit().await, Err(TitoError::Retryable(_))),
             "The batch read must leave the lock in place, so the later writer conflicts with it"
         );
+        let _ = kept_tx.rollback().await;
 
-        let unlocked = key("unlocked");
-        let kept = key("kept");
+        let unlocked = memory_record(&scope, "unlocked");
+        let kept = memory_record(&scope, "kept");
         let control = engine.begin_transaction().await.unwrap();
-        assert!(control
-            .batch_get(vec![unlocked.clone()])
-            .await
-            .unwrap()
-            .is_empty());
-        let other = engine.begin_transaction().await.unwrap();
-        other.put(&unlocked, b"other writer").await.unwrap();
-        other.commit().await.unwrap();
-        control.put(&kept, b"kept").await.unwrap();
         assert_eq!(
             control
-                .batch_get(vec![kept.clone(), unlocked.clone()])
+                .batch_get(records.read_maybe(&unlocked.id, Guard::None))
                 .await
                 .unwrap(),
-            vec![(kept.clone(), b"kept".to_vec())]
+            None
         );
-        assert_eq!(control.get(&unlocked).await.unwrap(), None);
+        create(&engine, &records, &unlocked).await.unwrap();
+        records.create(&kept, &control).await.unwrap();
+        assert_eq!(
+            control
+                .batch_get((
+                    records.read_maybe(&kept.id, Guard::None),
+                    records.read_maybe(&unlocked.id, Guard::None),
+                ))
+                .await
+                .unwrap(),
+            (Some(kept.clone()), None)
+        );
+        assert_eq!(control.get(records.key(&unlocked.id)).await.unwrap(), None);
         control
             .commit()
             .await
-            .expect("A key that was only read takes no lock, so its writer conflicts with nothing");
+            .expect("A row that was only read takes no lock, so its writer conflicts with nothing");
 
-        let after = engine.begin_transaction().await.unwrap();
-        assert_eq!(after.get(&written).await.unwrap(), None);
-        assert_eq!(after.get(&deleted).await.unwrap(), Some(b"before".to_vec()));
+        assert_eq!(read(&engine, &records, &written.id).await.unwrap(), None);
         assert_eq!(
-            after.get(&locked).await.unwrap(),
-            Some(b"other writer".to_vec())
+            read(&engine, &records, &deleted.id).await.unwrap(),
+            Some(deleted.clone())
         );
-        assert_eq!(after.get(&kept).await.unwrap(), Some(b"kept".to_vec()));
-        for name in [&deleted, &locked, &unlocked, &kept] {
-            after.delete(name).await.unwrap();
+        assert_eq!(
+            read(&engine, &records, &locked.id).await.unwrap(),
+            Some(locked.clone())
+        );
+        assert_eq!(
+            read(&engine, &records, &unlocked.id).await.unwrap(),
+            Some(unlocked.clone())
+        );
+        assert_eq!(
+            read(&engine, &records, &kept.id).await.unwrap(),
+            Some(kept.clone())
+        );
+        let written_code = records.read_unique_maybe(
+            CODE,
+            vec![
+                TitoIndexField::Text(scope.clone()),
+                TitoIndexField::Text(written.code.clone()),
+            ],
+            Guard::None,
+        );
+        assert_eq!(
+            engine
+                .transaction(|tx| async move { tx.batch_get(written_code).await })
+                .await
+                .unwrap(),
+            None
+        );
+        for id in [&deleted.id, &locked.id, &unlocked.id, &kept.id] {
+            remove(&engine, &records, id).await.unwrap();
         }
-        after.commit().await.unwrap();
     })
     .await
     .expect("The native batch memory write case must finish within its deadline");
 }
 
 #[tokio::test]
-async fn native_a_save_after_a_batch_read_of_its_save_keys_sends_no_read() {
+async fn native_a_create_sends_no_read_while_a_lock_sits_on_its_row() {
     let (endpoint, run_id) = native_endpoint();
     tokio::time::timeout(Duration::from_secs(60), async move {
         let engine = native_engine(endpoint).await;
-        let model = engine
-            .clone()
-            .model::<NativeMemoryRecord>(TitoModelOptions::default());
+        let records = engine.clone().model::<NativeMemoryRecord>();
         let scope = format!("{run_id}-{}", Uuid::new_v4());
-        let record = NativeMemoryRecord {
-            id: format!("{scope}-1"),
-            scope: scope.clone(),
-            code: "first".into(),
-        };
-        let primary = format!("table:native-memory-records:{scope}-0").into_bytes();
-        let row = model.key(&record.id).into_bytes();
+        let record = memory_record(&scope, "1");
+        let primary = records.key(&format!("{scope}-0")).into_bytes();
+        let row = records.key(&record.id).into_bytes();
         assert!(primary < row);
 
         let orphan = engine.begin_transaction().await.unwrap();
         let tx = engine.begin_transaction().await.unwrap();
-        assert!(tx
-            .batch_get(model.save_keys(&record))
-            .await
-            .unwrap()
-            .is_empty());
         let expiry = leave_lock(&engine, orphan, &primary, &row).await;
         let started = pd_millis(&engine).await;
         assert!(
             expiry - started >= 1_500,
-            "The lock must outlive the save for this case to prove it sent no read"
+            "The lock must outlive the create for this case to prove it sent no read"
         );
-        let saved = model
-            .set(record.clone())
-            .timestamps(false)
-            .execute(&tx)
-            .await
-            .unwrap();
+        records.create(&record, &tx).await.unwrap();
         let finished = pd_millis(&engine).await;
         println!(
-            "native save after save_keys: lock_remaining_ms={}, save_ms={}",
+            "native create under a lock: lock_remaining_ms={}, create_ms={}",
             expiry - started,
             finished - started
         );
-        assert_eq!(saved, record);
         assert!(
             finished < expiry,
-            "The save must finish while the lock on its row is alive, so it read nothing from TiKV"
+            "The create must finish while the lock on its row is alive, so it read nothing from TiKV"
         );
         tx.rollback().await.unwrap();
-        clear_lock(&engine, expiry, &primary, &row).await;
-        assert!(matches!(
-            model.get_for_share(&record.id, None).await,
-            Err(TitoError::NotFound(_))
-        ));
-        assert_eq!(save(&engine, &model, record.clone()).await.unwrap(), record);
-        assert!(remove(&engine, &model, &record.id).await.unwrap());
+        assert_eq!(clear_lock(&engine, expiry, &primary, &row).await, None);
+
+        assert_eq!(read(&engine, &records, &record.id).await.unwrap(), None);
+        create(&engine, &records, &record).await.unwrap();
+        assert_eq!(
+            read(&engine, &records, &record.id).await.unwrap(),
+            Some(record.clone())
+        );
+        remove(&engine, &records, &record.id).await.unwrap();
     })
     .await
-    .expect("The native save_keys case must finish within its deadline");
+    .expect("The native create under a lock must finish within its deadline");
+}
+
+#[tokio::test]
+async fn native_an_update_sends_no_read_while_a_lock_sits_on_its_row() {
+    let (endpoint, run_id) = native_endpoint();
+    tokio::time::timeout(Duration::from_secs(60), async move {
+        let engine = native_engine(endpoint).await;
+        let records = engine.clone().model::<NativeMemoryRecord>();
+        let scope = format!("{run_id}-{}", Uuid::new_v4());
+        let record = memory_record(&scope, "1");
+        let primary = records.key(&format!("{scope}-0")).into_bytes();
+        let row = records.key(&record.id).into_bytes();
+        assert!(primary < row);
+        create(&engine, &records, &record).await.unwrap();
+
+        let orphan = engine.begin_transaction().await.unwrap();
+        let tx = engine.begin_transaction().await.unwrap();
+        let old = tx
+            .batch_get(records.read(&record.id, Guard::None))
+            .await
+            .unwrap();
+        assert_eq!(old, record);
+        let expiry = leave_lock(&engine, orphan, &primary, &row).await;
+        let started = pd_millis(&engine).await;
+        assert!(
+            expiry - started >= 1_500,
+            "The lock must outlive the update for this case to prove it sent no read"
+        );
+        let changed = NativeMemoryRecord {
+            code: "2".into(),
+            ..record.clone()
+        };
+        records.update(&old, &changed, &tx).await.unwrap();
+        let finished = pd_millis(&engine).await;
+        println!(
+            "native update under a lock: lock_remaining_ms={}, update_ms={}",
+            expiry - started,
+            finished - started
+        );
+        assert!(
+            finished < expiry,
+            "The update must finish while the lock on its row is alive, so it read nothing from TiKV"
+        );
+        tx.rollback().await.unwrap();
+        let left = clear_lock(&engine, expiry, &primary, &row)
+            .await
+            .expect("The committed record outlives the abandoned lock");
+        assert_eq!(
+            serde_json::from_slice::<NativeMemoryRecord>(&left).unwrap(),
+            record
+        );
+
+        assert_eq!(
+            read(&engine, &records, &record.id).await.unwrap(),
+            Some(record.clone())
+        );
+        remove(&engine, &records, &record.id).await.unwrap();
+    })
+    .await
+    .expect("The native update under a lock must finish within its deadline");
 }

@@ -298,6 +298,102 @@ impl<PdC: PdClient> Transaction<PdC> {
             .map(move |pairs| pairs.map(move |pair| pair.truncate_keyspace(keyspace)))
     }
 
+    pub async fn batch_get_and_scan(
+        &mut self,
+        keys: Vec<Key>,
+        scans: Vec<TransactionScan>,
+    ) -> Result<(Result<Vec<KvPair>>, Vec<Result<Vec<KvPair>>>)> {
+        debug!("invoking transactional batch_get_and_scan request");
+        self.check_allow_operation().await?;
+        let timestamp = self.timestamp.clone();
+        let retry_options = self.options.retry_options.clone();
+        let keyspace = self.keyspace;
+        let (cached, undetermined) = self.buffer.batch_get_cached(
+            keys.into_iter()
+                .map(|key| key.encode_keyspace(keyspace, KeyMode::Txn)),
+        );
+        let key_read = {
+            let rpc = self.rpc.clone();
+            let timestamp = timestamp.clone();
+            let retry_options = retry_options.clone();
+            let undetermined = undetermined.clone();
+            async move {
+                if undetermined.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let request = new_batch_get_request(undetermined.into_iter(), timestamp.clone());
+                let plan = PlanBuilder::new(rpc, keyspace, request)
+                    .resolve_lock(timestamp, retry_options.lock_backoff, keyspace)
+                    .retry_multi_region(retry_options.region_backoff)
+                    .merge(Collect)
+                    .plan();
+                plan.execute()
+                    .await
+                    .map(|pairs| pairs.into_iter().collect::<Vec<KvPair>>())
+            }
+        };
+        let ranges = scans
+            .iter()
+            .map(|scan| {
+                let range = scan.range.clone().encode_keyspace(keyspace, KeyMode::Txn);
+                let fetch_limit = self.buffer.scan_fetch_limit(range.clone(), scan.limit);
+                (range, fetch_limit)
+            })
+            .collect::<Vec<_>>();
+        let scan_reads = ranges
+            .iter()
+            .zip(&scans)
+            .map(|((range, fetch_limit), scan)| {
+                let request = new_scan_request(
+                    range.clone(),
+                    timestamp.clone(),
+                    *fetch_limit,
+                    false,
+                    scan.reverse,
+                );
+                let plan = PlanBuilder::new(self.rpc.clone(), keyspace, request)
+                    .resolve_lock(
+                        timestamp.clone(),
+                        retry_options.lock_backoff.clone(),
+                        keyspace,
+                    )
+                    .retry_multi_region(retry_options.region_backoff.clone())
+                    .merge(Collect)
+                    .plan();
+                async move {
+                    plan.execute()
+                        .await
+                        .map(|pairs| pairs.into_iter().collect::<Vec<KvPair>>())
+                }
+            })
+            .collect::<Vec<_>>();
+        let (fetched, scanned) =
+            futures::future::join(key_read, futures::future::join_all(scan_reads)).await;
+        let key_result = fetched.map(|fetched| {
+            self.buffer.cache_batch_get(undetermined, &fetched);
+            cached
+                .into_iter()
+                .chain(fetched)
+                .map(|pair| pair.truncate_keyspace(keyspace))
+                .collect::<Vec<_>>()
+        });
+        let scan_results = scanned
+            .into_iter()
+            .zip(ranges)
+            .zip(&scans)
+            .map(|((fetched, (range, _)), scan)| {
+                fetched.map(|fetched| {
+                    self.buffer
+                        .merge_scan(range, scan.limit, true, scan.reverse, fetched)
+                        .into_iter()
+                        .map(|pair| pair.truncate_keyspace(keyspace))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok((key_result, scan_results))
+    }
+
     /// Create a new 'batch get for update' request.
     ///
     /// Similar to [`get_for_update`](Transaction::get_for_update), but it works
@@ -1303,6 +1399,13 @@ impl HeartbeatOption {
 pub enum Mutation {
     Put(Key, Value),
     Delete(Key),
+}
+
+#[derive(Clone, Debug)]
+pub struct TransactionScan {
+    pub range: BoundRange,
+    pub limit: u32,
+    pub reverse: bool,
 }
 
 impl Mutation {

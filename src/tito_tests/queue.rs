@@ -1,49 +1,205 @@
-use super::*;
-use crate::{encode_index_integer, QueueOwner};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-#[test]
-fn queue_event_helpers_read_the_event_timestamp() {
-    let event = QueueEvent::new("entry:entry-1", queue_payload("payload"), 123);
+use chrono::Utc;
+use futures::future::BoxFuture;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use tokio::sync::{broadcast, Notify};
+use tokio::task::JoinHandle;
+use tokio::time::{sleep, timeout};
 
-    assert_eq!(event.key_type(), "entry");
-    assert_eq!(event.key_value(), "entry-1");
-    assert_eq!(event.event().name, "payload");
-    assert_eq!(event.timestamp, 123);
+use crate::backend::tikv::TiKVBackend;
+use crate::queue::test_engine::{
+    get_raw, keys_with_prefix, native_engine, put_raw, unique_queue_name,
+};
+use crate::queue::{
+    run_cluster_worker, ClusterWorkerConfig, Queue, QueueConfig, QueueEvent, QueueHandlerOutcome,
+    QueueHandlerResult, QueueOwner,
+};
+use crate::types::{TitoEngine, TitoTransaction, PARTITION_DIGITS};
+use crate::{encode_index_integer, queue_partition_for_key, TitoError};
+
+type PayloadRun = BoxFuture<'static, QueueHandlerResult<Payload>>;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct Payload {
+    name: String,
 }
 
-#[test]
-fn queue_created_at_milliseconds_preserves_native_id_precision_and_exact_fallback() {
-    let mut event = QueueEvent::new("entry:clock", queue_payload("clock"), 123);
-    event.id = format!("{:020}-event", 1_700_000_000_123_456_i64);
-    assert_eq!(event.created_at_millis(), 1_700_000_000_123);
-    assert_eq!(
-        event.rescheduled(1_700_000_000_987).created_at_millis(),
-        1_700_000_000_123
-    );
+fn payload(name: &str) -> Payload {
+    Payload {
+        name: name.to_string(),
+    }
+}
 
-    for timestamp in [
+fn queue_event(id: &str, key: &str, timestamp: i64) -> QueueEvent<Payload> {
+    QueueEvent {
+        id: id.to_string(),
+        key: key.to_string(),
+        owner: None,
+        payload: payload(id),
+        timestamp,
+        pending_key: None,
+    }
+}
+
+fn named_queue(engine: &TiKVBackend, partition_count: u32) -> Queue<TiKVBackend> {
+    Queue::new(
+        engine.clone(),
+        QueueConfig::new(partition_count)
+            .with_name(unique_queue_name("queue"))
+            .unwrap(),
+    )
+}
+
+fn queue_prefix(queue: &Queue<TiKVBackend>) -> String {
+    format!("{}:", queue.config.name())
+}
+
+fn pending_key(
+    queue: &Queue<TiKVBackend>,
+    partition: u32,
+    timestamp: i64,
+    enqueue_version: u64,
+    id: &str,
+) -> String {
+    format!(
+        "{}:pending:{partition:0width$}:{}:{enqueue_version:020}:{id}",
+        queue.config.name(),
+        encode_index_integer(timestamp),
+        width = PARTITION_DIGITS,
+    )
+}
+
+async fn only_pending(queue: &Queue<TiKVBackend>) -> (String, QueueEvent<Payload>) {
+    let mut pending = queue
+        .scan_by_status::<Payload>(None, 10)
+        .await
+        .unwrap()
+        .events;
+    assert_eq!(pending.len(), 1);
+    pending.remove(0)
+}
+
+fn worker_config(node_id: &str) -> ClusterWorkerConfig {
+    ClusterWorkerConfig {
+        node_id: node_id.to_string(),
+        heartbeat_interval: Duration::from_millis(500),
+        poll_interval: Duration::from_millis(50),
+        handler_timeout: Duration::from_secs(60),
+        lease_ttl: Duration::from_secs(10),
+        stale_node_ttl: Duration::from_secs(60),
+    }
+}
+
+async fn stop_worker(shutdown: broadcast::Sender<()>, worker: JoinHandle<()>) {
+    let _ = shutdown.send(());
+    timeout(Duration::from_secs(30), worker)
+        .await
+        .expect("the worker stops")
+        .expect("the worker task ends without a panic");
+}
+
+async fn wait_until_gone(engine: &TiKVBackend, storage_key: &str) {
+    timeout(Duration::from_secs(30), async {
+        while get_raw(engine, storage_key).await.is_some() {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the worker acknowledges the row");
+}
+
+#[tokio::test]
+async fn queue_rows_store_exactly_their_id_key_owner_payload_and_signed_timestamp() {
+    let engine = native_engine().await;
+    let queue = named_queue(&engine, 1);
+    let before = Utc::now().timestamp_millis();
+    let fresh = QueueEvent::new("entry:entry-1", payload("fresh"), 123)
+        .with_owner(QueueOwner::new("store", "store-1").unwrap());
+    let after = Utc::now().timestamp_millis();
+    let mut native = queue_event("native", "entry:native", 456);
+    native.id = format!("{:020}-event", 1_700_000_000_123_456_i64);
+    let mut published = vec![fresh.clone(), native.clone()];
+    for (index, timestamp) in [
         i64::MIN,
         -9_007_199_254_740_991,
         -1,
         0,
-        123,
         1_700_000_000_123,
         i64::MAX,
-    ] {
-        let event = queue_event("opaque-event-id", "entry:clock", timestamp);
-        assert_eq!(event.created_at_millis(), timestamp);
-        let encoded = serde_json::to_value(&event).unwrap();
-        assert_eq!(encoded["timestamp"], json!(timestamp));
-        let decoded: QueueEvent<QueuePayload> = serde_json::from_value(encoded).unwrap();
-        assert_eq!(decoded.timestamp, timestamp);
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        published.push(queue_event(
+            &format!("opaque-{index}"),
+            "entry:clock",
+            timestamp,
+        ));
     }
+    for published_event in &published {
+        queue.publish(published_event.clone()).await.unwrap();
+    }
+
+    let stored = queue
+        .scan_by_status::<Payload>(None, 100)
+        .await
+        .unwrap()
+        .events;
+    assert_eq!(stored.len(), published.len());
+    for published_event in &published {
+        let (storage_key, read) = stored
+            .iter()
+            .find(|(_, read)| read.id == published_event.id)
+            .unwrap();
+        assert_eq!(read, published_event);
+        let raw: Value =
+            serde_json::from_slice(&get_raw(&engine, storage_key).await.unwrap()).unwrap();
+        let mut fields = raw.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        fields.sort();
+        let mut expected = vec!["id", "key", "payload", "timestamp"];
+        if published_event.owner.is_some() {
+            expected.push("owner");
+            assert_eq!(raw["owner"], json!({"type": "store", "id": "store-1"}));
+        }
+        expected.sort();
+        assert_eq!(fields, expected);
+        assert_eq!(raw["timestamp"], json!(published_event.timestamp));
+        if published_event.id.starts_with("opaque-") {
+            assert_eq!(read.created_at_millis(), published_event.timestamp);
+        }
+    }
+
+    let read_fresh = &stored
+        .iter()
+        .find(|(_, read)| read.id == fresh.id)
+        .unwrap()
+        .1;
+    assert_eq!(read_fresh.key_type(), "entry");
+    assert_eq!(read_fresh.key_value(), "entry-1");
+    assert_eq!(read_fresh.event(), &payload("fresh"));
+    assert!((before..=after).contains(&read_fresh.created_at_millis()));
+    let read_native = &stored
+        .iter()
+        .find(|(_, read)| read.id == native.id)
+        .unwrap()
+        .1;
+    assert_eq!(read_native.created_at_millis(), 1_700_000_000_123);
+    assert_eq!(
+        read_native
+            .rescheduled(1_700_000_000_987)
+            .created_at_millis(),
+        1_700_000_000_123
+    );
 }
 
 #[tokio::test]
 async fn queue_signed_millisecond_due_times_are_reachable_ordered_paged_and_never_rounded() {
-    let engine = engine();
-    let queue = queue(engine, 1);
+    let engine = native_engine().await;
+    let queue = named_queue(&engine, 1);
     let now = Utc::now().timestamp_millis();
     let past = now.div_euclid(1_000) * 1_000 - 60_000;
     let future = now.div_euclid(1_000) * 1_000 + 60_123;
@@ -70,21 +226,28 @@ async fn queue_signed_millisecond_due_times_are_reachable_ordered_paged_and_neve
         i64::MAX - 1,
         i64::MAX,
     ];
-    for timestamp in timestamps.into_iter().rev() {
-        queue
-            .publish(queue_event(
-                &format!("at-{timestamp}"),
-                "entry:clock",
-                timestamp,
-            ))
-            .await
-            .unwrap();
-    }
+    engine
+        .transaction(|tx| {
+            let queue = &queue;
+            async move {
+                for timestamp in timestamps.into_iter().rev() {
+                    queue
+                        .publish_in_tx(
+                            queue_event(&format!("at-{timestamp}"), "entry:clock", timestamp),
+                            &tx,
+                        )
+                        .await?;
+                }
+                Ok::<_, TitoError>(())
+            }
+        })
+        .await
+        .unwrap();
 
     let mut cursor = None;
     let mut due = Vec::new();
     loop {
-        let page = queue.pull::<QueuePayload>(0, cursor, 3).await.unwrap();
+        let page = queue.pull::<Payload>(0, cursor, 3).await.unwrap();
         assert!(page.events.len() <= 3);
         due.extend(page.events.into_iter().map(|(_, event)| event.timestamp));
         assert!(due.len() <= timestamps.len());
@@ -98,10 +261,7 @@ async fn queue_signed_millisecond_due_times_are_reachable_ordered_paged_and_neve
     let mut cursor = None;
     let mut stored = Vec::new();
     loop {
-        let page = queue
-            .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, cursor, 4)
-            .await
-            .unwrap();
+        let page = queue.scan_by_status::<Payload>(cursor, 4).await.unwrap();
         assert!(page.events.len() <= 4);
         stored.extend(page.events);
         assert!(stored.len() <= timestamps.len());
@@ -120,541 +280,306 @@ async fn queue_signed_millisecond_due_times_are_reachable_ordered_paged_and_neve
     }
 }
 
-#[test]
-fn queue_status_has_no_failed_or_dead_letter_variant() {
-    assert_eq!(
-        serde_json::to_value(QueueEventStatus::Pending).unwrap(),
-        json!({"type": "pending"})
-    );
-    assert_eq!(
-        serde_json::to_value(QueueEventStatus::Completed).unwrap(),
-        json!({"type": "completed"})
-    );
-    for unsupported in ["failed", "dead_letter", "processing"] {
-        assert!(serde_json::from_value::<QueueEventStatus>(json!({"type": unsupported})).is_err());
-    }
-    for malformed in [
-        json!("pending"),
-        json!("completed"),
-        json!({}),
-        json!({"kind": "pending"}),
-        json!({"type": "pending", "data": {}}),
-    ] {
-        assert!(serde_json::from_value::<QueueEventStatus>(malformed).is_err());
-    }
-}
-
-#[test]
-fn queue_owner_uses_type_and_rejects_kind_aliases() {
-    let owner = QueueOwner::new("store", "store-1").unwrap();
-    assert_eq!(owner.r#type, "store");
-    assert_eq!(
-        serde_json::to_value(&owner).unwrap(),
-        json!({"type": "store", "id": "store-1"})
-    );
-    for malformed in [
-        json!({"kind": "store", "id": "store-1"}),
-        json!({"type": "store", "kind": "store", "id": "store-1"}),
-    ] {
-        assert!(serde_json::from_value::<QueueOwner>(malformed).is_err());
-    }
-}
-
 #[tokio::test]
-async fn queue_legacy_lifecycle_rows_fail_closed_without_acknowledgement_or_replacement() {
+async fn queue_rows_of_an_older_shape_fail_closed_without_acknowledgement_or_replacement() {
+    let engine = native_engine().await;
     let canonical = serde_json::to_value(queue_event("legacy", "entry:legacy", 123)).unwrap();
-    let mut old_field = canonical.clone();
-    old_field.as_object_mut().unwrap().remove("status");
-    old_field["state"] = json!("pending");
-    let mut old_string = canonical.clone();
-    old_string["status"] = json!("pending");
-    let mut duplicate_field = canonical.clone();
-    duplicate_field["state"] = json!("pending");
-    let mut missing = canonical;
-    missing.as_object_mut().unwrap().remove("status");
+    let mut variants = Vec::new();
+    for (field, value) in [
+        ("status", json!({"type": "pending"})),
+        ("status", json!("pending")),
+        ("state", json!("pending")),
+        ("processedAt", json!(123)),
+        ("owner", json!({"kind": "store", "id": "store-1"})),
+        (
+            "owner",
+            json!({"type": "store", "kind": "store", "id": "store-1"}),
+        ),
+    ] {
+        let mut variant = canonical.clone();
+        variant[field] = value;
+        variants.push(variant);
+    }
 
-    for malformed in [old_field, old_string, duplicate_field, missing] {
-        let engine = engine();
-        let queue = queue(engine.clone(), 1);
-        let key = "queue:pending:0000:09223372036854775931:00000000000000000000:legacy";
-        let bytes = serde_json::to_vec(&malformed).unwrap();
-        engine.put_raw(key, bytes.clone()).await;
-        assert!(serde_json::from_value::<QueueEvent<QueuePayload>>(malformed).is_err());
+    for variant in variants {
+        let queue = named_queue(&engine, 1);
+        let key = pending_key(&queue, 0, 123, 0, "legacy");
+        let bytes = serde_json::to_vec(&variant).unwrap();
+        put_raw(&engine, &key, bytes.clone()).await;
+        let mut advanced = queue_event("legacy", "entry:legacy", 456);
+        advanced.payload = payload("advanced");
+
+        assert!(serde_json::from_value::<QueueEvent<Payload>>(variant.clone()).is_err());
+        assert!(matches!(
+            queue.scan_by_status::<Payload>(None, 10).await,
+            Err(TitoError::DeserializationFailed(_))
+        ));
         assert!(queue
-            .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 10)
-            .await
-            .is_err());
-        assert!(queue
-            .pull::<QueuePayload>(0, None, 10)
+            .pull::<Payload>(0, None, 10)
             .await
             .unwrap()
             .events
             .is_empty());
         assert!(matches!(
-            queue.ack(key).await,
+            queue.ack(&key).await,
             Err(TitoError::DeserializationFailed(_))
         ));
         assert!(matches!(
             queue
-                .reschedule(key, queue_event("legacy", "entry:legacy", 456))
+                .reschedule(&key, queue_event("legacy", "entry:legacy", 456))
                 .await,
             Err(TitoError::DeserializationFailed(_))
         ));
-        assert_eq!(engine.raw_bytes(key).await.unwrap(), bytes);
+        assert!(matches!(
+            queue.advance(&key, advanced).await,
+            Err(TitoError::DeserializationFailed(_))
+        ));
+        assert_eq!(get_raw(&engine, &key).await, Some(bytes));
         assert_eq!(
-            engine.keys_with_prefix("queue:").await,
-            vec![key.to_string()]
+            keys_with_prefix(&engine, &queue_prefix(&queue)).await,
+            vec![key]
         );
     }
-}
-
-#[test]
-fn queue_event_serialization_contains_no_retry_policy_metadata() {
-    let event = QueueEvent::new(
-        "entry:clean",
-        queue_payload("clean"),
-        Utc::now().timestamp_millis(),
-    );
-    let value = serde_json::to_value(&event).unwrap();
-
-    assert_eq!(value["status"], json!({"type": "pending"}));
-    assert!(value.get("state").is_none());
-    assert!(value.get("retryCount").is_none());
-    assert!(value.get("maxRetries").is_none());
-    assert!(value.get("errors").is_none());
-    assert!(
-        value.get("completionReason").is_none(),
-        "pending rows do not carry terminal completion metadata"
-    );
 }
 
 #[tokio::test]
 async fn queue_pending_key_orders_by_event_timestamp_and_enqueue_generation() {
-    let engine = engine();
-    let queue = queue(engine, 1);
-    queue
-        .publish(queue_event("event-1", "entry:1", 123))
-        .await
-        .unwrap();
+    let engine = native_engine().await;
+    let queue = named_queue(&engine, 1);
+    for (id, timestamp) in [("event-1", 123), ("event-2", 123), ("event-0", 122)] {
+        queue
+            .publish(queue_event(id, &format!("entry:{id}"), timestamp))
+            .await
+            .unwrap();
+    }
 
     let pending = queue
-        .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 10)
+        .scan_by_status::<Payload>(None, 10)
         .await
-        .unwrap();
-    let fields: Vec<_> = pending.events[0].0.splitn(6, ':').collect();
-
-    assert_eq!(fields.len(), 6);
+        .unwrap()
+        .events;
     assert_eq!(
-        &fields[..4],
-        ["queue", "pending", "0000", &encode_index_integer(123)]
+        pending
+            .iter()
+            .map(|(_, event)| event.id.as_str())
+            .collect::<Vec<_>>(),
+        ["event-0", "event-1", "event-2"]
     );
-    assert_eq!(fields[4].len(), 20);
-    assert!(fields[4].bytes().all(|byte| byte.is_ascii_digit()));
-    assert!(fields[4].parse::<u64>().unwrap() > 0);
-    assert_eq!(fields[5], "event-1");
+    let mut versions = Vec::new();
+    for (storage_key, event) in &pending {
+        let fields = storage_key.splitn(6, ':').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 6);
+        assert_eq!(
+            &fields[..4],
+            [
+                queue.config.name(),
+                "pending",
+                "0000",
+                encode_index_integer(event.timestamp).as_str(),
+            ]
+        );
+        assert_eq!(fields[4].len(), 20);
+        assert!(fields[4].bytes().all(|byte| byte.is_ascii_digit()));
+        assert_eq!(fields[5], event.id);
+        versions.push(fields[4].parse::<u64>().unwrap());
+    }
+    assert!(versions[1] > 0);
+    assert!(versions[1] < versions[2]);
+    assert!(versions[2] < versions[0]);
 }
 
 #[tokio::test]
-async fn queue_ack_missing_key_is_noop() {
-    let engine = engine();
-    let queue = queue(engine, 1);
+async fn queue_ack_of_a_missing_row_writes_nothing_and_of_a_malformed_row_keeps_its_bytes() {
+    let engine = native_engine().await;
+    let queue = named_queue(&engine, 1);
 
     queue
-        .ack("queue:pending:0000:09223372036854775809:00000000000000000000:missing")
+        .ack(&pending_key(&queue, 0, 1, 0, "missing"))
         .await
         .unwrap();
+    assert!(keys_with_prefix(&engine, &queue_prefix(&queue))
+        .await
+        .is_empty());
+
+    let malformed = pending_key(&queue, 0, 1, 0, "malformed");
+    put_raw(&engine, &malformed, b"not-json".to_vec()).await;
+    assert!(matches!(
+        queue.ack(&malformed).await,
+        Err(TitoError::DeserializationFailed(_))
+    ));
+    assert_eq!(
+        get_raw(&engine, &malformed).await,
+        Some(b"not-json".to_vec())
+    );
 }
 
 #[tokio::test]
-async fn queue_ack_preserves_malformed_pending_bytes() {
-    let engine = engine();
-    let queue = queue(engine.clone(), 1);
-    let key = "queue:pending:0000:09223372036854775809:00000000000000000000:bad";
-    engine.put_raw(key, b"not-json".to_vec()).await;
-
-    let error = queue.ack(key).await.unwrap_err();
-
-    assert!(matches!(error, TitoError::DeserializationFailed(_)));
-    assert!(engine.contains_key(key).await);
-}
-
-#[tokio::test]
-async fn queue_reschedule_atomically_completes_current_and_inserts_supplied_event() {
-    let engine = engine();
-    let queue = queue(engine, 1);
-    let now = Utc::now().timestamp_millis();
+async fn queue_pull_leaves_malformed_rows_in_place_and_passes_a_full_page_of_them() {
+    let engine = native_engine().await;
+    let queue = named_queue(&engine, 1);
+    let malformed = (0..50)
+        .map(|index| pending_key(&queue, 0, i64::MIN, 0, &format!("bad-{index:02}")))
+        .collect::<Vec<_>>();
+    engine
+        .transaction(|tx| {
+            let malformed = &malformed;
+            async move {
+                for key in malformed {
+                    tx.put(key.as_bytes(), b"not-json".to_vec()).await?;
+                }
+                Ok::<_, TitoError>(())
+            }
+        })
+        .await
+        .unwrap();
     queue
-        .publish(QueueEvent::new(
-            "entry:1",
-            queue_payload("current"),
-            now - 1,
+        .publish(queue_event(
+            "zz-valid",
+            "entry:zz-valid",
+            Utc::now().timestamp_millis() - 10_000,
         ))
         .await
         .unwrap();
-    let (storage_key, current) = queue
-        .pull::<QueuePayload>(0, None, 10)
-        .await
-        .unwrap()
-        .events
-        .into_iter()
-        .next()
-        .unwrap();
-    let next_due_at = now.div_euclid(1_000) * 1_000 + 60_123;
-    let next = current.rescheduled(next_due_at);
-    let next_id = next.id.clone();
-    let created_at_millis = next.created_at_millis();
-    assert_eq!(next_id, current.id);
-    assert_eq!(created_at_millis, current.created_at_millis());
 
-    let before_completion = Utc::now().timestamp_millis();
-    queue.reschedule(&storage_key, next).await.unwrap();
-    let after_completion = Utc::now().timestamp_millis();
-
-    let pending = queue
-        .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 10)
+    let first = queue.pull::<Payload>(0, None, 50).await.unwrap();
+    assert!(first.events.is_empty());
+    assert!(first.next_cursor.is_some());
+    let second = queue
+        .pull::<Payload>(0, first.next_cursor, 50)
         .await
         .unwrap();
-    assert_eq!(pending.events.len(), 1);
-    assert_eq!(pending.events[0].1.id, next_id);
-    assert_eq!(pending.events[0].1.timestamp, next_due_at);
-    let completed = queue
-        .scan_by_status::<QueuePayload>(QueueEventStatus::Completed, None, 10)
-        .await
-        .unwrap();
-    assert_eq!(completed.events.len(), 1);
-    assert_eq!(completed.events[0].1.id, next_id);
-    assert_eq!(completed.events[0].1.timestamp, current.timestamp);
-    let completed_wire = serde_json::to_value(&completed.events[0].1).unwrap();
-    assert_eq!(completed_wire["status"], json!({"type": "completed"}));
-    assert!(completed_wire.get("state").is_none());
-    assert!((before_completion..=after_completion)
-        .contains(&completed.events[0].1.processed_at.unwrap()));
-}
+    assert_eq!(second.events.len(), 1);
+    assert_eq!(second.events[0].1.id, "zz-valid");
+    assert!(second.next_cursor.is_none());
 
-#[tokio::test]
-async fn queue_completed_retention_preserves_the_exact_millisecond_boundary() {
-    let engine = engine();
-    let queue = Queue::new(
-        engine.clone(),
-        QueueConfig::new(1, Duration::from_millis(1_501)),
+    assert_eq!(
+        keys_with_prefix(&engine, &pending_key(&queue, 0, i64::MIN, 0, "bad-")).await,
+        malformed
     );
-    let now = 1_700_000_000_123;
-    let cutoff = now - 1_501;
-    let old = put_completed_queue_event(&engine, "old", cutoff - 1).await;
-    let boundary = put_completed_queue_event(&engine, "boundary", cutoff).await;
-    let retained = put_completed_queue_event(&engine, "retained", cutoff + 1).await;
-    queue
-        .publish(queue_event("pending", "entry:pending", 123))
-        .await
-        .unwrap();
-
-    assert!(!queue.maintain_completed_event_retention(now).await.unwrap());
-    assert!(!engine.contains_key(&old).await);
-    assert!(!engine.contains_key(&boundary).await);
-    assert!(engine.contains_key(&retained).await);
-    assert_eq!(engine.keys_with_prefix("queue:pending:").await.len(), 1);
+    assert_eq!(
+        get_raw(&engine, &malformed[0]).await,
+        Some(b"not-json".to_vec())
+    );
 }
 
 #[tokio::test]
-async fn queue_completed_retention_rounds_fractional_milliseconds_up() {
-    for (duration, expected_ms) in [
-        (Duration::ZERO, 0),
-        (Duration::from_nanos(1), 1),
-        (Duration::from_nanos(999_999), 1),
-        (Duration::from_nanos(1_000_000), 1),
-        (Duration::from_nanos(1_000_001), 2),
-        (Duration::from_nanos(1_501_000_001), 1_502),
-    ] {
-        let engine = engine();
-        let queue = Queue::new(engine.clone(), QueueConfig::new(1, duration));
-        let now = 1_700_000_000_123;
-        let boundary = put_completed_queue_event(&engine, "boundary", now - expected_ms).await;
-        let retained = put_completed_queue_event(&engine, "retained", now - expected_ms + 1).await;
+async fn queue_reschedule_and_advance_refuse_identity_and_payload_changes_without_writing() {
+    let engine = native_engine().await;
+    let queue = named_queue(&engine, 1);
+    let owner = QueueOwner::new("store", "original-owner").unwrap();
+    let now = Utc::now().timestamp_millis();
+    queue
+        .publish(queue_event("refused", "entry:refused", now - 1).with_owner(owner.clone()))
+        .await
+        .unwrap();
+    let (storage_key, current) = only_pending(&queue).await;
+    let mut keys = vec![
+        storage_key.clone(),
+        queue
+            .owner_index_key(&owner, storage_key.as_bytes())
+            .unwrap(),
+    ];
+    keys.sort();
 
-        assert!(!queue.maintain_completed_event_retention(now).await.unwrap());
-        assert!(!engine.contains_key(&boundary).await);
-        assert!(engine.contains_key(&retained).await);
+    let same = current.rescheduled(now + 60_000);
+    let mut changed = same.clone();
+    changed.payload = payload("changed");
+    let mut refusals = vec![
+        (false, changed.clone(), "must preserve the event payload"),
+        (true, same.clone(), "must change the event payload"),
+    ];
+    for (advance, base) in [(false, &same), (true, &changed)] {
+        let mut other_id = base.clone();
+        other_id.id = "different-id".to_string();
+        let mut other_key = base.clone();
+        other_key.key = "entry:different".to_string();
+        let mut other_owner = base.clone();
+        other_owner.owner = Some(QueueOwner::new("store", "different-owner").unwrap());
+        refusals.push((advance, other_id, "logical event id"));
+        refusals.push((advance, other_key, "partition key"));
+        refusals.push((advance, other_owner, "event owner"));
     }
-}
 
-#[tokio::test]
-async fn queue_oversized_retention_does_not_wrap_or_delete_history() {
-    let engine = engine();
-    let queue = Queue::new(engine.clone(), QueueConfig::new(1, Duration::MAX));
-    let retained = put_completed_queue_event(&engine, "retained", 123).await;
-
-    assert!(!queue
-        .maintain_completed_event_retention(1_700_000_000_123)
-        .await
-        .unwrap());
-    assert!(engine.contains_key(&retained).await);
-}
-
-#[tokio::test]
-async fn queue_reschedule_rejects_a_different_logical_event() {
-    let engine = engine();
-    let queue = queue(engine, 1);
-    let now = Utc::now().timestamp_millis();
-    queue
-        .publish(queue_event("current", "entry:1", now - 1))
-        .await
-        .unwrap();
-    let (storage_key, _) = queue
-        .pull::<QueuePayload>(0, None, 10)
-        .await
-        .unwrap()
-        .events
-        .into_iter()
-        .next()
-        .unwrap();
-
-    let error = queue
-        .reschedule(
-            &storage_key,
-            queue_event("different", "entry:1", now + 60_000),
-        )
-        .await
-        .unwrap_err();
-
-    assert!(matches!(error, TitoError::InvalidInput(_)));
-    assert_eq!(
-        queue
-            .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 10)
-            .await
-            .unwrap()
-            .events
-            .len(),
-        1
-    );
-    assert!(queue
-        .scan_by_status::<QueuePayload>(QueueEventStatus::Completed, None, 10)
-        .await
-        .unwrap()
-        .events
-        .is_empty());
-}
-
-#[tokio::test]
-async fn queue_reschedule_still_rejects_a_changed_payload() {
-    let engine = engine();
-    let queue = queue(engine, 1);
-    let now = Utc::now().timestamp_millis();
-    queue
-        .publish(queue_event("reschedule-payload", "entry:1", now - 1))
-        .await
-        .unwrap();
-    let (storage_key, current) = queue
-        .pull::<QueuePayload>(0, None, 10)
-        .await
-        .unwrap()
-        .events
-        .into_iter()
-        .next()
-        .unwrap();
-    let mut next = current.rescheduled(now + 60_000);
-    next.payload = queue_payload("changed");
-
-    let error = queue.reschedule(&storage_key, next).await.unwrap_err();
-
-    assert!(matches!(error, TitoError::InvalidInput(message)
-        if message == "A rescheduled row must preserve the event payload"));
-    assert_eq!(
-        queue
-            .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 10)
-            .await
-            .unwrap()
-            .events,
-        vec![(storage_key, current)]
-    );
-    assert!(queue
-        .scan_by_status::<QueuePayload>(QueueEventStatus::Completed, None, 10)
-        .await
-        .unwrap()
-        .events
-        .is_empty());
-}
-
-#[tokio::test]
-async fn queue_advance_atomically_preserves_current_history_and_owner() {
-    let engine = engine();
-    let queue = queue(engine.clone(), 1);
-    let now = Utc::now().timestamp_millis();
-    let owner = QueueOwner::new("store", "advance-owner").unwrap();
-    queue
-        .publish(queue_event("advance", "entry:1", now - 1).with_owner(owner.clone()))
-        .await
-        .unwrap();
-    let (storage_key, current) = queue
-        .pull::<QueuePayload>(0, None, 10)
-        .await
-        .unwrap()
-        .events
-        .into_iter()
-        .next()
-        .unwrap();
-    let mut next = current.rescheduled(now + 60_000);
-    next.payload = queue_payload("advanced");
-
-    queue.advance(&storage_key, next.clone()).await.unwrap();
-
-    let pending = queue
-        .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 10)
-        .await
-        .unwrap();
-    assert_eq!(pending.events.len(), 1);
-    assert_eq!(pending.events[0].1, next);
-    let completed = queue
-        .scan_by_status::<QueuePayload>(QueueEventStatus::Completed, None, 10)
-        .await
-        .unwrap();
-    assert_eq!(completed.events.len(), 1);
-    assert_eq!(completed.events[0].1.id, current.id);
-    assert_eq!(completed.events[0].1.key, current.key);
-    assert_eq!(completed.events[0].1.owner, Some(owner));
-    assert_eq!(completed.events[0].1.payload, current.payload);
-    assert_eq!(completed.events[0].1.timestamp, current.timestamp);
-    assert_eq!(completed.events[0].1.status, QueueEventStatus::Completed);
-    assert!(completed.events[0].1.processed_at.is_some());
-
-    let owner_indexes = engine.keys_with_prefix("queue:owner:").await;
-    assert_eq!(owner_indexes.len(), 2);
-    assert!(owner_indexes.iter().any(|key| key.contains(":pending:")));
-    assert!(owner_indexes.iter().any(|key| key.contains(":completed:")));
-}
-
-#[tokio::test]
-async fn queue_advance_rejects_unchanged_payload_and_identity_changes() {
-    for mutation in ["payload", "id", "key", "owner"] {
-        let engine = engine();
-        let queue = queue(engine.clone(), 1);
-        let now = Utc::now().timestamp_millis();
-        let owner = QueueOwner::new("store", "original-owner").unwrap();
-        queue
-            .publish(queue_event("advance-reject", "entry:1", now - 1).with_owner(owner.clone()))
-            .await
-            .unwrap();
-        let (storage_key, current) = queue
-            .pull::<QueuePayload>(0, None, 10)
-            .await
-            .unwrap()
-            .events
-            .into_iter()
-            .next()
-            .unwrap();
-        let mut next = current.rescheduled(now + 60_000);
-        if mutation != "payload" {
-            next.payload = queue_payload("changed");
-        }
-        match mutation {
-            "payload" => {}
-            "id" => next.id = "different-id".to_string(),
-            "key" => next.key = "entry:different".to_string(),
-            "owner" => {
-                next.owner = Some(QueueOwner::new("store", "different-owner").unwrap());
+    for (advance, next, reason) in refusals {
+        let refused = if advance {
+            queue.advance(&storage_key, next).await
+        } else {
+            queue.reschedule(&storage_key, next).await
+        };
+        match refused {
+            Err(TitoError::InvalidInput(message)) => {
+                assert!(message.contains(reason), "{message}")
             }
-            _ => unreachable!(),
+            other => panic!("a change of the {reason} was not refused: {other:?}"),
         }
-
-        let error = queue.advance(&storage_key, next).await.unwrap_err();
-
-        assert!(matches!(error, TitoError::InvalidInput(_)), "{mutation}");
         assert_eq!(
             queue
-                .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 10)
+                .scan_by_status::<Payload>(None, 10)
                 .await
                 .unwrap()
                 .events,
-            vec![(storage_key, current)]
+            vec![(storage_key.clone(), current.clone())]
         );
-        assert!(queue
-            .scan_by_status::<QueuePayload>(QueueEventStatus::Completed, None, 10)
-            .await
-            .unwrap()
-            .events
-            .is_empty());
-        let owner_indexes = engine.keys_with_prefix("queue:owner:").await;
-        assert_eq!(owner_indexes.len(), 1);
-        assert!(owner_indexes[0].contains(":pending:"));
+        assert_eq!(keys_with_prefix(&engine, &queue_prefix(&queue)).await, keys);
     }
 }
 
 #[tokio::test]
-async fn queue_signed_reschedule_and_advance_preserve_identity_owner_and_atomic_history() {
+async fn queue_signed_reschedule_and_advance_replace_the_row_and_its_owner_index_in_one_step() {
+    let engine = native_engine().await;
+    let owner = QueueOwner::new("store", "signed-owner").unwrap();
     for advance in [false, true] {
         for (current_at, next_at) in [(i64::MIN, -1), (0, i64::MIN), (1, i64::MAX), (i64::MAX, 0)] {
-            let engine = engine();
-            let queue = queue(engine.clone(), 1);
-            let owner = QueueOwner::new("store", "signed-owner").unwrap();
+            let queue = named_queue(&engine, 1);
             let original =
                 queue_event("signed-event", "entry:signed", current_at).with_owner(owner.clone());
             queue.publish(original.clone()).await.unwrap();
-            let initial = queue
-                .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 10)
-                .await
-                .unwrap();
-            let storage_key = initial.events[0].0.clone();
+            let (storage_key, _) = only_pending(&queue).await;
             let mut next = original.rescheduled(next_at);
             if advance {
-                next.payload = queue_payload("advanced");
+                next.payload = payload("advanced");
                 queue.advance(&storage_key, next.clone()).await.unwrap();
             } else {
                 queue.reschedule(&storage_key, next.clone()).await.unwrap();
             }
-            assert!(!engine.contains_key(&storage_key).await);
+
             let pending = queue
-                .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 10)
+                .scan_by_status::<Payload>(None, 10)
                 .await
-                .unwrap();
-            assert_eq!(pending.events.len(), 1);
-            assert_eq!(pending.events[0].1, next);
-            let completed = queue
-                .scan_by_status::<QueuePayload>(QueueEventStatus::Completed, None, 10)
-                .await
-                .unwrap();
-            assert_eq!(completed.events.len(), 1);
-            let (completed_key, completed_event) = &completed.events[0];
-            assert_eq!(completed_event.id, original.id);
-            assert_eq!(completed_event.key, original.key);
-            assert_eq!(completed_event.owner, original.owner);
-            assert_eq!(completed_event.payload, original.payload);
-            assert_eq!(completed_event.timestamp, current_at);
-            assert_eq!(completed_event.status, QueueEventStatus::Completed);
+                .unwrap()
+                .events;
+            assert_eq!(pending.len(), 1);
+            let (next_key, stored) = &pending[0];
+            assert_eq!(stored, &next);
             assert_eq!(
-                completed_key.split(':').nth(2).unwrap(),
-                encode_index_integer(completed_event.processed_at.unwrap())
+                next_key.split(':').nth(3).unwrap(),
+                encode_index_integer(next_at)
             );
-            assert_eq!(
-                completed_key.split(':').nth(3).unwrap(),
-                encode_index_integer(current_at)
-            );
-            let indexes = engine.keys_with_prefix("queue:owner:").await;
-            assert_eq!(indexes.len(), 2);
-            for key in [completed_key, &pending.events[0].0] {
-                let encoded_key = general_purpose::URL_SAFE_NO_PAD.encode(key);
-                assert!(indexes.iter().any(|index| index.ends_with(&encoded_key)));
-            }
-            let due = queue.pull::<QueuePayload>(0, None, 10).await.unwrap();
+            let mut keys = vec![
+                next_key.clone(),
+                queue.owner_index_key(&owner, next_key.as_bytes()).unwrap(),
+            ];
+            keys.sort();
+            assert_eq!(keys_with_prefix(&engine, &queue_prefix(&queue)).await, keys);
+
+            let due = queue.pull::<Payload>(0, None, 10).await.unwrap().events;
             if next_at == i64::MAX {
-                assert!(due.events.is_empty());
+                assert!(due.is_empty());
             } else {
-                assert_eq!(due.events, pending.events);
+                assert_eq!(due, pending);
             }
-            queue.ack(&pending.events[0].0).await.unwrap();
-            assert_eq!(
-                queue
-                    .delete_by_status_before(QueueEventStatus::Completed, i64::MAX, 10)
-                    .await
-                    .unwrap(),
-                2
-            );
-            assert!(engine.keys_with_prefix("queue:").await.is_empty());
+            queue.ack(next_key).await.unwrap();
+            assert!(keys_with_prefix(&engine, &queue_prefix(&queue))
+                .await
+                .is_empty());
         }
     }
 }
 
 #[tokio::test]
 async fn queue_negative_due_bucket_preserves_the_frozen_enqueue_horizon() {
-    let queue = queue(engine(), 1);
+    let engine = native_engine().await;
+    let queue = named_queue(&engine, 1);
     queue
         .publish(queue_event("early", "entry:early", -10))
         .await
@@ -663,7 +588,7 @@ async fn queue_negative_due_bucket_preserves_the_frozen_enqueue_horizon() {
         .publish(queue_event("later", "entry:later", -9))
         .await
         .unwrap();
-    let first = queue.pull::<QueuePayload>(0, None, 1).await.unwrap();
+    let first = queue.pull::<Payload>(0, None, 1).await.unwrap();
     assert_eq!(first.events.len(), 1);
     assert_eq!(first.events[0].1.id, "early");
     let successor = first.events[0].1.rescheduled(-10);
@@ -676,7 +601,7 @@ async fn queue_negative_due_bucket_preserves_the_frozen_enqueue_horizon() {
     assert!(cursor.is_some());
     let mut remaining = Vec::new();
     for _ in 0..4 {
-        let page = queue.pull::<QueuePayload>(0, cursor, 1).await.unwrap();
+        let page = queue.pull::<Payload>(0, cursor, 1).await.unwrap();
         remaining.extend(page.events.into_iter().map(|(_, event)| event.id));
         cursor = page.next_cursor;
         if cursor.is_none() {
@@ -685,183 +610,124 @@ async fn queue_negative_due_bucket_preserves_the_frozen_enqueue_horizon() {
     }
     assert!(cursor.is_none());
     assert_eq!(remaining, ["later"]);
-    let wrapped = queue.pull::<QueuePayload>(0, None, 1).await.unwrap();
+    let wrapped = queue.pull::<Payload>(0, None, 1).await.unwrap();
     assert_eq!(wrapped.events[0].1, successor);
 }
 
 #[tokio::test]
-async fn queue_completed_retention_includes_exact_signed_cutoffs_and_extrema_in_bounded_pages() {
-    let timestamps = [
-        i64::MIN,
-        i64::MIN + 1,
-        -1_000,
-        -1,
-        0,
-        1,
-        1_000,
-        i64::MAX - 1,
-        i64::MAX,
-    ];
-    for cutoff in timestamps {
-        let engine = engine();
-        let queue = queue(engine.clone(), 1);
-        for (index, at) in timestamps.into_iter().enumerate().rev() {
-            put_completed_queue_event(&engine, &format!("at-{index}"), at).await;
-            if at == cutoff {
-                put_completed_queue_event(&engine, "same-cutoff", at).await;
-            }
-        }
-        queue
-            .publish(queue_event("pending", "entry:pending", i64::MIN))
-            .await
-            .unwrap();
-        let mut deleted = 0;
-        loop {
-            let count = queue
-                .delete_by_status_before(QueueEventStatus::Completed, cutoff, 2)
-                .await
-                .unwrap();
-            assert!(count <= 2);
-            deleted += count;
-            assert!(deleted <= timestamps.len() + 1);
-            if count < 2 {
-                break;
-            }
-        }
-        assert_eq!(
-            deleted,
-            timestamps.iter().filter(|at| **at <= cutoff).count() + 1
-        );
-        let retained = queue
-            .scan_by_status::<QueuePayload>(QueueEventStatus::Completed, None, 20)
-            .await
-            .unwrap();
-        assert_eq!(
-            retained
-                .events
-                .iter()
-                .map(|(_, event)| event.processed_at.unwrap())
-                .collect::<Vec<_>>(),
-            timestamps
-                .into_iter()
-                .filter(|at| *at > cutoff)
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(engine.keys_with_prefix("queue:pending:").await.len(), 1);
-    }
-}
-
-#[tokio::test]
-async fn queue_retention_duration_can_cross_zero_without_skipping_negative_history() {
-    let engine = engine();
-    let queue = Queue::new(
-        engine.clone(),
-        QueueConfig::new(1, Duration::from_millis(1_000)),
-    );
-    let old = put_completed_queue_event(&engine, "old", -501).await;
-    let boundary = put_completed_queue_event(&engine, "boundary", -500).await;
-    let retained = put_completed_queue_event(&engine, "retained", -499).await;
-    assert!(!queue.maintain_completed_event_retention(500).await.unwrap());
-    assert!(!engine.contains_key(&old).await);
-    assert!(!engine.contains_key(&boundary).await);
-    assert!(engine.contains_key(&retained).await);
-}
-
-#[tokio::test]
-async fn queue_ack_indeterminate_commit_converges_to_one_of_the_two_atomic_statuses() {
-    for after_apply in [false, true] {
-        let engine = engine();
-        let queue = queue(engine.clone(), 1);
-        let timestamp = Utc::now().timestamp_millis() - 10_000;
-        let owner = QueueOwner::new("store", "atomic-owner").unwrap();
-        queue
-            .publish(queue_event("event-1", "entry:1", timestamp).with_owner(owner.clone()))
-            .await
-            .unwrap();
-        let (storage_key, current) = queue
-            .pull::<QueuePayload>(0, None, 10)
-            .await
-            .unwrap()
-            .events
-            .into_iter()
-            .next()
-            .unwrap();
-        engine.make_next_commit_outcome_unknown(after_apply).await;
-
-        let error = queue.ack(&storage_key).await.unwrap_err();
-
-        assert!(matches!(error, TitoError::CommitOutcomeUnknown(_)));
-        let pending = queue
-            .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 10)
-            .await
-            .unwrap();
-        let completed = queue
-            .scan_by_status::<QueuePayload>(QueueEventStatus::Completed, None, 10)
-            .await
-            .unwrap();
-        let owner_indexes = engine.keys_with_prefix("queue:owner:").await;
-        assert_eq!(owner_indexes.len(), 1);
-        if after_apply {
-            assert!(pending.events.is_empty());
-            assert_eq!(completed.events.len(), 1);
-            assert_eq!(completed.events[0].1.id, current.id);
-            assert_eq!(completed.events[0].1.status, QueueEventStatus::Completed);
-            assert!(owner_indexes[0].contains(":completed:"));
-        } else {
-            assert_eq!(pending.events.len(), 1);
-            assert_eq!(pending.events[0].0, storage_key);
-            assert_eq!(pending.events[0].1.id, current.id);
-            assert!(completed.events.is_empty());
-            assert!(owner_indexes[0].contains(":pending:"));
-        }
-    }
-}
-
-#[tokio::test]
-async fn queue_pull_preserves_malformed_pending_bytes() {
-    let engine = engine();
-    let queue = queue(engine.clone(), 1);
-    let key = "queue:pending:0000:00000000000000000000:00000000000000000000:bad";
-    engine.put_raw(key, b"not-json".to_vec()).await;
-
-    let pulled = queue.pull::<QueuePayload>(0, None, 10).await.unwrap();
-
-    assert!(pulled.events.is_empty());
-    assert!(engine.contains_key(key).await);
-}
-
-#[tokio::test]
-async fn queue_pull_cursor_advances_past_a_full_malformed_page() {
-    let engine = engine();
-    let queue = queue(engine.clone(), 1);
-    for index in 0..50 {
-        let key =
-            format!("queue:pending:0000:00000000000000000000:00000000000000000000:bad-{index:02}");
-        engine.put_raw(&key, b"not-json".to_vec()).await;
-    }
+async fn queue_worker_handler_error_leaves_the_exact_row_and_its_owner_index() {
+    let engine = native_engine().await;
+    let queue = Arc::new(named_queue(&engine, 1));
+    let owner = QueueOwner::new("store", "worker-error").unwrap();
     queue
-        .publish(queue_event(
-            "zz-valid",
-            "entry:zz-valid",
-            Utc::now().timestamp_millis() - 10_000,
-        ))
+        .publish(
+            queue_event(
+                "worker-error",
+                "entry:worker-error",
+                Utc::now().timestamp_millis() - 10_000,
+            )
+            .with_owner(owner.clone()),
+        )
         .await
         .unwrap();
+    let (storage_key, stored) = only_pending(&queue).await;
+    let bytes = get_raw(&engine, &storage_key).await.unwrap();
+    let delivered = Arc::new(Mutex::new(Vec::new()));
+    let called = Arc::new(Notify::new());
+    let handler = {
+        let delivered = delivered.clone();
+        let called = called.clone();
+        move |event: QueueEvent<Payload>| -> PayloadRun {
+            delivered.lock().unwrap().push(event);
+            called.notify_one();
+            Box::pin(async { Err(TitoError::Internal("the test handler fails".to_string())) })
+        }
+    };
+    let (shutdown, shutdown_rx) = broadcast::channel(1);
+    let worker = run_cluster_worker(
+        queue.clone(),
+        worker_config("error-node"),
+        handler,
+        shutdown_rx,
+    )
+    .await;
 
-    let first = queue.pull::<QueuePayload>(0, None, 50).await.unwrap();
-    assert!(first.events.is_empty());
-    assert!(first.next_cursor.is_some());
+    timeout(Duration::from_secs(30), called.notified())
+        .await
+        .expect("the worker delivers the row");
+    stop_worker(shutdown, worker).await;
 
-    let second = queue
-        .pull::<QueuePayload>(0, first.next_cursor, 50)
+    let mut expected = stored;
+    expected.pending_key = Some(storage_key.clone());
+    assert_eq!(delivered.lock().unwrap()[0], expected);
+    assert_eq!(get_raw(&engine, &storage_key).await, Some(bytes));
+    let mut keys = vec![
+        storage_key.clone(),
+        queue
+            .owner_index_key(&owner, storage_key.as_bytes())
+            .unwrap(),
+    ];
+    keys.sort();
+    assert_eq!(keys_with_prefix(&engine, &queue_prefix(&queue)).await, keys);
+}
+
+#[tokio::test]
+async fn queue_worker_does_not_let_a_failing_first_page_starve_later_rows() {
+    let engine = native_engine().await;
+    let queue = Arc::new(named_queue(&engine, 1));
+    let due = Utc::now().timestamp_millis() - 10_000;
+    engine
+        .transaction(|tx| {
+            let queue = &queue;
+            async move {
+                for index in 0..50 {
+                    let id = format!("blocked-{index:02}");
+                    queue
+                        .publish_in_tx(queue_event(&id, &format!("entry:{id}"), due), &tx)
+                        .await?;
+                }
+                Ok::<_, TitoError>(())
+            }
+        })
         .await
         .unwrap();
-    assert_eq!(second.events.len(), 1);
-    assert_eq!(second.events[0].1.id, "zz-valid");
-    assert!(second.next_cursor.is_none());
+    queue
+        .publish(queue_event("zz-target", "entry:zz-target", due))
+        .await
+        .unwrap();
+    let target_key = queue
+        .scan_by_status::<Payload>(None, 100)
+        .await
+        .unwrap()
+        .events
+        .into_iter()
+        .find(|(_, event)| event.id == "zz-target")
+        .unwrap()
+        .0;
+    let handler = |event: QueueEvent<Payload>| -> PayloadRun {
+        Box::pin(async move {
+            if event.id == "zz-target" {
+                Ok(QueueHandlerOutcome::Acknowledge)
+            } else {
+                Err(TitoError::Internal(
+                    "the test handler fails every row before the target".to_string(),
+                ))
+            }
+        })
+    };
+    let (shutdown, shutdown_rx) = broadcast::channel(1);
+    let worker = run_cluster_worker(
+        queue.clone(),
+        worker_config("starvation-node"),
+        handler,
+        shutdown_rx,
+    )
+    .await;
+
+    wait_until_gone(&engine, &target_key).await;
+    stop_worker(shutdown, worker).await;
     assert_eq!(
-        engine
-            .keys_with_prefix("queue:pending:0000:00000000000000000000:00000000000000000000:bad-",)
+        keys_with_prefix(&engine, &queue.pending_prefix())
             .await
             .len(),
         50
@@ -869,271 +735,9 @@ async fn queue_pull_cursor_advances_past_a_full_malformed_page() {
 }
 
 #[tokio::test]
-async fn queue_clear_removes_pending_and_completed_rows() {
-    let engine = engine();
-    let queue = queue(engine.clone(), 1);
-    let now = Utc::now().timestamp_millis();
-    let pending = queue_event("pending", "entry:pending", now);
-    let mut completed = queue_event("completed", "entry:completed", now);
-    completed.status = QueueEventStatus::Completed;
-    completed.processed_at = Some(now);
-
-    engine
-        .put_raw(
-            &format!(
-                "queue:pending:0000:{}:00000000000000000000:pending",
-                encode_index_integer(now)
-            ),
-            serde_json::to_vec(&pending).unwrap(),
-        )
-        .await;
-    engine
-        .put_raw(
-            &format!(
-                "queue:completed:{}:{}:completed",
-                encode_index_integer(now),
-                encode_index_integer(now)
-            ),
-            serde_json::to_vec(&completed).unwrap(),
-        )
-        .await;
-    queue.clear().await.unwrap();
-
-    assert!(engine.keys_with_prefix("queue:").await.is_empty());
-}
-
-#[tokio::test]
-async fn queue_delete_by_status_before_rejects_pending_status() {
-    let engine = engine();
-    let queue = queue(engine, 1);
-
-    let error = queue
-        .delete_by_status_before(QueueEventStatus::Pending, Utc::now().timestamp_millis(), 10)
-        .await
-        .unwrap_err();
-
-    assert!(matches!(error, TitoError::InvalidInput(_)));
-}
-
-#[tokio::test]
-async fn queue_completed_retention_uses_the_terminal_time_index_not_value_decoding() {
-    let engine = engine();
-    let queue = queue(engine.clone(), 1);
-    let cutoff = Utc::now().timestamp_millis() - 1;
-    let malformed_key = format!(
-        "queue:completed:{}:{}:malformed",
-        encode_index_integer(cutoff - 1),
-        encode_index_integer(0),
-    );
-    engine.put_raw(&malformed_key, b"not-json".to_vec()).await;
-
-    let deleted = queue
-        .delete_by_status_before(QueueEventStatus::Completed, cutoff, 10)
-        .await
-        .unwrap();
-
-    assert_eq!(deleted, 1);
-    assert!(!engine.contains_key(&malformed_key).await);
-}
-
-#[tokio::test]
-async fn queue_scan_cursor_continues_after_previous_page() {
-    let engine = engine();
-    let queue = queue(engine, 1);
-    let now = Utc::now().timestamp_millis();
-    for id in ["event-1", "event-2", "event-3"] {
-        queue
-            .publish(queue_event(id, id, now - 10_000))
-            .await
-            .unwrap();
-    }
-
-    let first = queue
-        .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 2)
-        .await
-        .unwrap();
-    assert_eq!(first.events.len(), 2);
-    assert!(first.next_cursor.is_some());
-
-    let second = queue
-        .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, first.next_cursor, 2)
-        .await
-        .unwrap();
-    assert_eq!(second.events.len(), 1);
-}
-
-#[tokio::test]
-async fn queue_worker_applies_an_advance_outcome() {
-    let engine = engine();
-    let queue = Arc::new(queue(engine, 1));
-    let now = Utc::now().timestamp_millis();
-    let owner = QueueOwner::new("store", "worker-advance").unwrap();
-    queue
-        .publish(
-            queue_event("worker-advance", "entry:worker-advance", now - 10_000)
-                .with_owner(owner.clone()),
-        )
-        .await
-        .unwrap();
-    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-
-    let handle = crate::run_cluster_worker::<_, QueuePayload, _>(
-        queue.clone(),
-        cluster_config("advance-node"),
-        move |event| {
-            Box::pin(async move {
-                let mut next = event.rescheduled(now + 3_600_000);
-                next.payload = queue_payload("worker-advanced");
-                Ok(QueueHandlerOutcome::Advance(next))
-            })
-        },
-        shutdown_rx,
-    )
-    .await;
-
-    wait_for_completed(&queue, "worker-advance").await;
-    let pending = queue
-        .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 10)
-        .await
-        .unwrap();
-    assert_eq!(pending.events.len(), 1);
-    assert_eq!(pending.events[0].1.id, "worker-advance");
-    assert_eq!(pending.events[0].1.key, "entry:worker-advance");
-    assert_eq!(pending.events[0].1.owner, Some(owner));
-    assert_eq!(
-        pending.events[0].1.payload,
-        queue_payload("worker-advanced")
-    );
-    assert_eq!(pending.events[0].1.timestamp, now + 3_600_000);
-
-    let _ = shutdown_tx.send(());
-    timeout(Duration::from_secs(2), handle)
-        .await
-        .unwrap()
-        .unwrap();
-}
-
-#[tokio::test]
-async fn queue_worker_handler_error_leaves_exact_pending_invocation_unchanged() {
-    let engine = engine();
-    let queue = Arc::new(queue(engine.clone(), 1));
-    queue
-        .publish(queue_event(
-            "worker-error",
-            "entry:worker-error",
-            Utc::now().timestamp_millis() - 10_000,
-        ))
-        .await
-        .unwrap();
-    let initial = queue
-        .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 10)
-        .await
-        .unwrap();
-    let (storage_key, event) = initial.events.into_iter().next().unwrap();
-    let pending_bytes = engine.raw_bytes(&storage_key).await.unwrap();
-
-    let started = Arc::new(Notify::new());
-    let release = Arc::new(Notify::new());
-    let handler_started = started.clone();
-    let handler_release = release.clone();
-    let mut handler_event = event.clone();
-    handler_event.pending_key = Some(storage_key.clone());
-    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-    let handle = crate::run_cluster_worker::<_, QueuePayload, _>(
-        queue.clone(),
-        cluster_config("error-node"),
-        move |handled_event| {
-            let handler_started = handler_started.clone();
-            let handler_release = handler_release.clone();
-            let handler_event = handler_event.clone();
-            Box::pin(async move {
-                assert_eq!(handled_event, handler_event);
-                handler_started.notify_one();
-                handler_release.notified().await;
-                Err(TitoError::Internal("simulated handler error".to_string()))
-            })
-        },
-        shutdown_rx,
-    )
-    .await;
-
-    timeout(Duration::from_secs(2), started.notified())
-        .await
-        .unwrap();
-    let _ = shutdown_tx.send(());
-    release.notify_one();
-    timeout(Duration::from_secs(2), handle)
-        .await
-        .unwrap()
-        .unwrap();
-
-    let pending = queue
-        .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 10)
-        .await
-        .unwrap();
-    assert_eq!(pending.events, vec![(storage_key.clone(), event)]);
-    assert_eq!(engine.raw_bytes(&storage_key).await, Some(pending_bytes));
-    assert_eq!(
-        engine.keys_with_prefix("queue:pending:").await,
-        vec![storage_key]
-    );
-    assert!(engine.keys_with_prefix("queue:completed:").await.is_empty());
-}
-
-#[tokio::test]
-async fn queue_worker_does_not_let_unacknowledged_first_page_starve_later_rows() {
-    let engine = engine();
-    let queue = Arc::new(queue(engine, 1));
-    let timestamp = Utc::now().timestamp_millis() - 10_000;
-    for index in 0..50 {
-        let id = format!("blocked-{index:02}");
-        queue
-            .publish(queue_event(&id, &format!("entry:{id}"), timestamp))
-            .await
-            .unwrap();
-    }
-    queue
-        .publish(queue_event("zz-target", "entry:zz-target", timestamp))
-        .await
-        .unwrap();
-
-    let target_processed = Arc::new(Notify::new());
-    let handler_target_processed = target_processed.clone();
-    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-    let handle = crate::run_cluster_worker::<_, QueuePayload, _>(
-        queue.clone(),
-        cluster_config("starvation-node"),
-        move |event| {
-            let handler_target_processed = handler_target_processed.clone();
-            Box::pin(async move {
-                if event.id == "zz-target" {
-                    handler_target_processed.notify_one();
-                    Ok(QueueHandlerOutcome::Acknowledge)
-                } else {
-                    panic!("simulated interrupted handler")
-                }
-            })
-        },
-        shutdown_rx,
-    )
-    .await;
-
-    timeout(Duration::from_secs(3), target_processed.notified())
-        .await
-        .unwrap();
-    wait_for_completed(&queue, "zz-target").await;
-
-    let _ = shutdown_tx.send(());
-    timeout(Duration::from_secs(2), handle)
-        .await
-        .unwrap()
-        .unwrap();
-}
-
-#[tokio::test]
-async fn queue_worker_contains_synchronous_handler_panic_and_redelivers() {
-    let engine = engine();
-    let queue = Arc::new(queue(engine, 1));
+async fn queue_worker_contains_a_synchronous_handler_panic_and_redelivers() {
+    let engine = native_engine().await;
+    let queue = Arc::new(named_queue(&engine, 1));
     queue
         .publish(queue_event(
             "worker-sync-panic",
@@ -1142,47 +746,35 @@ async fn queue_worker_contains_synchronous_handler_panic_and_redelivers() {
         ))
         .await
         .unwrap();
+    let (storage_key, _) = only_pending(&queue).await;
     let attempts = Arc::new(AtomicUsize::new(0));
-    let processed = Arc::new(Notify::new());
-    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-    let handler_attempts = attempts.clone();
-    let handler_processed = processed.clone();
-
-    let handle = crate::run_cluster_worker::<_, QueuePayload, _>(
-        queue.clone(),
-        cluster_config("sync-panic-node"),
-        move |event| {
-            assert_eq!(event.id, "worker-sync-panic");
-            if handler_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                panic!("simulated synchronous handler panic");
+    let handler = {
+        let attempts = attempts.clone();
+        move |_event: QueueEvent<Payload>| -> PayloadRun {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("the test handler panics before it returns its future");
             }
-            let handler_processed = handler_processed.clone();
-            Box::pin(async move {
-                handler_processed.notify_one();
-                Ok(QueueHandlerOutcome::Acknowledge)
-            })
-        },
+            Box::pin(async { Ok(QueueHandlerOutcome::Acknowledge) })
+        }
+    };
+    let (shutdown, shutdown_rx) = broadcast::channel(1);
+    let worker = run_cluster_worker(
+        queue.clone(),
+        worker_config("sync-panic-node"),
+        handler,
         shutdown_rx,
     )
     .await;
 
-    timeout(Duration::from_secs(3), processed.notified())
-        .await
-        .unwrap();
-    wait_for_completed(&queue, "worker-sync-panic").await;
+    wait_until_gone(&engine, &storage_key).await;
+    stop_worker(shutdown, worker).await;
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
-
-    let _ = shutdown_tx.send(());
-    timeout(Duration::from_secs(2), handle)
-        .await
-        .unwrap()
-        .unwrap();
 }
 
 #[tokio::test]
-async fn queue_worker_times_out_handler_and_redelivers_pending_invocation() {
-    let engine = engine();
-    let queue = Arc::new(queue(engine, 1));
+async fn queue_worker_times_out_a_handler_and_redelivers_its_row() {
+    let engine = native_engine().await;
+    let queue = Arc::new(named_queue(&engine, 1));
     queue
         .publish(queue_event(
             "worker-timeout",
@@ -1191,50 +783,41 @@ async fn queue_worker_times_out_handler_and_redelivers_pending_invocation() {
         ))
         .await
         .unwrap();
+    let (storage_key, _) = only_pending(&queue).await;
     let attempts = Arc::new(AtomicUsize::new(0));
-    let processed = Arc::new(Notify::new());
-    let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-    let handler_attempts = attempts.clone();
-    let handler_processed = processed.clone();
-    let mut config = cluster_config("timeout-node");
-    config.handler_timeout = Duration::from_millis(20);
-
-    let handle = crate::run_cluster_worker::<_, QueuePayload, _>(
-        queue.clone(),
-        config,
-        move |event| {
-            let attempt = handler_attempts.fetch_add(1, Ordering::SeqCst);
-            let handler_processed = handler_processed.clone();
+    let handler = {
+        let attempts = attempts.clone();
+        move |_event: QueueEvent<Payload>| -> PayloadRun {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
-                assert_eq!(event.id, "worker-timeout");
                 if attempt == 0 {
                     std::future::pending::<()>().await;
                 }
-                handler_processed.notify_one();
                 Ok(QueueHandlerOutcome::Acknowledge)
             })
-        },
-        shutdown_rx,
-    )
-    .await;
+        }
+    };
+    let mut config = worker_config("timeout-node");
+    config.handler_timeout = Duration::from_millis(20);
+    let (shutdown, shutdown_rx) = broadcast::channel(1);
+    let worker = run_cluster_worker(queue.clone(), config, handler, shutdown_rx).await;
 
-    timeout(Duration::from_secs(3), processed.notified())
-        .await
-        .unwrap();
-    wait_for_completed(&queue, "worker-timeout").await;
+    wait_until_gone(&engine, &storage_key).await;
+    stop_worker(shutdown, worker).await;
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
-
-    let _ = shutdown_tx.send(());
-    timeout(Duration::from_secs(2), handle)
-        .await
-        .unwrap()
-        .unwrap();
 }
 
 #[tokio::test]
 async fn published_and_rescheduled_rows_sit_in_the_partition_of_their_key_hash() {
-    let engine = engine();
-    let queue = queue(engine, 10);
+    let engine = native_engine().await;
+    let queue = named_queue(&engine, 10);
+    let partition_prefix = |partition: u32| {
+        format!(
+            "{}:pending:{partition:0width$}:",
+            queue.config.name(),
+            width = PARTITION_DIGITS,
+        )
+    };
     let keys = [
         "store:4f6c1a52-7e0b-4f43-9d0c-2b4c1a9e8f10",
         "entry:due",
@@ -1244,68 +827,47 @@ async fn published_and_rescheduled_rows_sit_in_the_partition_of_their_key_hash()
     ];
     for key in keys {
         queue
-            .publish(QueueEvent::new(key, queue_payload(key), 0))
+            .publish(QueueEvent::new(key, payload(key), 0))
             .await
             .unwrap();
     }
 
     let pending = queue
-        .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 100)
+        .scan_by_status::<Payload>(None, 100)
         .await
-        .unwrap();
-    assert_eq!(pending.events.len(), keys.len());
-    for (storage_key, event) in &pending.events {
-        let partition = crate::queue_partition_for_key(&event.key, 10);
-        assert!(storage_key.starts_with(&format!("queue:pending:{partition:04}:")));
+        .unwrap()
+        .events;
+    assert_eq!(pending.len(), keys.len());
+    for (storage_key, event) in &pending {
+        assert!(storage_key.starts_with(&partition_prefix(queue_partition_for_key(&event.key, 10))));
     }
     for (key, partition) in [
         ("store:4f6c1a52-7e0b-4f43-9d0c-2b4c1a9e8f10", 3),
         ("entry:due", 9),
         ("order:ž", 8),
     ] {
-        assert!(pending.events.iter().any(|(storage_key, event)| {
-            event.key == key && storage_key.starts_with(&format!("queue:pending:{partition:04}:"))
+        assert!(pending.iter().any(|(storage_key, event)| {
+            event.key == key && storage_key.starts_with(&partition_prefix(partition))
         }));
     }
 
-    let (storage_key, event) = pending
-        .events
+    let (storage_key, moved) = pending
         .iter()
         .find(|(_, event)| event.key == "order:ž")
         .cloned()
         .unwrap();
     queue
-        .reschedule(&storage_key, event.rescheduled(1))
+        .reschedule(&storage_key, moved.rescheduled(1))
         .await
         .unwrap();
     let pending = queue
-        .scan_by_status::<QueuePayload>(QueueEventStatus::Pending, None, 100)
+        .scan_by_status::<Payload>(None, 100)
         .await
-        .unwrap();
-    assert!(pending.events.iter().any(|(storage_key, event)| {
+        .unwrap()
+        .events;
+    assert!(pending.iter().any(|(storage_key, event)| {
         event.key == "order:ž"
             && event.timestamp == 1
-            && storage_key.starts_with("queue:pending:0008:")
+            && storage_key.starts_with(&partition_prefix(8))
     }));
-}
-
-async fn wait_for_completed(queue: &Arc<Queue<MemoryEngine>>, event_id: &str) {
-    timeout(Duration::from_secs(2), async {
-        loop {
-            let completed = queue
-                .scan_by_status::<QueuePayload>(QueueEventStatus::Completed, None, 10)
-                .await
-                .unwrap();
-            if completed
-                .events
-                .iter()
-                .any(|(_, event)| event.id == event_id)
-            {
-                break;
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
 }

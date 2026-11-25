@@ -6,11 +6,11 @@ pub mod types;
 
 mod base;
 
-pub use base::{
-    CreateManyBuilder, ReplaceManyBuilder, SetBuilder, TitoModel, MAX_BATCH_BYTES, MAX_BATCH_KEYS,
-    MAX_BATCH_RECORDS, MAX_REPLACE_MANY_BYTES, MAX_REPLACE_MANY_KEYS, MAX_REPLACE_MANY_RECORDS,
-    MAX_SAVE_BYTES,
-};
+pub use base::{TitoModel, MAX_SAVE_BYTES};
+
+mod read;
+
+pub use read::{Batch, BatchAnswers, BatchRequests, Read};
 
 mod utils;
 
@@ -25,22 +25,22 @@ mod fence;
 
 mod error;
 
-pub mod index;
-
-#[cfg(test)]
-mod test_support;
+mod index;
 
 #[cfg(test)]
 mod tito_tests;
 
 pub use error::TitoError;
-pub use types::{TitoEngine, TitoGuard, TitoModelOptions, TitoModelTrait, PARTITION_DIGITS};
+pub use types::{
+    Guard, TitoEngine, TitoIndex, TitoIndexBound, TitoIndexField, TitoIndexValue, TitoModelTrait,
+    PARTITION_DIGITS,
+};
 
 pub use queue::{
-    queue_partition_for_key, run_cluster_worker, ClusterCoordinatorLease,
-    ClusterPartitionAssignment, ClusterWorkerConfig, ClusterWorkerNode, Queue, QueueConfig,
-    QueueDeletePage, QueueEvent, QueueEventStatus, QueueHandlerOutcome, QueueHandlerResult,
-    QueueOwner, QueueScanPage, MAX_QUEUE_EVENT_BYTES, MAX_QUEUE_OWNER_COMPONENT_BYTES,
+    queue_partition_for_key, run_cluster_worker, ClusterPartitionAssignment, ClusterPartitions,
+    ClusterWorkerConfig, ClusterWorkerNode, Queue, QueueConfig, QueueDeletePage, QueueEvent,
+    QueueHandlerOutcome, QueueHandlerResult, QueueOwner, QueueScanPage, MAX_QUEUE_EVENT_BYTES,
+    MAX_QUEUE_OWNER_COMPONENT_BYTES,
 };
 
 pub use utils::{key_after, prefix_end};

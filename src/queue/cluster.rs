@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,17 +8,15 @@ use futures::future::BoxFuture;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch};
-use tokio::time::{sleep, Instant};
+use tokio::task::{AbortHandle, JoinSet};
+use tokio::time::{sleep, timeout};
 
 use super::worker::{
     apply_handler_outcome, execute_handler, handler_outcome_or_log, DEFAULT_HANDLER_TIMEOUT,
 };
-use super::{
-    duration_millis, Queue, QueueEvent, QueueHandlerResult, QueuePullCursor,
-    COMPLETED_EVENT_MAINTENANCE_INTERVAL,
-};
+use super::{duration_millis, Queue, QueueEvent, QueueHandlerResult, QueuePullCursor};
 use crate::key_encoder::encode_index_string;
-use crate::types::{TitoEngine, TitoTransaction, PARTITION_DIGITS};
+use crate::types::{Sealed, TitoEngine, TitoTransaction, PARTITION_DIGITS};
 use crate::TitoError;
 
 #[derive(Debug, Clone)]
@@ -56,6 +55,11 @@ impl ClusterWorkerConfig {
 
         Self::new(format!("{base}:{boot_id}"))
     }
+
+    fn stop_after_millis(&self) -> i64 {
+        duration_millis(self.lease_ttl)
+            .saturating_sub(duration_millis(self.heartbeat_interval).saturating_mul(2))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -65,36 +69,15 @@ pub struct ClusterWorkerNode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ClusterCoordinatorLease {
-    pub owner_node_id: String,
-    pub lease_until: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClusterPartitionAssignment {
     pub partition: u32,
-    pub desired_node_id: Option<String>,
     pub owner_node_id: Option<String>,
-    pub lease_until: i64,
-    pub generation: u64,
 }
 
-impl ClusterPartitionAssignment {
-    fn new(partition: u32) -> Self {
-        Self {
-            partition,
-            desired_node_id: None,
-            owner_node_id: None,
-            lease_until: 0,
-            generation: 0,
-        }
-    }
-
-    fn owner_is_active(&self, active_nodes: &BTreeSet<String>, now: i64) -> bool {
-        self.owner_node_id
-            .as_ref()
-            .is_some_and(|owner| active_nodes.contains(owner) && self.lease_until > now)
-    }
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClusterPartitions {
+    pub share: Vec<u32>,
+    pub held: Vec<u32>,
 }
 
 impl<E: TitoEngine> Queue<E> {
@@ -102,41 +85,21 @@ impl<E: TitoEngine> Queue<E> {
         format!("tito:{}:cluster:", self.config.name())
     }
 
-    fn coordinator_key(&self) -> String {
-        format!("{}coordinator", self.cluster_prefix())
-    }
-
     fn nodes_prefix(&self) -> String {
         format!("{}nodes:", self.cluster_prefix())
     }
 
-    fn node_key(&self, node_id: &str) -> String {
+    pub(crate) fn node_key(&self, node_id: &str) -> String {
         format!("{}{}", self.nodes_prefix(), encode_index_string(node_id))
     }
 
-    fn partitions_prefix(&self) -> String {
-        format!("{}partitions:", self.cluster_prefix())
-    }
-
-    fn partition_key(&self, partition: u32) -> String {
+    pub(crate) fn partition_key(&self, partition: u32) -> String {
         format!(
-            "{}{:0pwidth$}",
-            self.partitions_prefix(),
+            "{}partitions:{:0pwidth$}",
+            self.cluster_prefix(),
             partition,
             pwidth = PARTITION_DIGITS,
         )
-    }
-
-    async fn read_json<T: DeserializeOwned>(
-        tx: &E::Transaction,
-        key: &str,
-    ) -> Result<Option<T>, TitoError> {
-        let bytes = tx
-            .get(key.as_bytes())
-            .await
-            .map_err(|e| TitoError::QueryFailed(format!("Get cluster queue key: {}", e)))?;
-
-        Self::decode_json(bytes)
     }
 
     fn decode_json<T: DeserializeOwned>(bytes: Option<Vec<u8>>) -> Result<Option<T>, TitoError> {
@@ -161,10 +124,86 @@ impl<E: TitoEngine> Queue<E> {
             .map_err(|e| TitoError::UpdateFailed(format!("Put cluster queue key: {}", e)))
     }
 
+    async fn read_cluster_nodes(
+        &self,
+        tx: &E::Transaction,
+    ) -> Result<Vec<ClusterWorkerNode>, TitoError> {
+        let prefix = self.nodes_prefix();
+        let entries = tx
+            .scan(
+                prefix.as_bytes()..Self::prefix_end(&prefix).as_slice(),
+                u32::MAX,
+            )
+            .await
+            .map_err(|e| TitoError::QueryFailed(format!("Scan cluster queue nodes: {}", e)))?;
+
+        let mut nodes = Vec::with_capacity(entries.len());
+        for (key, value) in entries {
+            let node = serde_json::from_slice::<ClusterWorkerNode>(&value)
+                .map_err(|e| TitoError::DeserializationFailed(e.to_string()))?;
+            if key != self.node_key(&node.node_id).into_bytes() {
+                return Err(TitoError::DeserializationFailed(
+                    "Cluster queue node row names another node".to_string(),
+                ));
+            }
+            nodes.push(node);
+        }
+        Ok(nodes)
+    }
+
+    async fn read_cluster_partitions(
+        &self,
+        tx: &E::Transaction,
+    ) -> Result<Vec<ClusterPartitionAssignment>, TitoError> {
+        let partition_count = self.config.partition_count.max(1);
+        let keys = (0..partition_count)
+            .map(|partition| self.partition_key(partition))
+            .collect::<Vec<_>>();
+        let mut found: HashMap<_, _> = tx
+            .get_keys(keys.iter().collect::<Vec<_>>(), Sealed)
+            .await
+            .map_err(|e| TitoError::QueryFailed(format!("Get cluster queue partitions: {}", e)))?
+            .into_iter()
+            .collect();
+
+        let mut assignments = Vec::with_capacity(keys.len());
+        for (partition, key) in (0..partition_count).zip(keys) {
+            let assignment =
+                Self::decode_json::<ClusterPartitionAssignment>(found.remove(key.as_bytes()))?
+                    .unwrap_or(ClusterPartitionAssignment {
+                        partition,
+                        owner_node_id: None,
+                    });
+            if assignment.partition != partition {
+                return Err(TitoError::DeserializationFailed(
+                    "Cluster queue partition row names another partition".to_string(),
+                ));
+            }
+            assignments.push(assignment);
+        }
+        Ok(assignments)
+    }
+
+    async fn fence_cluster_node(
+        &self,
+        tx: &E::Transaction,
+        nodes: &[ClusterWorkerNode],
+        node_id: &str,
+    ) -> Result<(), TitoError> {
+        let key = self.node_key(node_id);
+        match nodes.iter().find(|node| node.node_id == node_id) {
+            Some(node) => Self::put_json(tx, &key, node).await,
+            None => tx
+                .delete(key.as_bytes())
+                .await
+                .map_err(|e| TitoError::DeleteFailed(format!("Fence cluster queue node: {}", e))),
+        }
+    }
+
     pub async fn heartbeat_cluster_worker(
         &self,
         config: &ClusterWorkerConfig,
-    ) -> Result<(), TitoError> {
+    ) -> Result<i64, TitoError> {
         let config = config.clone();
         self.engine
             .transaction(|tx| {
@@ -174,284 +213,150 @@ impl<E: TitoEngine> Queue<E> {
                         node_id: config.node_id.clone(),
                         heartbeat_at: Utc::now().timestamp_millis(),
                     };
-                    Self::put_json(&tx, &self.node_key(&config.node_id), &node).await
+                    Self::put_json(&tx, &self.node_key(&config.node_id), &node).await?;
+                    Ok::<_, TitoError>(node.heartbeat_at)
                 }
             })
             .await
     }
 
-    pub async fn try_acquire_cluster_coordinator(
+    pub async fn step_cluster_worker(
         &self,
         config: &ClusterWorkerConfig,
-    ) -> Result<bool, TitoError> {
+        running_partitions: &BTreeSet<u32>,
+    ) -> Result<ClusterPartitions, TitoError> {
         let config = config.clone();
-        self.engine
+        let running_partitions = running_partitions.clone();
+        let (partitions, stale_nodes) = self
+            .engine
             .transaction(|tx| {
                 let config = config.clone();
+                let running_partitions = running_partitions.clone();
                 async move {
                     let now = Utc::now().timestamp_millis();
-                    let key = self.coordinator_key();
-                    let lease = Self::read_json::<ClusterCoordinatorLease>(&tx, &key).await?;
-                    let can_claim = match lease {
-                        None => true,
-                        Some(ref lease) if lease.owner_node_id == config.node_id => true,
-                        Some(ref lease) if lease.lease_until <= now => true,
-                        Some(_) => false,
-                    };
+                    let live_after = now.saturating_sub(duration_millis(config.lease_ttl));
+                    let remove_before = now.saturating_sub(duration_millis(config.stale_node_ttl));
+                    let nodes = self.read_cluster_nodes(&tx).await?;
+                    let stale_nodes = nodes.iter().any(|node| node.heartbeat_at < remove_before);
+                    let mut live_nodes = nodes
+                        .iter()
+                        .filter(|node| node.heartbeat_at > live_after)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    live_nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+                    let share =
+                        desired_partition_owners(self.config.partition_count.max(1), &live_nodes)
+                            .into_iter()
+                            .filter(|(_, node_id)| *node_id == config.node_id)
+                            .map(|(partition, _)| partition)
+                            .collect::<BTreeSet<_>>();
 
-                    if !can_claim {
-                        return Ok(false);
+                    let mut fenced = BTreeSet::new();
+                    let mut held = Vec::new();
+                    for mut assignment in self.read_cluster_partitions(&tx).await? {
+                        let partition = assignment.partition;
+                        if assignment.owner_node_id.as_deref() == Some(config.node_id.as_str()) {
+                            if share.contains(&partition) || running_partitions.contains(&partition)
+                            {
+                                held.push(partition);
+                            } else {
+                                assignment.owner_node_id = None;
+                                Self::put_json(&tx, &self.partition_key(partition), &assignment)
+                                    .await?;
+                            }
+                            continue;
+                        }
+                        if !share.contains(&partition) {
+                            continue;
+                        }
+                        if let Some(holder) = assignment.owner_node_id.clone() {
+                            if live_nodes.iter().any(|node| node.node_id == holder) {
+                                continue;
+                            }
+                            if fenced.insert(holder.clone()) {
+                                self.fence_cluster_node(&tx, &nodes, &holder).await?;
+                            }
+                        }
+                        assignment.owner_node_id = Some(config.node_id.clone());
+                        Self::put_json(&tx, &self.partition_key(partition), &assignment).await?;
+                        held.push(partition);
                     }
 
-                    let lease = ClusterCoordinatorLease {
-                        owner_node_id: config.node_id.clone(),
-                        lease_until: now.saturating_add(duration_millis(config.lease_ttl)),
-                    };
-                    Self::put_json(&tx, &key, &lease).await?;
-                    Ok(true)
+                    Ok::<_, TitoError>((
+                        ClusterPartitions {
+                            share: share.into_iter().collect(),
+                            held,
+                        },
+                        stale_nodes,
+                    ))
                 }
             })
-            .await
+            .await?;
+
+        if stale_nodes {
+            if let Err(error) = self.delete_stale_cluster_nodes(&config).await {
+                log::error!(
+                    "Deleting stale queue cluster nodes failed for {}: {error}",
+                    config.node_id
+                );
+            }
+        }
+        Ok(partitions)
     }
 
-    pub async fn rebalance_cluster_partitions(
+    async fn delete_stale_cluster_nodes(
         &self,
         config: &ClusterWorkerConfig,
-    ) -> Result<Vec<ClusterPartitionAssignment>, TitoError> {
+    ) -> Result<(), TitoError> {
         let config = config.clone();
-        let partition_count = self.config.partition_count.max(1);
         self.engine
             .transaction(|tx| {
                 let config = config.clone();
                 async move {
-                    let now = Utc::now().timestamp_millis();
-                    let nodes = {
-                        let stale_before = now.saturating_sub(duration_millis(config.lease_ttl));
-                        let remove_before =
-                            now.saturating_sub(duration_millis(config.stale_node_ttl));
-                        let prefix = self.nodes_prefix();
-                        let entries = tx
-                            .scan(
-                                prefix.as_bytes()..Self::prefix_end(&prefix).as_slice(),
-                                u32::MAX,
-                            )
-                            .await
-                            .map_err(|e| {
-                                TitoError::QueryFailed(format!("Scan cluster queue nodes: {}", e))
-                            })?;
-
-                        let mut nodes = Vec::new();
-                        for (key, value) in entries {
-                            let node = serde_json::from_slice::<ClusterWorkerNode>(&value)
-                                .map_err(|e| TitoError::DeserializationFailed(e.to_string()))?;
-                            if node.heartbeat_at >= stale_before {
-                                nodes.push(node);
-                            } else if node.heartbeat_at < remove_before {
-                                tx.delete(key).await.map_err(|e| {
+                    let remove_before = Utc::now()
+                        .timestamp_millis()
+                        .saturating_sub(duration_millis(config.stale_node_ttl));
+                    for node in self.read_cluster_nodes(&tx).await? {
+                        if node.heartbeat_at < remove_before {
+                            tx.delete(self.node_key(&node.node_id).as_bytes())
+                                .await
+                                .map_err(|e| {
                                     TitoError::DeleteFailed(format!(
                                         "Delete stale cluster queue node: {}",
                                         e
                                     ))
                                 })?;
-                            }
                         }
-                        nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
-                        nodes
-                    };
-
-                    if nodes.is_empty() {
-                        return Ok(Vec::new());
                     }
-
-                    let active_nodes = nodes
-                        .iter()
-                        .map(|node| node.node_id.clone())
-                        .collect::<BTreeSet<_>>();
-                    let desired = desired_partition_owners(partition_count, &nodes);
-                    let mut assignments = Vec::new();
-                    let keys = (0..partition_count)
-                        .map(|partition| self.partition_key(partition))
-                        .collect::<Vec<_>>();
-                    let mut found: HashMap<_, _> = tx
-                        .batch_get(keys.iter().collect::<Vec<_>>())
-                        .await
-                        .map_err(|e| {
-                            TitoError::QueryFailed(format!("Get cluster queue key: {}", e))
-                        })?
-                        .into_iter()
-                        .collect();
-
-                    for (partition, key) in (0..partition_count).zip(keys) {
-                        let mut assignment = Self::decode_json::<ClusterPartitionAssignment>(
-                            found.remove(key.as_bytes()),
-                        )?
-                        .unwrap_or_else(|| ClusterPartitionAssignment::new(partition));
-
-                        let next_desired = desired.get(&partition).cloned();
-                        let desired_changed = assignment.desired_node_id != next_desired;
-                        assignment.desired_node_id = next_desired;
-
-                        if !assignment.owner_is_active(&active_nodes, now) {
-                            assignment.owner_node_id = None;
-                            assignment.lease_until = 0;
-                        }
-
-                        if desired_changed {
-                            assignment.generation = assignment.generation.saturating_add(1);
-                        }
-
-                        Self::put_json(&tx, &key, &assignment).await?;
-                        assignments.push(assignment);
-                    }
-
-                    Ok(assignments)
+                    Ok::<_, TitoError>(())
                 }
             })
             .await
     }
 
-    pub async fn sync_cluster_partition_leases(
-        &self,
-        config: &ClusterWorkerConfig,
-    ) -> Result<Vec<ClusterPartitionAssignment>, TitoError> {
+    pub async fn leave_cluster(&self, config: &ClusterWorkerConfig) -> Result<(), TitoError> {
         let config = config.clone();
         self.engine
             .transaction(|tx| {
                 let config = config.clone();
                 async move {
-                    let now = Utc::now().timestamp_millis();
-                    let prefix = self.partitions_prefix();
-                    let entries = tx
-                        .scan(
-                            prefix.as_bytes()..Self::prefix_end(&prefix).as_slice(),
-                            u32::MAX,
-                        )
-                        .await
-                        .map_err(|e| {
-                            TitoError::QueryFailed(format!("Scan cluster queue partitions: {}", e))
-                        })?;
-
-                    let mut owned = Vec::new();
-                    for (key_bytes, value) in entries {
-                        let key = String::from_utf8(key_bytes).map_err(|_| {
-                            TitoError::DeserializationFailed(
-                                "Invalid cluster queue partition key".to_string(),
+                    for mut assignment in self.read_cluster_partitions(&tx).await? {
+                        if assignment.owner_node_id.as_deref() == Some(config.node_id.as_str()) {
+                            assignment.owner_node_id = None;
+                            Self::put_json(
+                                &tx,
+                                &self.partition_key(assignment.partition),
+                                &assignment,
                             )
-                        })?;
-                        let mut assignment =
-                            serde_json::from_slice::<ClusterPartitionAssignment>(&value)
-                                .map_err(|e| TitoError::DeserializationFailed(e.to_string()))?;
-
-                        let desired_is_me =
-                            assignment.desired_node_id.as_ref() == Some(&config.node_id);
-                        let owner_is_me =
-                            assignment.owner_node_id.as_ref() == Some(&config.node_id);
-                        let owner_expired = assignment.lease_until <= now;
-
-                        if owner_is_me && !desired_is_me {
-                            assignment.owner_node_id = None;
-                            assignment.lease_until = 0;
-                            assignment.generation = assignment.generation.saturating_add(1);
-                            Self::put_json(&tx, &key, &assignment).await?;
-                            continue;
-                        }
-
-                        if desired_is_me
-                            && (owner_is_me || assignment.owner_node_id.is_none() || owner_expired)
-                        {
-                            if !owner_is_me {
-                                assignment.generation = assignment.generation.saturating_add(1);
-                            }
-                            assignment.owner_node_id = Some(config.node_id.clone());
-                            assignment.lease_until =
-                                now.saturating_add(duration_millis(config.lease_ttl));
-                            Self::put_json(&tx, &key, &assignment).await?;
-                            owned.push(assignment);
+                            .await?;
                         }
                     }
-
-                    owned.sort_by_key(|assignment| assignment.partition);
-                    Ok(owned)
-                }
-            })
-            .await
-    }
-
-    pub async fn owned_cluster_partitions(
-        &self,
-        config: &ClusterWorkerConfig,
-    ) -> Result<Vec<u32>, TitoError> {
-        Ok(self
-            .owned_cluster_partition_assignments(config)
-            .await?
-            .into_iter()
-            .map(|assignment| assignment.partition)
-            .collect())
-    }
-
-    pub async fn owned_cluster_partition_assignments(
-        &self,
-        config: &ClusterWorkerConfig,
-    ) -> Result<Vec<ClusterPartitionAssignment>, TitoError> {
-        let config = config.clone();
-        self.engine
-            .transaction(|tx| {
-                let config = config.clone();
-                async move {
-                    let now = Utc::now().timestamp_millis();
-                    let prefix = self.partitions_prefix();
-                    let entries = tx
-                        .scan(
-                            prefix.as_bytes()..Self::prefix_end(&prefix).as_slice(),
-                            u32::MAX,
-                        )
+                    tx.delete(self.node_key(&config.node_id).as_bytes())
                         .await
                         .map_err(|e| {
-                            TitoError::QueryFailed(format!("Scan cluster queue partitions: {}", e))
+                            TitoError::DeleteFailed(format!("Delete cluster queue node: {}", e))
                         })?;
-
-                    let mut assignments = Vec::new();
-                    for (_, value) in entries {
-                        let assignment =
-                            serde_json::from_slice::<ClusterPartitionAssignment>(&value)
-                                .map_err(|e| TitoError::DeserializationFailed(e.to_string()))?;
-                        if assignment.owner_node_id.as_ref() == Some(&config.node_id)
-                            && assignment.desired_node_id.as_ref() == Some(&config.node_id)
-                            && assignment.lease_until > now
-                        {
-                            assignments.push(assignment);
-                        }
-                    }
-                    assignments.sort_by_key(|assignment| assignment.partition);
-                    Ok(assignments)
-                }
-            })
-            .await
-    }
-
-    async fn cluster_partition_lease_is_current(
-        &self,
-        config: &ClusterWorkerConfig,
-        partition: u32,
-        generation: u64,
-    ) -> Result<bool, TitoError> {
-        let config = config.clone();
-        self.engine
-            .transaction(|tx| {
-                let config = config.clone();
-                async move {
-                    let now = Utc::now().timestamp_millis();
-                    let key = self.partition_key(partition);
-                    let Some(assignment) =
-                        Self::read_json::<ClusterPartitionAssignment>(&tx, &key).await?
-                    else {
-                        return Ok(false);
-                    };
-
-                    Ok(assignment.generation == generation
-                        && assignment.owner_node_id.as_ref() == Some(&config.node_id)
-                        && assignment.desired_node_id.as_ref() == Some(&config.node_id)
-                        && assignment.lease_until > now)
+                    Ok::<_, TitoError>(())
                 }
             })
             .await
@@ -495,179 +400,136 @@ where
         + Sync
         + 'static,
 {
-    let maintenance_shutdown = shutdown.resubscribe();
     tokio::spawn(async move {
-        let (shutdown_latch, shutdown_latched) = watch::channel(false);
-        let mut shutdown_signal = shutdown;
-        let mut partition_workers = BTreeMap::<u32, PartitionWorker>::new();
-        let mut retired_partition_workers = Vec::<tokio::task::JoinHandle<()>>::new();
-        let maintenance_queue = queue.clone();
-        let maintenance_config = config.clone();
-        let maintenance_handle = tokio::spawn(async move {
-            maintain_cluster_worker(maintenance_queue, maintenance_config, maintenance_shutdown)
-                .await;
-        });
+        let stop_after = config.stop_after_millis();
+        if stop_after <= 0 {
+            log::error!(
+                "Queue cluster worker {} needs a lease_ttl longer than two heartbeat intervals",
+                config.node_id
+            );
+            return;
+        }
+        let mut shutdown = shutdown;
+        let heartbeat = Arc::new(AtomicI64::new(i64::MIN));
+        let mut tasks = JoinSet::new();
+        let mut workers = BTreeMap::<u32, PartitionWorker>::new();
 
         loop {
-            if shutdown_requested(&mut shutdown_signal) {
-                let _ = shutdown_latch.send(true);
+            if shutdown_requested(&mut shutdown) {
                 break;
             }
-
-            tokio::select! {
-                biased;
-                _ = shutdown_signal.recv() => {
-                    let _ = shutdown_latch.send(true);
-                    break;
+            while let Some(result) = tasks.try_join_next() {
+                if let Err(error) = result {
+                    log::error!(
+                        "A queue partition worker of {} ended abnormally: {error}",
+                        config.node_id
+                    );
                 }
-                _ = reconcile_partition_workers(
-                    queue.clone(),
-                    config.clone(),
-                    handler.clone(),
-                    &mut partition_workers,
-                    &mut retired_partition_workers,
-                    shutdown_latched.clone(),
-                ) => {}
             }
-            reap_partition_workers(&mut retired_partition_workers).await;
+            workers.retain(|_, worker| !worker.task.is_finished());
+
+            let heartbeat_at = tokio::select! {
+                biased;
+                _ = shutdown.recv() => break,
+                heartbeat_at = queue.heartbeat_cluster_worker(&config) => heartbeat_at,
+            };
+            match heartbeat_at {
+                Ok(heartbeat_at) => {
+                    let previous = heartbeat.load(Ordering::Acquire);
+                    if Utc::now().timestamp_millis().saturating_sub(previous) >= stop_after {
+                        for worker in workers.values() {
+                            let _ = worker.stop.send(true);
+                        }
+                    }
+                    heartbeat.store(heartbeat_at, Ordering::Release);
+                    let running = workers.keys().copied().collect::<BTreeSet<_>>();
+                    let step = tokio::select! {
+                        biased;
+                        _ = shutdown.recv() => break,
+                        step = queue.step_cluster_worker(&config, &running) => step,
+                    };
+                    match step {
+                        Ok(partitions) => {
+                            let run = partitions
+                                .held
+                                .iter()
+                                .copied()
+                                .filter(|partition| partitions.share.contains(partition))
+                                .collect::<BTreeSet<_>>();
+                            for (partition, worker) in &workers {
+                                if !run.contains(partition) {
+                                    let _ = worker.stop.send(true);
+                                }
+                            }
+                            for partition in run {
+                                if workers.contains_key(&partition) {
+                                    continue;
+                                }
+                                let (stop, stop_rx) = watch::channel(false);
+                                let task = tasks.spawn(run_partition_worker(
+                                    queue.clone(),
+                                    config.clone(),
+                                    partition,
+                                    handler.clone(),
+                                    stop_rx,
+                                    heartbeat.clone(),
+                                    stop_after,
+                                ));
+                                workers.insert(partition, PartitionWorker { stop, task });
+                            }
+                        }
+                        Err(error) => {
+                            log::error!(
+                                "Queue cluster step failed for {}: {error}",
+                                config.node_id
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    log::error!("Queue heartbeat failed for {}: {error}", config.node_id);
+                }
+            }
 
             tokio::select! {
                 biased;
-                _ = shutdown_signal.recv() => {
-                    let _ = shutdown_latch.send(true);
-                    break;
-                }
-                _ = sleep(config.poll_interval) => {}
+                _ = shutdown.recv() => break,
+                _ = sleep(config.heartbeat_interval) => {}
             }
         }
 
-        stop_partition_workers(partition_workers, retired_partition_workers).await;
-        let _ = maintenance_handle.await;
+        for worker in workers.values() {
+            let _ = worker.stop.send(true);
+        }
+        while tasks.join_next().await.is_some() {}
+        match timeout(config.lease_ttl, queue.leave_cluster(&config)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                log::error!(
+                    "Leaving the queue cluster failed for {}: {error}",
+                    config.node_id
+                );
+            }
+            Err(_) => {
+                log::error!("Leaving the queue cluster timed out for {}", config.node_id);
+            }
+        }
     })
 }
 
 struct PartitionWorker {
-    generation: u64,
     stop: watch::Sender<bool>,
-    handle: tokio::task::JoinHandle<()>,
-}
-
-async fn reconcile_partition_workers<E, T, H>(
-    queue: Arc<Queue<E>>,
-    config: ClusterWorkerConfig,
-    handler: H,
-    partition_workers: &mut BTreeMap<u32, PartitionWorker>,
-    retired_partition_workers: &mut Vec<tokio::task::JoinHandle<()>>,
-    shutdown: watch::Receiver<bool>,
-) where
-    E: TitoEngine + 'static,
-    T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerResult<T>>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-{
-    let owned = match queue.owned_cluster_partition_assignments(&config).await {
-        Ok(assignments) => assignments
-            .into_iter()
-            .map(|assignment| (assignment.partition, assignment))
-            .collect::<BTreeMap<_, _>>(),
-        Err(_) => return,
-    };
-
-    let stale_partitions = partition_workers
-        .iter()
-        .filter_map(|(partition, worker)| match owned.get(partition) {
-            Some(assignment)
-                if assignment.generation == worker.generation && !worker.handle.is_finished() =>
-            {
-                None
-            }
-            _ => Some(*partition),
-        })
-        .collect::<Vec<_>>();
-
-    for partition in stale_partitions {
-        if let Some(worker) = partition_workers.remove(&partition) {
-            let _ = worker.stop.send(true);
-            retired_partition_workers.push(worker.handle);
-        }
-    }
-
-    for assignment in owned.into_values() {
-        if partition_workers.contains_key(&assignment.partition) {
-            continue;
-        }
-
-        let (stop, stop_rx) = watch::channel(false);
-        let q = queue.clone();
-        let worker_config = config.clone();
-        let h = handler.clone();
-        let partition = assignment.partition;
-        let generation = assignment.generation;
-        let shutdown_rx = shutdown.clone();
-        let handle = tokio::spawn(async move {
-            run_partition_worker(
-                q,
-                worker_config,
-                partition,
-                generation,
-                h,
-                stop_rx,
-                shutdown_rx,
-            )
-            .await;
-        });
-
-        partition_workers.insert(
-            partition,
-            PartitionWorker {
-                generation,
-                stop,
-                handle,
-            },
-        );
-    }
-}
-
-async fn reap_partition_workers(partition_workers: &mut Vec<tokio::task::JoinHandle<()>>) {
-    let mut index = 0;
-    while index < partition_workers.len() {
-        if partition_workers[index].is_finished() {
-            let handle = partition_workers.swap_remove(index);
-            let _ = handle.await;
-        } else {
-            index += 1;
-        }
-    }
-}
-
-async fn stop_partition_workers(
-    partition_workers: BTreeMap<u32, PartitionWorker>,
-    retired_partition_workers: Vec<tokio::task::JoinHandle<()>>,
-) {
-    for worker in partition_workers.values() {
-        let _ = worker.stop.send(true);
-    }
-
-    for (_, worker) in partition_workers {
-        let _ = worker.handle.await;
-    }
-
-    for handle in retired_partition_workers {
-        let _ = handle.await;
-    }
+    task: AbortHandle,
 }
 
 async fn run_partition_worker<E, T, H>(
     queue: Arc<Queue<E>>,
     config: ClusterWorkerConfig,
     partition: u32,
-    generation: u64,
     handler: H,
-    stop: watch::Receiver<bool>,
-    shutdown: watch::Receiver<bool>,
+    mut stop: watch::Receiver<bool>,
+    heartbeat: Arc<AtomicI64>,
+    stop_after: i64,
 ) where
     E: TitoEngine + 'static,
     T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
@@ -677,193 +539,26 @@ async fn run_partition_worker<E, T, H>(
         + Sync
         + 'static,
 {
-    let mut stop = PartitionWorkerStop {
-        retirement: stop,
-        shutdown,
-    };
     let mut cursor: Option<QueuePullCursor> = None;
+    let mut finished_in_pass = false;
 
     loop {
-        if partition_stop_requested(&mut stop) {
-            break;
+        if !partition_still_held(&stop, &heartbeat, stop_after) {
+            return;
         }
 
-        match process_partition_once(
-            queue.clone(),
-            config.clone(),
-            partition,
-            generation,
-            handler.clone(),
-            &mut cursor,
-            &mut stop,
-        )
-        .await
-        {
-            PartitionWorkerDirective::Stop => break,
-            PartitionWorkerDirective::Pull => continue,
-            PartitionWorkerDirective::Wait => {}
-        }
-
-        tokio::select! {
+        let pull = tokio::select! {
             biased;
-            _ = stop.retirement.changed() => break,
-            _ = stop.shutdown.changed() => break,
-            _ = sleep(config.poll_interval) => {}
-        }
-    }
-}
+            _ = stop.changed() => return,
+            pull = queue.pull::<T>(partition, cursor.clone(), 50) => pull,
+        };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PartitionWorkerDirective {
-    Pull,
-    Wait,
-    Stop,
-}
-
-struct PartitionWorkerStop {
-    retirement: watch::Receiver<bool>,
-    shutdown: watch::Receiver<bool>,
-}
-
-fn partition_stop_requested(stop: &mut PartitionWorkerStop) -> bool {
-    *stop.retirement.borrow_and_update() || *stop.shutdown.borrow_and_update()
-}
-
-async fn maintain_cluster_worker<E>(
-    queue: Arc<Queue<E>>,
-    config: ClusterWorkerConfig,
-    mut shutdown: broadcast::Receiver<()>,
-) where
-    E: TitoEngine + 'static,
-{
-    let mut next_completed_event_maintenance = Instant::now();
-
-    loop {
-        if shutdown_requested(&mut shutdown) {
-            break;
-        }
-
-        if queue.heartbeat_cluster_worker(&config).await.is_ok() {
-            let is_coordinator = matches!(
-                queue.try_acquire_cluster_coordinator(&config).await,
-                Ok(true)
-            );
-            if is_coordinator {
-                let _ = queue.rebalance_cluster_partitions(&config).await;
-                let now = Instant::now();
-                if now >= next_completed_event_maintenance {
-                    loop {
-                        match queue
-                            .maintain_completed_event_retention(Utc::now().timestamp_millis())
-                            .await
-                        {
-                            Ok(true) => {
-                                tokio::task::yield_now().await;
-                                if shutdown_requested(&mut shutdown) {
-                                    return;
-                                }
-                                if queue.heartbeat_cluster_worker(&config).await.is_err() {
-                                    break;
-                                }
-                                if !matches!(
-                                    queue.try_acquire_cluster_coordinator(&config).await,
-                                    Ok(true)
-                                ) {
-                                    break;
-                                }
-                                let _ = queue.rebalance_cluster_partitions(&config).await;
-                                if queue.sync_cluster_partition_leases(&config).await.is_err() {
-                                    break;
-                                }
-                            }
-                            Ok(false) => break,
-                            Err(error) => {
-                                log::error!(
-                                    "Completed queue retention maintenance failed: {error}"
-                                );
-                                break;
-                            }
-                        }
-                    }
-                    next_completed_event_maintenance =
-                        Instant::now() + COMPLETED_EVENT_MAINTENANCE_INTERVAL;
-                }
-            }
-            let _ = queue.sync_cluster_partition_leases(&config).await;
-        }
-
-        tokio::select! {
-            _ = shutdown.recv() => break,
-            _ = sleep(config.heartbeat_interval) => {}
-        }
-    }
-}
-
-fn shutdown_requested(rx: &mut broadcast::Receiver<()>) -> bool {
-    matches!(
-        rx.try_recv(),
-        Ok(_) | Err(broadcast::error::TryRecvError::Closed)
-    )
-}
-
-async fn process_partition_once<E, T, H>(
-    queue: Arc<Queue<E>>,
-    config: ClusterWorkerConfig,
-    partition: u32,
-    generation: u64,
-    handler: H,
-    cursor: &mut Option<QueuePullCursor>,
-    stop: &mut PartitionWorkerStop,
-) -> PartitionWorkerDirective
-where
-    E: TitoEngine + 'static,
-    T: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-    H: Fn(QueueEvent<T>) -> BoxFuture<'static, QueueHandlerResult<T>>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-{
-    let pull = tokio::select! {
-        biased;
-        _ = stop.retirement.changed() => return PartitionWorkerDirective::Stop,
-        _ = stop.shutdown.changed() => return PartitionWorkerDirective::Stop,
-        pull = queue.pull::<T>(partition, cursor.clone(), 50) => pull,
-    };
-
-    match pull {
-        Ok(page) => {
-            *cursor = page.next_cursor;
-            let directive = if cursor.is_some() {
-                PartitionWorkerDirective::Pull
-            } else {
-                PartitionWorkerDirective::Wait
-            };
-            if page.events.is_empty() {
-                return directive;
-            }
-
+        if let Ok(page) = pull {
+            cursor = page.next_cursor;
             for (storage_key, event) in page.events {
-                if partition_stop_requested(stop) {
-                    return PartitionWorkerDirective::Stop;
+                if !partition_still_held(&stop, &heartbeat, stop_after) {
+                    return;
                 }
-
-                let lease_is_current = tokio::select! {
-                    biased;
-                    _ = stop.retirement.changed() => return PartitionWorkerDirective::Stop,
-                    _ = stop.shutdown.changed() => return PartitionWorkerDirective::Stop,
-                    result = queue
-                        .cluster_partition_lease_is_current(&config, partition, generation)
-                        => matches!(result, Ok(true)),
-                };
-                if !lease_is_current {
-                    continue;
-                }
-
-                if partition_stop_requested(stop) {
-                    return PartitionWorkerDirective::Stop;
-                }
-
                 let execution = execute_handler(
                     &handler,
                     &storage_key,
@@ -874,29 +569,39 @@ where
                 if let Some(outcome) =
                     handler_outcome_or_log(execution, &event, config.handler_timeout)
                 {
-                    if matches!(
-                        queue
-                            .cluster_partition_lease_is_current(&config, partition, generation)
-                            .await,
-                        Ok(true)
-                    ) {
-                        apply_handler_outcome(&queue, &storage_key, &event, outcome).await;
+                    if apply_handler_outcome(&queue, &storage_key, &event, outcome).await {
+                        finished_in_pass = true;
                     }
                 }
-
-                if partition_stop_requested(stop) {
-                    return PartitionWorkerDirective::Stop;
-                }
             }
-            directive
+            if cursor.is_some() || std::mem::take(&mut finished_in_pass) {
+                continue;
+            }
         }
-        Err(_) => {
-            tokio::select! {
-                biased;
-                _ = stop.retirement.changed() => PartitionWorkerDirective::Stop,
-                _ = stop.shutdown.changed() => PartitionWorkerDirective::Stop,
-                _ = sleep(Duration::from_millis(500)) => PartitionWorkerDirective::Wait,
-            }
+
+        tokio::select! {
+            biased;
+            _ = stop.changed() => return,
+            _ = sleep(config.poll_interval) => {}
         }
     }
+}
+
+fn partition_still_held(
+    stop: &watch::Receiver<bool>,
+    heartbeat: &AtomicI64,
+    stop_after: i64,
+) -> bool {
+    !*stop.borrow()
+        && Utc::now()
+            .timestamp_millis()
+            .saturating_sub(heartbeat.load(Ordering::Acquire))
+            < stop_after
+}
+
+fn shutdown_requested(rx: &mut broadcast::Receiver<()>) -> bool {
+    matches!(
+        rx.try_recv(),
+        Ok(_) | Err(broadcast::error::TryRecvError::Closed)
+    )
 }

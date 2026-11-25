@@ -32,58 +32,50 @@ runner does, and builds before starting a database. Its first runtime is one PD 
 process on loopback ports it reserves, with their data in a new temporary folder and TiKV started
 with the small settings the Server's host tests use (no reserved space, a 512 MiB block cache, 1,024
 open raft files and small raft-engine files). It supplies the existing `TITO_NATIVE_PD_URI` and
-`TITO_NATIVE_RUN_ID` declarations to the complete `cargo test --locked --all-targets` phase. Every
-native case is mandatory:
+`TITO_NATIVE_RUN_ID` declarations to the complete `cargo test --locked --all-targets` phase, where
+every Tito test runs on that PD and TiKV: the library tests of models, indexes and the queue
+(`src/tito_tests/`, `src/queue/`) and the native cases in `tests/`. There is no in-memory stand-in,
+and a test checks results by reading TiKV after the commit, never trips or the keys a path read.
+Every native case is mandatory:
 
-- the actual secondary-lock recovery and atomic batch replacement cases;
-- 40 records of 1 MiB, more than the client's 32 MiB decoding budget, read in one forward scan,
-  one reverse scan, ordinary index pages and one batch get, and 16 queue events of almost 1 MiB
-  pulled, completed and cleared;
-- a record of 1 MiB with five ordinary index entries, one unique entry and three holder entries, a
-  save of about 7 MiB, where get, scan and batch get return the record's bytes for every ordinary and
-  unique entry and an empty value for every holder entry, while an index list and the unique lookup
-  return the record, `execute_ids` returns its id, and its remove deletes every entry;
-- a save of a 1 MiB record with 62 copies, about 63 MiB, commits, and one with 64 copies is refused
-  with the save bound's message before it writes;
-- index entries hold the record's bytes and holder entries hold nothing, across forward and reverse
-  pages, cursors and key-only IDs; lists and the unique lookup return the copies with the primary
-  deleted; malformed, mismatched and moved copies fail naming their key; a non-indexed edit refreshes
-  every copy; changed and removed entries; concurrent unique claims and batch ownership swaps;
-  a unique hit for share guards its owner while lists add no guard; holder entries answer `execute_ids` and
-  refuse every record read and scan, whatever bytes they hold;
-- a batch read that did not find a key answers a later single or batch read of it from memory while
-  a live lock sits on that key and a fresh read meets the lock; a batch read leaves its transaction's
-  own writes, deletes and locks as they were, and a locked key still conflicts with a later writer;
-  a save after a batch read of its `save_keys` finishes while a lock sits on its row, so it sent no
-  read;
-- a cluster-worker handler completes its own pending queue row inside the transaction that applies
-  its change, and the later acknowledgement changes nothing; two deliveries of one row conflict at
-  commit and the retry skips, so the change applies once; a rolled-back handler transaction leaves
-  the row and its owner index pending for redelivery; an undelivered event, a completed-row key and
-  another event's pending row are refused without writes;
+- the actual secondary-lock recovery case;
+- 40 records of 1 MiB, more than the client's 32 MiB decoding budget, read through `scan_records`,
+  index pages in both directions and `read_many`, and 16 queue events of almost 1 MiB pulled and
+  acknowledged, their rows gone;
+- the `Full`, `KeysOnly` and `Part` entries of a record of 1 MiB read back: every `Full` entry
+  holds the record's bytes, every `KeysOnly` entry nothing and every `Part` entry its fields;
+- a save just under `MAX_SAVE_BYTES` commits its copies, and a larger one is refused with the save
+  bound's message before it writes;
+- a cluster-worker handler acknowledges its own pending queue row inside the transaction that
+  applies its change, and the later acknowledgement changes nothing; two deliveries of one row
+  conflict at commit and the retry skips, so the change applies once; a rolled-back handler
+  transaction leaves the row and its owner index pending for redelivery; an undelivered event, a
+  row of another queue and another event's pending row are refused without writes;
 - guards on fence keys, which Tito only deletes (in TiKV a delete is a write: it leaves a Delete
-  entry in the key's history until garbage collection, and reads never see it): a read for share or
-  for update in a transaction that writes (`get_for_share`, `get_many_for_share`,
-  `get_versioned_for_share`, a hit of `find_one_by_unique_index_for_share` and `get_for_update`)
-  conflicts at commit with a save of its record, and a later versioned read returns the new version,
-  while index reads (lists, which read the copies in their entries, and `execute_ids`, which reads
-  keys only), scans and reads that find nothing add no guard; of 480 pairs of transactions reading the
-  same twenty records, 4 to 75 conflict; two reads for update of one record always conflict and the
-  retry passes; a read for share and a read for update of one record commit together in either order;
-  of 128 pairs of writers that read one record with a plain read (`get`, `get_many` or
-  `find_one_by_unique_index`, in turn), none conflicts, each plain read commits beside a save or a
-  remove of its record, and a record the same transaction also reads for share or for update keeps
-  that guard; a save and a remove conflict with reads for share and for update in either commit order;
-  a transaction that only reads adds no guard, while `get_for_update` counts as a write; and a retried
-  transaction starts without the guards of the attempt before;
-- ids held by other records: a new holder that reads the record it names and a delete of that
-  record that checks the holders' index in its own transaction conflict in either commit order,
-  and the retry refuses the delete or finds the record gone;
-- two concurrent claims of one unique value conflict and the retry is refused, while values that
-  differ only by case or spacing coexist and are found exactly;
-- a save whose batch read meets a live lock waits for it as a single read does: with a real
-  secondary lock left on the record key by a failed prewrite, one plain client batch read gives up
-  while the lock lives, and the save succeeds only after the lock's TTL has passed.
+  entry in the key's history until garbage collection, and reads never see it): a note with
+  `Guard::Share` or `Guard::Update` in a transaction that writes conflicts at commit with an update
+  of its record, while index pages, scans and notes that find nothing add no guard; of 480 pairs of
+  transactions reading the same twenty records for share, 4 to 75 conflict; two reads for update of
+  one record always conflict and the retry passes; a read for share and a read for update of one
+  record commit together in either order; writers that read one record with `Guard::None` never
+  conflict, such a read commits beside an update or a remove of its record, and a record the same
+  transaction also reads for share or for update keeps that guard; an update and a remove conflict
+  with reads for share and for update in either commit order; a transaction that only reads adds no
+  guard, while a read for update counts as a write; and a retried transaction starts without the
+  guards of the attempt before;
+- ids held by other records: a new holder that reads the record it names for share and a delete
+  of that record that checks the holders' `KeysOnly` index in its own transaction conflict in either
+  commit order, and the retry refuses the delete or finds the record gone;
+- two concurrent creates of one unique value: one commits and the other ends in
+  `UniqueViolation`, while values that differ only by case or spacing coexist and are found
+  exactly;
+- a key a batch read did not find is answered from memory while a live lock sits on that key and a
+  fresh read meets the lock; a batch read leaves its transaction's own writes, deletes and locks as
+  they were; a `create` and an `update` send no read: each returns while another transaction's live
+  lock sits on its row;
+- a note whose key holds a live lock waits for it as a single read does: with a real secondary lock
+  left on the record key by a failed prewrite, a plain client batch read gives up while the lock
+  lives, and the note is answered only after the lock's TTL has passed.
 
 After stopping that runtime and removing its folder, the wrapper starts three PD processes with
 distinct loopback client and peer ports in a new temporary folder. Their advertised addresses are

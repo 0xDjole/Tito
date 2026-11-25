@@ -1,15 +1,17 @@
 mod native;
 
-use native::{native_endpoint, native_engine, remove, save};
+use native::{create, native_endpoint, native_engine, read, remove};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tikv_client::{Key, ProtoLockInfo, Timestamp, TimestampExt};
 use tito::backend::tikv::TiKVBackend;
-use tito::types::{TitoIndexConfig, TitoIndexField, TitoIndexFieldType, TitoTransaction};
-use tito::{TitoEngine, TitoError, TitoModelOptions, TitoModelTrait};
+use tito::types::TitoTransaction;
+use tito::{
+    Guard, TitoEngine, TitoError, TitoIndex, TitoIndexField, TitoIndexValue, TitoModelTrait,
+};
 use uuid::Uuid;
 
-#[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct NativeLockedRecord {
     id: String,
     scope: String,
@@ -17,29 +19,20 @@ struct NativeLockedRecord {
 }
 
 impl TitoModelTrait for NativeLockedRecord {
-    fn indexes(&self) -> Vec<TitoIndexConfig> {
-        Vec::new()
-    }
-
-    fn unique_indexes(&self) -> Vec<TitoIndexConfig> {
-        vec![TitoIndexConfig {
-            condition: true,
-            name: "native-batch-lock-value".into(),
+    fn indexes(&self) -> Vec<TitoIndex> {
+        vec![TitoIndex {
+            name: "native-batch-read-lock-value",
             fields: vec![
-                TitoIndexField {
-                    name: "scope".into(),
-                    r#type: TitoIndexFieldType::String,
-                },
-                TitoIndexField {
-                    name: "value".into(),
-                    r#type: TitoIndexFieldType::String,
-                },
+                TitoIndexField::Text(self.scope.clone()),
+                TitoIndexField::Text(self.value.clone()),
             ],
+            value: TitoIndexValue::Full,
+            unique: true,
         }]
     }
 
     fn table() -> String {
-        "native-batch-lock-records".into()
+        "native-batch-read-lock-records".into()
     }
 
     fn id(&self) -> String {
@@ -72,22 +65,26 @@ async fn pd_millis(engine: &TiKVBackend) -> i64 {
 }
 
 #[tokio::test]
-async fn native_a_save_whose_batch_read_meets_a_live_lock_waits_for_it_like_a_single_read() {
+async fn native_a_note_whose_key_holds_a_live_lock_waits_for_it_like_a_single_read() {
     let (endpoint, run_id) = native_endpoint();
     tokio::time::timeout(Duration::from_secs(60), async move {
         let engine = native_engine(endpoint).await;
-        let model = engine
-            .clone()
-            .model::<NativeLockedRecord>(TitoModelOptions::default());
+        let records = engine.clone().model::<NativeLockedRecord>();
         let scope = format!("{run_id}-{}", Uuid::new_v4());
         let record = NativeLockedRecord {
             id: format!("{scope}-1"),
             scope: scope.clone(),
             value: "locked".into(),
         };
-        let primary = format!("table:native-batch-lock-records:{scope}-0").into_bytes();
-        let secondary = format!("table:native-batch-lock-records:{}", record.id).into_bytes();
+        let neighbor = NativeLockedRecord {
+            id: format!("{scope}-2"),
+            scope: scope.clone(),
+            value: "neighbor".into(),
+        };
+        let primary = records.key(&format!("{scope}-0")).into_bytes();
+        let secondary = records.key(&record.id).into_bytes();
         assert!(primary < secondary);
+        create(&engine, &records, &neighbor).await.unwrap();
 
         let orphan = engine
             .begin_transaction()
@@ -101,7 +98,7 @@ async fn native_a_save_whose_batch_read_meets_a_live_lock_waits_for_it_like_a_si
         orphan
             .put(&secondary, b"abandoned secondary")
             .await
-            .expect("Buffer the record key as the secondary of a separate prewrite batch");
+            .expect("Buffer the record row as the secondary of a separate prewrite batch");
         let winner = engine
             .begin_transaction()
             .await
@@ -123,7 +120,7 @@ async fn native_a_save_whose_batch_read_meets_a_live_lock_waits_for_it_like_a_si
         assert_eq!(
             observed.len(),
             1,
-            "The failed prewrite must leave exactly the lock on the record key"
+            "The failed prewrite must leave exactly the lock on the record row"
         );
         let lock = &observed[0];
         assert!(
@@ -131,7 +128,7 @@ async fn native_a_save_whose_batch_read_meets_a_live_lock_waits_for_it_like_a_si
                 && lock.primary_lock == primary
                 && lock.lock_version == orphan_start
                 && lock.lock_ttl > 0,
-            "The lock must sit on the record key and name the absent transaction primary"
+            "The lock must sit on the record row and name the absent transaction primary"
         );
         let expiry = Timestamp::from_version(lock.lock_version)
             .physical
@@ -141,7 +138,7 @@ async fn native_a_save_whose_batch_read_meets_a_live_lock_waits_for_it_like_a_si
         let tx = engine
             .begin_transaction()
             .await
-            .expect("Begin the saving transaction after the lock");
+            .expect("Begin the reading transaction after the lock");
         let reader = engine
             .begin_transaction()
             .await
@@ -161,20 +158,21 @@ async fn native_a_save_whose_batch_read_meets_a_live_lock_waits_for_it_like_a_si
                 .map(|pairs| pairs.count())
         };
         let tito = async {
-            let saved = model
-                .set(record.clone())
-                .timestamps(false)
-                .execute(&tx)
+            let found = tx
+                .batch_get((
+                    records.read_maybe(&record.id, Guard::None),
+                    records.read(&neighbor.id, Guard::None),
+                ))
                 .await;
-            (saved, pd_millis(&engine).await)
+            (found, pd_millis(&engine).await)
         };
-        let (client_only, (saved, finished)) = tokio::join!(client_only, tito);
+        let (client_only, (found, finished)) = tokio::join!(client_only, tito);
         println!(
-            "native batch read lock wait: lock_ttl_ms={}, remaining_at_start_ms={}, client_only_failed={}, save_succeeded={}, finished_after_expiry_ms={}",
+            "native batch read lock wait: lock_ttl_ms={}, remaining_at_start_ms={}, client_only_failed={}, note_succeeded={}, finished_after_expiry_ms={}",
             lock.lock_ttl,
             expiry - started,
             client_only.is_err(),
-            saved.is_ok(),
+            found.is_ok(),
             finished - expiry
         );
         assert!(
@@ -186,28 +184,49 @@ async fn native_a_save_whose_batch_read_meets_a_live_lock_waits_for_it_like_a_si
             .await
             .expect("Close the client-only reader");
         assert_eq!(
-            saved.expect("The save must wait for the lock inside its own transaction"),
-            record
+            found.expect("The note must wait for the lock inside its own transaction"),
+            (None, neighbor.clone())
         );
         assert!(
             finished >= expiry,
-            "The save can only read the record key after the lock expired"
+            "The note can only read the record row after the lock expired"
         );
         assert!(locks(&engine, &primary, &secondary).await.is_empty());
+        records
+            .create(&record, &tx)
+            .await
+            .expect("Create the record the note found missing");
         tx.commit()
             .await
-            .expect("Commit the save made after the lock was resolved");
+            .expect("Commit the create made after the lock was resolved");
 
         assert_eq!(
-            model.get_for_share(&record.id, None).await.unwrap(),
-            record
+            read(&engine, &records, &record.id).await.unwrap(),
+            Some(record.clone())
         );
         let renamed = NativeLockedRecord {
             value: "unlocked".into(),
             ..record.clone()
         };
-        assert_eq!(save(&engine, &model, renamed.clone()).await.unwrap(), renamed);
-        assert!(remove(&engine, &model, &record.id).await.unwrap());
+        let note = records.read(&record.id, Guard::None);
+        engine
+            .transaction(|tx| {
+                let records = records.clone();
+                let note = note.clone();
+                let renamed = renamed.clone();
+                async move {
+                    let old = tx.batch_get(note).await?;
+                    records.update(&old, &renamed, &tx).await
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            read(&engine, &records, &record.id).await.unwrap(),
+            Some(renamed)
+        );
+        remove(&engine, &records, &record.id).await.unwrap();
+        remove(&engine, &records, &neighbor.id).await.unwrap();
         let cleanup = engine
             .begin_transaction()
             .await

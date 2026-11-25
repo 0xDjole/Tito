@@ -23,6 +23,7 @@ pub use transaction::Mutation;
 pub use transaction::Scanner;
 pub use transaction::Transaction;
 pub use transaction::TransactionOptions;
+pub use transaction::TransactionScan;
 
 mod buffer;
 mod client;

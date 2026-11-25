@@ -80,45 +80,34 @@ impl Buffer {
         F: FnOnce(Box<dyn Iterator<Item = Key> + Send>) -> Fut,
         Fut: Future<Output = Result<Vec<KvPair>>>,
     {
-        let (cached_results, undetermined_keys) = {
-            // Partition the keys into those we have buffered and those we have to
-            // get from the store.
-            let (undetermined_keys, cached_results): (Vec<_>, Vec<_>) = keys
-                .map(|key| {
-                    let value = self
-                        .entry_map
-                        .get(&key)
-                        .map(BufferEntry::get_value)
-                        .unwrap_or(MutationValue::Undetermined);
-                    (key, value)
-                })
-                .partition(|(_, v)| *v == MutationValue::Undetermined);
-
-            let cached_results = cached_results
-                .into_iter()
-                .filter_map(|(k, v)| v.unwrap().map(|v| KvPair(k, v)));
-
-            let undetermined_keys = undetermined_keys
-                .into_iter()
-                .map(|(k, _)| k)
-                .collect::<Vec<_>>();
-            (cached_results, undetermined_keys)
-        };
-
+        let (cached_results, undetermined_keys) = self.batch_get_cached(keys);
         let fetched_results = f(Box::new(undetermined_keys.clone().into_iter())).await?;
-        for kvpair in &fetched_results {
-            let key = kvpair.0.clone();
-            let value = Some(kvpair.1.clone());
-            self.update_cache(key, value);
+        self.cache_batch_get(undetermined_keys, &fetched_results);
+        Ok(cached_results.into_iter().chain(fetched_results))
+    }
+
+    pub fn batch_get_cached(&self, keys: impl Iterator<Item = Key>) -> (Vec<KvPair>, Vec<Key>) {
+        let mut cached = Vec::new();
+        let mut undetermined = Vec::new();
+        for key in keys {
+            match self.get_from_mutations(&key) {
+                MutationValue::Determined(Some(value)) => cached.push(KvPair(key, value)),
+                MutationValue::Determined(None) => {}
+                MutationValue::Undetermined => undetermined.push(key),
+            }
         }
-        for key in undetermined_keys {
+        (cached, undetermined)
+    }
+
+    pub fn cache_batch_get(&mut self, keys: Vec<Key>, fetched: &[KvPair]) {
+        for pair in fetched {
+            self.update_cache(pair.0.clone(), Some(pair.1.clone()));
+        }
+        for key in keys {
             if self.get_from_mutations(&key) == MutationValue::Undetermined {
                 self.update_cache(key, None);
             }
         }
-
-        let results = cached_results.chain(fetched_results);
-        Ok(results)
     }
 
     /// Run `f` to fetch entries in `range` from TiKV. Combine them with mutations in local buffer. Returns the results.
@@ -134,32 +123,38 @@ impl Buffer {
         F: FnOnce(BoundRange, u32) -> Fut,
         Fut: Future<Output = Result<Vec<KvPair>>>,
     {
-        // read from local buffer
-        let mutation_range = self.entry_map.range(range.clone());
+        let redundant_limit = self.scan_fetch_limit(range.clone(), limit);
+        let fetched = f(range.clone(), redundant_limit).await?;
+        Ok(self
+            .merge_scan(range, limit, update_cache, reverse, fetched)
+            .into_iter())
+    }
 
-        // fetch from TiKV
-        // fetch more entries because some of them may be hidden by buffered
-        // deletions or not-exist checks.
+    pub fn scan_fetch_limit(&self, range: BoundRange, limit: u32) -> u32 {
         let deleted_count = u32::try_from(
-            mutation_range
-                .clone()
+            self.entry_map
+                .range(range)
                 .filter(|(_, m)| matches!(m, BufferEntry::Del | BufferEntry::CheckNotExist))
                 .count(),
         )
         .unwrap_or(u32::MAX);
-        let redundant_limit = limit.saturating_add(deleted_count);
+        limit.saturating_add(deleted_count)
+    }
 
-        let mut results = f(range, redundant_limit)
-            .await?
+    pub fn merge_scan(
+        &mut self,
+        range: BoundRange,
+        limit: u32,
+        update_cache: bool,
+        reverse: bool,
+        fetched: Vec<KvPair>,
+    ) -> Vec<KvPair> {
+        let mut results = fetched
             .into_iter()
             .map(|pair| pair.into())
             .collect::<HashMap<Key, Value>>();
 
-        // Override using local data. An inserted value is visible like a put
-        // and a not-exist check hides the key like a delete, consistent with
-        // point reads (`get_value`) and the scanner's `MutationIterator`;
-        // cached reads and locks do not change the visible value.
-        for (k, m) in mutation_range {
+        for (k, m) in self.entry_map.range(range) {
             match m {
                 BufferEntry::Put(v) | BufferEntry::Insert(v) => {
                     results.insert(k.clone(), v.clone());
@@ -171,7 +166,6 @@ impl Buffer {
             }
         }
 
-        // update local buffer
         if update_cache {
             for (k, v) in &results {
                 self.update_cache(k.clone(), Some(v.clone()));
@@ -183,14 +177,14 @@ impl Buffer {
             .map(|(k, v)| KvPair::new(k, v))
             .collect::<Vec<_>>();
 
-        // TODO: use `BTreeMap` instead of `HashMap` to avoid sorting.
         if reverse {
             res.sort_unstable_by(|a, b| b.key().cmp(a.key()));
         } else {
             res.sort_unstable_by(|a, b| a.key().cmp(b.key()));
         }
 
-        Ok(res.into_iter().take(limit as usize))
+        res.truncate(limit as usize);
+        res
     }
 
     /// Iterate over buffered mutations in `range` in key order.
@@ -439,15 +433,6 @@ enum MutationValue {
     Determined(Option<Value>),
     // The buffer cannot determine the value.
     Undetermined,
-}
-
-impl MutationValue {
-    fn unwrap(self) -> Option<Value> {
-        match self {
-            MutationValue::Determined(v) => v,
-            MutationValue::Undetermined => unreachable!(),
-        }
-    }
 }
 
 #[cfg(test)]

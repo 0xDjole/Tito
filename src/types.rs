@@ -8,21 +8,18 @@ use std::ops::Range;
 use std::time::Duration;
 use uuid::Uuid;
 
-mod record_version;
-pub use record_version::{TitoRecordVersion, TitoVersioned};
-
 pub trait TitoModelConstraints:
-    Default + Clone + Serialize + DeserializeOwned + Unpin + std::marker::Send + Sync + TitoModelTrait
+    Clone + Serialize + DeserializeOwned + Unpin + std::marker::Send + Sync + 'static + TitoModelTrait
 {
 }
 impl<T> TitoModelConstraints for T where
-    T: Default
-        + Clone
+    T: Clone
         + Serialize
         + DeserializeOwned
         + Unpin
         + std::marker::Send
         + Sync
+        + 'static
         + TitoModelTrait
 {
 }
@@ -43,23 +40,6 @@ pub(crate) fn validate_delete_range(start: &[u8], end: &[u8]) -> Result<(), Tito
         ));
     }
     Ok(())
-}
-
-#[derive(Debug, Clone)]
-pub struct TitoModelOptions {
-    pub partition_count: u32,
-}
-
-impl Default for TitoModelOptions {
-    fn default() -> Self {
-        Self { partition_count: 1 }
-    }
-}
-
-impl TitoModelOptions {
-    pub fn with_partitions(partition_count: u32) -> Self {
-        Self { partition_count }
-    }
 }
 
 #[async_trait]
@@ -88,24 +68,35 @@ pub trait TitoEngine: Send + Sync + Clone {
         Ok(())
     }
 
-    fn model<T: TitoModelConstraints>(self, options: TitoModelOptions) -> TitoModel<Self, T> {
-        TitoModel::new(self, options)
+    fn model<T: TitoModelConstraints>(self) -> TitoModel<Self, T> {
+        TitoModel::new(self)
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum TitoGuard {
-    Shared,
-    Exclusive,
+pub enum Guard {
+    None,
+    Share,
+    Update,
 }
+
+mod sealed {
+    pub struct Sealed;
+}
+pub(crate) use sealed::Sealed;
 
 #[async_trait]
 pub trait TitoTransaction: Send + Sync {
     fn start_version(&self) -> u64;
 
-    async fn guard(&self, table: &str, id: &str, guard: TitoGuard);
-
     async fn get<K: AsRef<[u8]> + Send>(&self, key: K) -> Result<Option<TitoValue>, TitoError>;
+
+    async fn get_keys<K: AsRef<[u8]> + Send>(
+        &self,
+        keys: Vec<K>,
+        sealed: Sealed,
+    ) -> Result<Vec<TitoKvPair>, TitoError>;
+
     async fn put<K: AsRef<[u8]> + Send, V: AsRef<[u8]> + Send>(
         &self,
         key: K,
@@ -130,86 +121,45 @@ pub trait TitoTransaction: Send + Sync {
         limit: u32,
     ) -> Result<Vec<TitoKvPair>, TitoError>;
 
-    async fn batch_get<K: AsRef<[u8]> + Send>(
-        &self,
-        keys: Vec<K>,
-    ) -> Result<Vec<TitoKvPair>, TitoError>;
-
     async fn commit(self) -> Result<(), TitoError>;
     async fn rollback(self) -> Result<(), TitoError>;
 }
 
-#[derive(Debug, Clone)]
-pub enum TitoIndexFieldType {
-    String,
-    Number,
-    CustomString(std::string::String),
-}
-
-#[derive(Debug, Clone)]
-pub enum FieldValue {
-    Simple(serde_json::Value),
-    HashMapEntry {
-        key: String,
-        value: serde_json::Value,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub struct TitoIndexField {
-    pub name: String,
-    pub r#type: TitoIndexFieldType,
-}
-
-pub struct TitoIndexConfig {
-    pub condition: bool,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TitoIndex {
+    pub name: &'static str,
     pub fields: Vec<TitoIndexField>,
-    pub name: String,
+    pub value: TitoIndexValue,
+    pub unique: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TitoIndexValue {
+    Full,
+    KeysOnly,
+    Part(&'static [&'static str]),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TitoIndexField {
+    Text(String),
+    Number(i64),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TitoIndexBound {
+    Included(Vec<TitoIndexField>),
+    Excluded(Vec<TitoIndexField>),
 }
 
 pub trait TitoModelTrait {
-    fn indexes(&self) -> Vec<TitoIndexConfig>;
-    fn unique_indexes(&self) -> Vec<TitoIndexConfig> {
-        Vec::new()
-    }
-    fn holder_indexes(&self) -> Vec<TitoIndexConfig> {
-        Vec::new()
-    }
+    fn indexes(&self) -> Vec<TitoIndex>;
     fn table() -> String;
     fn id(&self) -> String;
 
     fn key_prefix() -> String {
         format!("table:{}", Self::table())
     }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReverseIndex {
-    pub value: Vec<String>,
-    pub version: TitoRecordVersion,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct TitoScanPayload {
-    pub start: String,
-    pub end: Option<String>,
-    pub limit: Option<u32>,
-    pub cursor: Option<String>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct TitoFindByIndexPayload {
-    pub index: String,
-    pub values: Vec<String>,
-    pub limit: Option<u32>,
-    pub cursor: Option<String>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct TitoFindOneByIndexPayload {
-    pub index: String,
-    pub values: Vec<String>,
 }
 
 #[derive(Default, Serialize, Debug)]
@@ -219,12 +169,12 @@ pub struct TitoPaginated<T> {
 }
 
 #[derive(Default, Serialize, Deserialize, Debug)]
-pub struct TitoCursor {
-    pub ids: Vec<Option<String>>,
+pub(crate) struct TitoCursor {
+    pub(crate) ids: Vec<Option<String>>,
 }
 
 impl TitoCursor {
-    pub fn first_id(&self) -> Result<String, TitoError> {
+    pub(crate) fn first_id(&self) -> Result<String, TitoError> {
         self.ids
             .first()
             .and_then(|id_option| id_option.as_ref())
